@@ -17,7 +17,7 @@
  *
  * ============================================================================
  *)
-{$DEFINE SCRIPT_REVISION := '1'}
+{$DEFINE SCRIPT_REVISION := '2'}
 {$DEFINE SCRIPT_GUI}
 program OrkaAmmoniteCrabs;
 {$I SRL-T/osr.simba}
@@ -3434,14 +3434,14 @@ begin
   Font.Free();
 
   // Download background image if not exists
-  if not FileExists(AppPath + 'Resources\OrkaAmmoniteCrabsBG.jpeg') then
-    DownloadToFile('https://i.imgur.com/S62lcIc.jpeg', AppPath + 'Resources\OrkaAmmoniteCrabsBG.jpeg');
+  if not FileExists(AppPath + 'Resources\OrkaAmmoniteCrabsBG.png') then
+    DownloadToFile('https://raw.githubusercontent.com/orkabyte/orka-scripts/refs/heads/main/orka-ammonite-crabs/orka-ammonite-crabs-bg.png', AppPath + 'Resources\OrkaAmmoniteCrabsBG.png');
 
   // Setup background image on PageControl
-  if FileExists(AppPath + 'Resources\OrkaAmmoniteCrabsBG.jpeg') then
+  if FileExists(AppPath + 'Resources\OrkaAmmoniteCrabsBG.png') then
   begin
     Img.Init();
-    Img.LoadFromFile(AppPath + 'Resources\OrkaAmmoniteCrabsBG.jpeg');
+    Img.LoadFromFile(AppPath + 'Resources\OrkaAmmoniteCrabsBG.png');
     with BGImg do
     begin
       Init(Self.PageControl);

@@ -17,7 +17,7 @@
  *
  * ============================================================================
  *)
-{$DEFINE SCRIPT_REVISION := '5'}
+{$DEFINE SCRIPT_REVISION := '6'}
 {$IFNDEF SCRIPT_CHAIN}
   {$DEFINE SCRIPT_GUI}
   program OrkaReanimation;
@@ -3399,17 +3399,41 @@ begin
 end;
 
 (**
+ * SetChildsBoldFont
+ *
+ * Recursively applies bold font styling to a control and all its children.
+ *
+ * @param ctrl  The control to style
+ *)
+procedure SetChildsBoldFont(ctrl: TControl);
+var
+  i: Int32;
+  child: TControl;
+begin
+  for i := 0 to ctrl.getComponentCount() - 1 do
+  begin
+    child := ctrl.GetComponent(i);
+    SetChildsBoldFont(child);
+  end;
+  ctrl.GetFont().SetStyle([fsBold]);
+end;
+
+(**
  * TReanimationConfig.Run
  *
  * Initializes and displays the script configuration GUI.
  *)
 procedure TReanimationConfig.Run(); override;
 var
-  tab, accountTab: TTabSheet;
+  tab, accountTab, abTab, wlTab: TTabSheet;
   Font: TFont;
   Img: TPicture;
   BGImg: TImage;
   baseLeft, baseTop, controlWidth, spacing, indent, labelGap, currentTop, startTop: Int32;
+  accountPanel, limitPanel, riPanel, vPanel: TPanel;
+  offset, currentY: Int32;
+  i: Int32;
+  child: TControl;
 begin
   Self.Setup('Orka Reanimation');
   Self.Start.setOnClick(@Self.StartScript);
@@ -3422,21 +3446,20 @@ begin
   Font.Free();
 
   // Set background on PageControl (like aeroguardians) so TLabeledCheckBox panels appear transparent
-  if not FileExists(AppPath + 'Resources\OrkaReanimationBG.jpeg') then
-    DownloadToFile('https://i.imgur.com/l7YzMvK.jpeg', AppPath + 'Resources\OrkaReanimationBG.jpeg');
+  if not FileExists(AppPath + 'Resources\OrkaReanimationBG.png') then
+    DownloadToFile('https://raw.githubusercontent.com/orkabyte/orka-scripts/refs/heads/main/orka-reanimation/orka-reanimation-bg.png', AppPath + 'Resources\OrkaReanimationBG.png');
 
-  if FileExists(AppPath + 'Resources\OrkaReanimationBG.jpeg') then
+  if FileExists(AppPath + 'Resources\OrkaReanimationBG.png') then
   begin
     Img.Init();
-    Img.LoadFromFile(AppPath + 'Resources\OrkaReanimationBG.jpeg');
+    Img.LoadFromFile(AppPath + 'Resources\OrkaReanimationBG.png');
     with BGImg do
     begin
       Init(Self.PageControl);
       SetParent(Self.PageControl);
       SetPicture(Img);
-      SetBounds(0, 0, Self.Form.GetWidth(), Self.Form.GetHeight());
+      SetAlign(alClient);
       SetStretch(True);
-      AdjustToDPI(GetScreenDPI);
     end;
   end;
 
@@ -3599,12 +3622,67 @@ begin
   // Account Manager Tab
   Self.AddTab('Account Manager');
   accountTab := Self.Tabs[High(Self.Tabs)];
-  Self.CreateAccountManager(accountTab);
+  accountPanel := Self.CreateAccountManager(accountTab);
+  accountPanel.SetTop(TControl.AdjustToDPI(160));
+  SetChildsBoldFont(accountPanel);
 
   LoadConfig();
 
-  Self.CreateAntibanManager();
-  Self.CreateWaspLibSettings();
+  abTab := Self.CreateAntibanManager();
+  offset := TControl.AdjustToDPI(150);
+  for i := 0 to abTab.getComponentCount() - 1 do
+  begin
+    child := abTab.GetComponent(i);
+    child.SetTop(child.GetTop() + offset);
+  end;
+  SetChildsBoldFont(abTab);
+
+  wlTab := Self.CreateWaspLibSettings();
+  limitPanel := Self.Form.GetChild('limit_panel');
+  riPanel := Self.Form.GetChild('ri_panel');
+  vPanel := Self.Form.GetChild('v_panel');
+
+  offset := TControl.AdjustToDPI(160);
+  currentY := offset;
+
+  // Stack panels sequentially below the background title
+  if limitPanel <> nil then
+  begin
+    limitPanel.SetAlign(alNone);
+    limitPanel.SetTop(currentY);
+    limitPanel.SetWidth(Self.Size.X);
+    currentY := currentY + limitPanel.GetHeight();
+  end;
+
+  if riPanel <> nil then
+  begin
+    riPanel.SetAlign(alNone);
+    riPanel.SetTop(currentY);
+    riPanel.SetWidth(Self.Size.X);
+    currentY := currentY + riPanel.GetHeight();
+  end;
+
+  if vPanel <> nil then
+  begin
+    vPanel.SetAlign(alNone);
+    vPanel.SetTop(currentY);
+    vPanel.SetLeft(Floor(Self.Size.X / 2));
+    vPanel.SetWidth(Floor(Self.Size.X / 2));
+  end;
+
+  SetChildsBoldFont(wlTab);
+
+  // Fix label clipping: bold font is wider than the auto-sized panel widths
+  child := Self.Form.GetChild('block_real_input_group_panel');
+  if child <> nil then
+  begin
+    child.GetParent().SetWidth(TControl.AdjustToDPI(200));
+    child.GetParent().GetParent().SetWidth(TControl.AdjustToDPI(220));
+  end;
+
+  child := Self.Form.GetChild('v_enabled_panel');
+  if child <> nil then
+    child.SetWidth(child.GetWidth() + TControl.AdjustToDPI(30));
 
   // Birdhouse Settings Tab (from birdhouserunner.simba)
   Self.CreateBirdhouseRunSettings();

@@ -18,7 +18,7 @@
  * ============================================================================
  *)
 
-{$DEFINE SCRIPT_REVISION := '3'}
+{$DEFINE SCRIPT_REVISION := '4'}
 program OrkaGECooking;
 {$DEFINE SCRIPT_GUI}
 {$I SRL-T/osr.simba}
@@ -1758,13 +1758,13 @@ begin
   Self.AddTab('Script Settings');
   tab := Self.Tabs[High(Self.Tabs)];
 
-  if not FileExists(AppPath + 'Resources\OrkaGECookingBG.jpeg') then
-    DownloadToFile('https://i.imgur.com/1fnnD9H.jpeg', AppPath + 'Resources\OrkaGECookingBG.jpeg');
+  if not FileExists(AppPath + 'Resources\OrkaGECookingBG.png') then
+    DownloadToFile('https://raw.githubusercontent.com/orkabyte/orka-scripts/refs/heads/main/orka-ge-cooking/orka-ge-cooking-bg.png', AppPath + 'Resources\OrkaGECookingBG.png');
 
-  if FileExists(AppPath + 'Resources\OrkaGECookingBG.jpeg') then
+  if FileExists(AppPath + 'Resources\OrkaGECookingBG.png') then
   begin
     Img.Init();
-    Img.LoadFromFile(AppPath + 'Resources\OrkaGECookingBG.jpeg');
+    Img.LoadFromFile(AppPath + 'Resources\OrkaGECookingBG.png');
     with BGImg do
     begin
       Create(tab);
