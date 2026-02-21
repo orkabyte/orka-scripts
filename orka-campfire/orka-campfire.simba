@@ -18,7 +18,7 @@
  * ============================================================================
  *)
 
-{$DEFINE SCRIPT_REVISION := '6'}
+{$DEFINE SCRIPT_REVISION := '7'}
 program OrkaCampfire;
 {$DEFINE SCRIPT_GUI}
 {$I SRL-T/osr.simba}
@@ -1263,13 +1263,13 @@ begin
   Self.AddTab('Script Settings');
   tab := Self.Tabs[High(Self.Tabs)];
 
-  if not FileExists(AppPath + 'Resources\OrkaCampfireBG.jpeg') then
-    DownloadToFile('https://i.imgur.com/GlokJmj.jpeg', AppPath + 'Resources\OrkaCampfireBG.jpeg');
+  if not FileExists(AppPath + 'Resources\OrkaCampfireBG.png') then
+    DownloadToFile('https://raw.githubusercontent.com/orkabyte/orka-scripts/refs/heads/main/orka-campfire/orka-campfire-bg.png', AppPath + 'Resources\OrkaCampfireBG.png');
 
-  if FileExists(AppPath + 'Resources\OrkaCampfireBG.jpeg') then
+  if FileExists(AppPath + 'Resources\OrkaCampfireBG.png') then
   begin
     Img.Init();
-    Img.LoadFromFile(AppPath + 'Resources\OrkaCampfireBG.jpeg');
+    Img.LoadFromFile(AppPath + 'Resources\OrkaCampfireBG.png');
     with BGImg do
     begin
       Create(tab);
