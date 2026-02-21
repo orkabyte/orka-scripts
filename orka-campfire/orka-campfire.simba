@@ -1,0 +1,1327 @@
+(**
+ * ============================================================================
+ * Orka Campfire - Credits & Appreciation
+ * ============================================================================
+ *
+ * This script wouldn't exist without the incredible work of the WaspScripts community.
+ *
+ * Special thanks to the admins, moderators, scripters, and testers who
+ * maintain and continuously improve WaspLib, SRL-T, and the entire ecosystem.
+ *
+ * Credits:
+ * Torwent  |  3Garrett3  |  Student  |  BigAussie  |  Kriptic
+ * Fik  |  skunkworks  |  XJ  |  unit
+ *
+ * A huge thank you to everyone in the WaspScripts community who provides
+ * feedback, reports bugs, tests scripts, and helps newcomers learn.
+ *
+ * ============================================================================
+ *)
+
+{$DEFINE SCRIPT_REVISION := '6'}
+program OrkaCampfire;
+{$DEFINE SCRIPT_GUI}
+{$I SRL-T/osr.simba}
+{$I WaspLib/osr.simba}
+
+const
+  SCRIPT_NAME = 'Orka Campfire';
+  VERBOSE_LOGGING = True;
+
+  // GE Location Constants
+  LEFT_GE_TILES: TPointArray = [[8552, 36478], [8548, 36474], [8548, 36470], [8552, 36466]];
+  RIGHT_GE_TILES: TPointArray = [[8572, 36478], [8576, 36474], [8576, 36470], [8572, 36466]];
+  LEFT_FIRE_TILE: TPoint = [8548, 36474];
+  RIGHT_FIRE_TILE: TPoint = [8576, 36474];
+  LEFT_SELF_FIRE_TILES: TPointArray = [[8548, 36470], [8548, 36474]];
+  RIGHT_SELF_FIRE_TILES: TPointArray = [[8576, 36470], [8576, 36474]];
+  LEFT_BANK_TILE: TPoint = [8554, 36474];
+  RIGHT_BANK_TILE: TPoint = [8570, 36474];
+
+type
+  EForesterState = (
+    HANDLE_LOGIN,
+    OPEN_BANK,
+    HANDLE_BANK,
+    CLOSE_BANK,
+    FIND_EXISTING_FIRE,
+    BURN_LOGS,
+    WAIT_BURNING,
+    LEVEL_UP,
+    END_SCRIPT
+  );
+
+  TForesterCampfire = record(TBaseWalkerScript)
+    State: EForesterState;
+    LogType: TRSItem;
+    Tinderbox: TRSItem;
+
+    // Location & Tiles
+    IsLeftSide: Boolean;
+    BankTile: TPoint;
+    PreferredFireTile: TPoint;
+    CurrentFireTile: TPoint;
+
+    // Stats
+    StartXP, GainedXP: Int32;
+    LogsBurned: Int32;
+
+    // Break tracking
+    TotalBreakTime, LastBreakStartTime, LastBreakEndTime: Int64;
+
+    // Internal flags
+    HasFire: Boolean;
+    IsBurning: Boolean;
+    HasScannedForFire: Boolean;
+
+    // Report timer
+    ReportTimer: TStopwatch;
+  end;
+
+var
+  ForesterBot: TForesterCampfire;
+  Config: TConfigJSON;
+
+// -----------------------------------------------------------------------------
+// Helper Functions
+// -----------------------------------------------------------------------------
+
+(**
+ * WriteDebug
+ *
+ * Writes a debug message to the console if VERBOSE_LOGGING is enabled.
+ * Include timestamp and script tag.
+ *
+ * @param msg  The message to write
+ *)
+procedure WriteDebug(msg: String);
+begin
+  if VERBOSE_LOGGING then
+    WriteLn(SRL.TimeStamp(), ':[Campfire]: ', msg);
+end;
+
+(**
+ * GetTilesInRadius
+ *
+ * Generates a TPointArray of all tiles within a given radius of center points.
+ *
+ * @param Centers      Array of center points
+ * @param RadiusTiles  Radius in game tiles
+ * @return             TPointArray of all tiles in range
+ *)
+function GetTilesInRadius(Centers: TPointArray; RadiusTiles: Int32): TPointArray;
+var
+  Center: TPoint;
+  x, y: Int32;
+  p: TPoint;
+begin
+  for Center in Centers do
+    for x := -RadiusTiles to RadiusTiles do
+      for y := -RadiusTiles to RadiusTiles do
+        if (x*x + y*y) <= (RadiusTiles * RadiusTiles) then
+        begin
+          p := [Center.X + (x * 4), Center.Y + (y * 4)];
+          if not Result.Contains(p) then
+            Result += p;
+        end;
+end;
+
+(**
+ * Campfire_MSToWorld
+ *
+ * Converts a MainScreen point to a World Map coordinate (TPoint).
+ * Used to get the exact tile of a found object.
+ *
+ * @param MSPt  Point on the Main Screen
+ * @return      World Map coordinate
+ *)
+function Campfire_MSToWorld(MSPt: TPoint): TPoint;
+var
+  Me, MMPt: TPoint;
+  Angle: Double;
+  Vec: Vector3;
+begin
+  Me := Map.Position();
+  Vec := MainScreen.PointToMM(MSPt);
+  MMPt := [Round(Vec.X), Round(Vec.Y)];
+  Angle := Minimap.GetCompassAngle(False);
+
+  Result := Me + MMPt - Minimap.Center;
+  Result := Result.Rotate(-Angle, Me);
+end;
+
+(**
+ * RightClickTileAt
+ *
+ * Right-clicks a tile on the main screen and selects an option.
+ *
+ * @param tile     World tile to click
+ * @param options  Array of menu options to select
+ * @return         True if option was found and selected
+ *)
+function RightClickTileAt(tile: TPoint; options: TStringArray): Boolean;
+var
+  rect: TRectangle;
+  attempt: Int32;
+begin
+  rect := Map.GetTileMS(tile).Expand(MainScreen.NormalizeDistance(4));
+
+  for attempt := 1 to 4 do
+  begin
+    Mouse.Move(rect);
+    Mouse.Click(MOUSE_RIGHT);
+    if ChooseOption.Select(options) then
+      Exit(True);
+    Wait(150, 250);
+  end;
+
+  WriteDebug('RightClickTileAt | Failed to find options: ' + ToStr(options));
+  Result := False;
+end;
+
+(**
+ * ClickTileAt
+ *
+ * Left-clicks a tile on the main screen.
+ *
+ * @param tile  World tile to click
+ * @return      True
+ *)
+function ClickTileAt(tile: TPoint): Boolean;
+var
+  rect: TRectangle;
+begin
+  rect := Map.GetTileMS(tile).Expand(MainScreen.NormalizeDistance(4));
+  Mouse.Move(rect);
+  Mouse.Click(MOUSE_LEFT);
+  Result := True;
+end;
+
+// -----------------------------------------------------------------------------
+// Stats Report
+// -----------------------------------------------------------------------------
+
+(**
+ * Report
+ *
+ * Prints the script progress report to the debug console.
+ *)
+procedure TForesterCampfire.Report();
+var
+  RunTime: Int64;
+  XPPerHour, LogsPerHour: Int32;
+  leftCol, rightCol: String;
+  bannerWidth: Int32 = 59;
+  separator: String;
+  title: String;
+  TimeSinceLastBreak: Int64;
+begin
+  RunTime := GetTimeRunning();
+
+  if RunTime > 0 then
+  begin
+    XPPerHour := Round((Self.GainedXP) / (RunTime / 3600000));
+    LogsPerHour := Round((Self.LogsBurned) / (RunTime / 3600000));
+  end
+  else
+  begin
+    XPPerHour := 0;
+    LogsPerHour := 0;
+  end;
+
+  separator := '|' + StringOfChar('=', bannerWidth - 2) + '|';
+  title := SCRIPT_NAME;
+  title := '|' + PadR(PadL(title, (bannerWidth - 2 + Length(title)) div 2, ' '), bannerWidth - 2, ' ') + '|';
+
+  WriteLn(separator);
+  WriteLn(title);
+  WriteLn(separator);
+
+  // Row 1: Runtime | Next break
+  leftCol := 'Runtime: ' + SRL.MsToTime(RunTime, Time_Short);
+  if Length(Antiban.Breaks) > 0 then
+    rightCol := 'Next break: ' + SRL.MsToTime(Max(0, Round(Antiban.Breaks[0].NextAtTime - RunTime)), Time_Short)
+  else
+    rightCol := 'Next break: N/A';
+  WriteLn('| ' + PadR(leftCol, 22, ' ') + ' | ' + PadR(rightCol, 30, ' ') + ' |');
+
+  // Row 2: Logs burned | Time since last break
+  leftCol := 'Logs burned: ' + ToString(Self.LogsBurned);
+  if Self.LastBreakEndTime > 0 then
+  begin
+    TimeSinceLastBreak := RunTime - Self.LastBreakEndTime;
+    rightCol := 'Since last break: ' + SRL.MsToTime(TimeSinceLastBreak, Time_Short);
+  end
+  else
+    rightCol := 'Since last break: N/A';
+  WriteLn('| ' + PadR(leftCol, 22, ' ') + ' | ' + PadR(rightCol, 30, ' ') + ' |');
+
+  // Row 3: Logs/Hr | Total break time
+  leftCol := 'Logs/Hr: ' + ToString(LogsPerHour);
+  if Self.TotalBreakTime > 0 then
+    rightCol := 'Total break time: ' + SRL.MsToTime(Self.TotalBreakTime, Time_Short)
+  else
+    rightCol := 'Total break time: N/A';
+  WriteLn('| ' + PadR(leftCol, 22, ' ') + ' | ' + PadR(rightCol, 30, ' ') + ' |');
+
+  // Row 4: XP gained | Next Sleep
+  leftCol := 'XP gained: ' + ToString(Round(Self.GainedXP));
+  if Length(Antiban.Sleeps) > 0 then
+    rightCol := 'Next sleep: ' + SRL.MsToTime(Max(0, Round(Antiban.Sleeps[0].NextAtTime - RunTime)), Time_Short)
+  else
+    rightCol := 'Next sleep: N/A';
+  WriteLn('| ' + PadR(leftCol, 22, ' ') + ' | ' + PadR(rightCol, 30, ' ') + ' |');
+
+  // Row 5: XP/Hr | Shutdown
+  leftCol := 'XP/Hr: ' + ToString(XPPerHour);
+  if WLSettings.MaxTime > 0 then
+    rightCol := 'Shutdown: ' + SRL.MsToTime(Max(0, WLSettings.MaxTime - RunTime), Time_Short)
+  else
+    rightCol := 'Shutdown: N/A';
+  WriteLn('| ' + PadR(leftCol, 22, ' ') + ' | ' + PadR(rightCol, 30, ' ') + ' |');
+
+  WriteLn(separator);
+
+  title := 'Orka Scripts';
+  title := '|' + PadR(PadL(title, (bannerWidth - 2 + Length(title)) div 2, ' '), bannerWidth - 2, ' ') + '|';
+  WriteLn(title);
+  WriteLn(separator);
+end;
+
+// -----------------------------------------------------------------------------
+// Break Callbacks
+// -----------------------------------------------------------------------------
+
+(**
+ * OnBreakStart
+ *
+ * Callback for when a break starts. Records start time.
+ *
+ * @param Task  The break task information
+ *)
+procedure OnBreakStart(Task: PBreakTask);
+begin
+  Task; // Suppress unused parameter warning
+  ForesterBot.LastBreakStartTime := GetTimeRunning();
+end;
+
+(**
+ * OnBreakEnd
+ *
+ * Callback for when a break ends. Calculates total break duration.
+ *
+ * @param Task  The break task information
+ *)
+procedure OnBreakEnd(Task: PBreakTask);
+var
+  BreakDuration: Int64;
+begin
+  Task; // Suppress unused parameter warning
+  ForesterBot.LastBreakEndTime := GetTimeRunning();
+  BreakDuration := ForesterBot.LastBreakEndTime - ForesterBot.LastBreakStartTime;
+  ForesterBot.TotalBreakTime := ForesterBot.TotalBreakTime + BreakDuration;
+end;
+
+// -----------------------------------------------------------------------------
+// TForesterCampfire Implementation
+// -----------------------------------------------------------------------------
+
+(**
+ * Setup
+ *
+ * Configures the Antiban settings for the script.
+ *)
+procedure TAntiban.Setup(); override;
+begin
+  Self.Skills := [ERSSkill.FIREMAKING, ERSSkill.TOTAL];
+  Self.MinZoom := 10;
+  Self.MaxZoom := 60;
+
+  Self.OnStartBreak := @OnBreakStart;
+  Self.OnFinishBreak := @OnBreakEnd;
+
+  inherited;
+end;
+
+(**
+ * Init
+ *
+ * Initializes the script, variables, and determines GE location (Left/Right).
+ *
+ * @param maxActions  Maximum actions before stopping
+ * @param maxTime     Maximum time before stopping
+ *)
+procedure TForesterCampfire.Init(maxActions: UInt32; maxTime: UInt64); override;
+var
+  MyPos: TPoint;
+  DistLeft, DistRight: Int32;
+begin
+  inherited;
+
+  Self.StartXP := XPBar.Read();
+  Self.GainedXP := 0;
+  Self.LogsBurned := 0;
+  Self.Tinderbox := 'Tinderbox';
+  Self.HasFire := False;
+  Self.IsBurning := False;
+  Self.HasScannedForFire := False;
+  Self.CurrentFireTile := [0, 0];
+
+  Self.TotalBreakTime := 0;
+  Self.LastBreakStartTime := 0;
+  Self.LastBreakEndTime := 0;
+
+  Self.ReportTimer.Start();
+
+  // Setup Map Chunks around GE
+  Map.SetupChunk(Chunk([48, 55, 50, 53], 0));
+
+  // Determine Side based on distance to bank tiles
+  MyPos := Map.Position();
+  DistLeft := Round(MyPos.DistanceTo(LEFT_GE_TILES.Sorted(MyPos)[0]));
+  DistRight := Round(MyPos.DistanceTo(RIGHT_GE_TILES.Sorted(MyPos)[0]));
+
+  if DistLeft < DistRight then
+  begin
+    WriteDebug('Init | Detected LEFT side (Distance: ' + ToStr(DistLeft) + ')');
+    Self.IsLeftSide := True;
+    Self.BankTile := LEFT_BANK_TILE;
+    Self.PreferredFireTile := LEFT_FIRE_TILE;
+  end
+  else
+  begin
+    WriteDebug('Init | Detected RIGHT side (Distance: ' + ToStr(DistRight) + ')');
+    Self.IsLeftSide := False;
+    Self.BankTile := RIGHT_BANK_TILE;
+    Self.PreferredFireTile := RIGHT_FIRE_TILE;
+  end;
+
+  Writeln('');
+  Writeln(' _____                                           _____ ');
+  Writeln('( ___ )                                         ( ___ )');
+  Writeln(' |   |~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~|   | ');
+  Writeln(' |   |    _______  ______    ___   _  _______    |   | ');
+  Writeln(' |   |   |       ||    _ |  |   | | ||   _   |   |   | ');
+  Writeln(' |   |   |   _   ||   | ||  |   |_| ||  |_|  |   |   | ');
+  Writeln(' |   |   |  | |  ||   |_||_ |      _||       |   |   | ');
+  Writeln(' |   |   |  |_|  ||    __  ||     |_ |       |   |   | ');
+  Writeln(' |   |   |       ||   |  | ||    _  ||   _   |   |   | ');
+  Writeln(' |   |   |_______||___|  |_||___| |_||__| |__|   |   | ');
+  Writeln(' |   |                                           |   | ');
+  Writeln(' |___|~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~|___| ');
+  Writeln('(_____)                                         (_____)');
+
+  // ===== Credits block =====
+  Writeln('');
+  Writeln('  ___                                             ___  ');
+  Writeln(' |   |****************  CREDITS  ****************|   | ');
+  Writeln(' |   |                                           |   | ');
+  Writeln(' |   |    3Garrett3  |  Torwent  |  Student      |   | ');
+  Writeln(' |   |    BigAussie  |  Kriptic  |  Fik          |   | ');
+  Writeln(' |   |    skunkworks |  XJ       |  unit         |   | ');
+  Writeln(' |   |                                           |   | ');
+  Writeln(' |___|~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~|___| ');
+  Writeln('');
+
+  Writeln('  ___                                             ___  ');
+  Writeln(' |   |*************  Orka Campfire  *************|   | ');
+  Writeln(' |   |                                           |   | ');
+  Writeln(' |   |    ' + PadR('Log Type:  ' + ToStr(Self.LogType), 39) + '|   | ');
+  if Self.IsLeftSide then
+    Writeln(' |   |    ' + PadR('GE Side:   Left', 39) + '|   | ')
+  else
+    Writeln(' |   |    ' + PadR('GE Side:   Right', 39) + '|   | ');
+  Writeln(' |   |                                           |   | ');
+  Writeln(' |___|~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~|___| ');
+  Writeln('');
+end;
+
+(**
+ * AdjustCameraForBanking
+ *
+ * Rotates camera to a favorable angle for finding the bank booth.
+ *)
+procedure TForesterCampfire.AdjustCameraForBanking();
+var
+  currentAngle: Double;
+  minAngle, maxAngle: Double;
+  targetAngle: Double;
+begin
+  currentAngle := Minimap.GetCompassAngle();
+
+  if Self.IsLeftSide then
+  begin
+    minAngle := 230;
+    maxAngle := 310;
+  end
+  else
+  begin
+    minAngle := 50;
+    maxAngle := 130;
+  end;
+
+  if (currentAngle >= minAngle) and (currentAngle <= maxAngle) then
+  begin
+    WriteDebug('AdjustCameraForBanking | Angle ' + ToStr(Round(currentAngle)) + ' good');
+    Exit;
+  end;
+
+  // Generate random angle within range
+  targetAngle := Random(Round(minAngle), Round(maxAngle));
+  WriteDebug('AdjustCameraForBanking | Rotating to ' + ToStr(Round(targetAngle)));
+  Minimap.SetCompassAngle(targetAngle);
+  Wait(300, 600);
+end;
+
+(**
+ * FindBank
+ *
+ * Locates and clicks on the bank booth.
+ *
+ * @return True if bank was clicked
+ *)
+function TForesterCampfire.FindBank(): Boolean;
+var
+  BankObj: TRSObjectV2;
+begin
+  WriteDebug('FindBank | Searching for bank near ' + ToStr(Self.BankTile));
+
+  BankObj.SetupEx([1, 1, 6], [Self.BankTile]);
+  BankObj.SetupUpText(['Bank', 'booth']);
+
+  if Self.IsLeftSide then
+    BankObj.Finder.Colors += [CTS2(7112598, 1, 0.01, 0.01)]
+  else
+    BankObj.Finder.Colors += [CTS2(3490121, 1, 0.01, 0.01)];
+
+  BankObj.Walker := @Map.Walker;
+
+  Result := BankObj.WalkClick();
+
+  if Result then
+    WriteDebug('FindBank | Successfully clicked bank')
+  else
+    WriteDebug('FindBank | Failed to click bank');
+end;
+
+(**
+ * HandleBanking
+ *
+ * Manages bank interaction: depositing items, withdrawing tinderbox and logs.
+ *
+ * @return True if successful
+ *)
+function TForesterCampfire.HandleBanking(): Boolean;
+var
+  NeedTinderbox: Boolean;
+  TinderboxItem, LogItem: TRSBankItem;
+  WithdrawAttempts: Int32;
+begin
+  if not Bank.IsOpen() then
+    Exit(False);
+
+  Wait(800, 1200); // Allow items to render
+
+  if not Bank.IsOpen() then
+    Exit(False);
+
+  // 1. Manage Inventory Space
+  NeedTinderbox := not Self.HasFire;
+
+  // Deposit tinderbox if we have fire
+  if Self.HasFire and Inventory.ContainsItem(Self.Tinderbox) then
+  begin
+    WriteDebug('HandleBanking | Fire exists, depositing tinderbox');
+    Bank.DepositItem(Self.Tinderbox, True);
+    Wait(600, 900);
+  end;
+
+  if Inventory.IsFull() then
+  begin
+    WriteDebug('HandleBanking | Inventory full, depositing items');
+    Bank.DepositAll();
+    Wait(600, 1200);
+
+    if not Bank.IsOpen() then
+    begin
+      WriteDebug('HandleBanking | Bank closed after deposit');
+      Exit(False);
+    end;
+  end;
+
+  // 2. Withdraw Tinderbox if needed
+  if NeedTinderbox and not Inventory.ContainsItem(Self.Tinderbox) then
+  begin
+    WriteDebug('HandleBanking | Need tinderbox');
+    if not Bank.ContainsItem(Self.Tinderbox) then
+    begin
+       WriteDebug('HandleBanking | Tinderbox not visible, searching...');
+       if Bank.Search(ToStr(Self.Tinderbox)) then
+         Wait(1000, 1500);
+    end;
+
+    if Bank.ContainsItem(Self.Tinderbox) then
+    begin
+      TinderboxItem := TRSBankItem.Setup(Self.Tinderbox, 1, False);
+      if not Bank.WithdrawItem(TinderboxItem, False) then
+      begin
+        WriteDebug('HandleBanking | Failed to withdraw tinderbox');
+        Exit(False);
+      end;
+      Wait(600, 900);
+    end
+    else
+    begin
+      TerminateScript('No Tinderbox found in bank');
+    end;
+  end;
+
+  // 3. Withdraw Logs
+  if Inventory.ContainsItem(Self.LogType) then
+  begin
+    WriteDebug('HandleBanking | Already have logs');
+    Exit(True);
+  end;
+
+  LogItem := TRSBankItem.Setup(Self.LogType, Bank.QUANTITY_ALL, False);
+
+  for WithdrawAttempts := 1 to 3 do
+  begin
+    WriteDebug('HandleBanking | Withdraw attempt ' + ToStr(WithdrawAttempts));
+
+    if not Bank.IsOpen() then
+      Exit(False);
+
+    if not Bank.ContainsItem(Self.LogType) then
+    begin
+       WriteDebug('HandleBanking | Logs not visible, searching');
+       if Bank.Search(ToStr(Self.LogType)) then
+         Wait(1000, 1500);
+    end;
+
+    if Bank.ContainsItem(Self.LogType) then
+    begin
+      if Bank.WithdrawItem(LogItem, False) then
+      begin
+        Wait(400, 600);
+
+        if WaitUntil(Inventory.ContainsItem(Self.LogType), 200, 3000) then
+        begin
+          WriteDebug('HandleBanking | Withdrew logs successfully');
+          Wait(300, 500);
+          Exit(True);
+        end
+        else
+          WriteDebug('HandleBanking | Logs not in inv after withdraw');
+      end
+      else
+        WriteDebug('HandleBanking | WithdrawItem failed');
+    end
+    else
+      WriteDebug('HandleBanking | Logs not found in bank');
+
+    Wait(500, 800);
+  end;
+
+  // Check if we are really out of logs
+  if not Bank.ContainsItem(Self.LogType) then
+  begin
+      Bank.Close();
+      Self.Report();
+      TerminateScript('Out of logs - script finished');
+  end;
+
+  Result := False;
+end;
+
+(**
+ * ScanForFire
+ *
+ * Scans the surrounding area for an existing Forester Campfire.
+ *
+ * @return True if fire was found
+ *)
+function TForesterCampfire.ScanForFire(): Boolean;
+var
+  SearchArea: TPointArray;
+  Campfire: TRSObjectV2;
+  ATPA: T2DPointArray;
+  i, k: Int32;
+  CheckAreas: array of TPointArray;
+begin
+  // Check preferred fire tiles first, then expand to general area
+  if Self.IsLeftSide then
+    CheckAreas := [LEFT_SELF_FIRE_TILES, GetTilesInRadius(LEFT_GE_TILES, 5)]
+  else
+    CheckAreas := [RIGHT_SELF_FIRE_TILES, GetTilesInRadius(RIGHT_GE_TILES, 5)];
+
+  for k := 0 to High(CheckAreas) do
+  begin
+    SearchArea := CheckAreas[k];
+
+    // Exclude GE desk area
+    for i := High(SearchArea) downto 0 do
+    begin
+      if (SearchArea[i].X >= 8556) and (SearchArea[i].X <= 8568) and
+         (SearchArea[i].Y >= 36466) and (SearchArea[i].Y <= 36478) then
+        Delete(SearchArea, i, 1);
+    end;
+
+    if Length(SearchArea) = 0 then
+      Continue;
+
+    Campfire.SetupUpText(['Forester', 'Campfire']);
+    Campfire.SetupEx([0.7, 0.8, 0.5], SearchArea);
+    Campfire.Finder.Colors := [CTS2(2387591, 19, 0.09, 2.27)];
+    Campfire.Walker := @Map.Walker;
+
+    if Campfire.Find(ATPA) then
+    begin
+      for i := 0 to High(ATPA) do
+      begin
+        Mouse.Move(ATPA[i].Mean());
+        if WaitUntil(MainScreen.IsUpText(['Forester', 'Campfire']), 50, 300) then
+        begin
+          Self.CurrentFireTile := Campfire_MSToWorld(ATPA[i].Mean());
+          WriteDebug('ScanForFire | Found existing fire at ' + ToStr(Self.CurrentFireTile));
+          Self.HasFire := True;
+          Exit(True);
+        end;
+      end;
+    end;
+  end;
+
+  WriteDebug('ScanForFire | No existing fire found');
+  Self.HasFire := False;
+  Self.CurrentFireTile := [0, 0];
+  Result := False;
+end;
+
+(**
+ * CreateFire
+ *
+ * Creates a new fire at the preferred tile and upgrades it to a Forester Campfire.
+ *
+ * @return True if successful
+ *)
+function TForesterCampfire.CreateFire(): Boolean;
+var
+  Tile, startPos: TPoint;
+begin
+  Tile := Self.PreferredFireTile;
+  WriteDebug('CreateFire | Attempting to create fire at ' + ToStr(Tile));
+
+  if not Inventory.ContainsItem(Self.Tinderbox) then
+    Exit(False);
+
+  // Walk to the fire tile
+  if Map.Position().DistanceTo(Tile) > 0 then
+  begin
+    WriteDebug('CreateFire | Walking to tile ' + ToStr(Tile));
+    if Map.Position().DistanceTo(Tile) > 6 then
+    begin
+      Map.Walker.WalkBlind(Tile, 0);
+      WaitUntil(Map.Position().DistanceTo(Tile) <= 5, 200, 8000);
+    end;
+
+    // Click on the tile to move to exact position
+    if Map.Position().DistanceTo(Tile) > 0 then
+    begin
+      ClickTileAt(Tile);
+      WaitUntil(Map.Position().DistanceTo(Tile) = 0, 200, 6000);
+    end;
+
+    // Final check
+    if Map.Position().DistanceTo(Tile) > 0 then
+    begin
+      Map.Walker.WalkBlind(Tile, 0);
+      WaitUntil(Map.Position().DistanceTo(Tile) = 0, 200, 8000);
+    end;
+
+    if Map.Position().DistanceTo(Tile) > 0 then
+    begin
+      WriteDebug('CreateFire | Failed to reach tile. Dist: ' + ToStr(Map.Position().DistanceTo(Tile)));
+      Exit(False);
+    end;
+  end;
+
+  // Light Fire: Use tinderbox on logs
+  if not Inventory.Use(Self.Tinderbox, Self.LogType) then
+  begin
+    WriteDebug('CreateFire | Failed to use tinderbox on logs');
+    Exit(False);
+  end;
+
+  // Wait for player to move (lighting fire moves player off tile)
+  startPos := Map.Position();
+  if not WaitUntil(Map.Position().DistanceTo(startPos) > 0, 200, 8000) then
+  begin
+    WriteDebug('CreateFire | Did not move, checking for existing fire...');
+    if Self.ScanForFire() then
+      Exit(True);
+    WriteDebug('CreateFire | Fire creation failed (no movement, no fire found)');
+    Exit(False);
+  end;
+
+  Wait(600, 1200);
+
+  // Upgrade to Forester Campfire
+  if not Inventory.ClickItem(Self.LogType, 'Use') then
+  begin
+    WriteDebug('CreateFire | Failed to select log for upgrade');
+    Exit(False);
+  end;
+
+  Wait(200, 400);
+
+  if not RightClickTileAt(Tile, ['Fire']) then
+  begin
+    WriteDebug('CreateFire | Failed to click fire to upgrade');
+    Exit(False);
+  end;
+
+  if WaitUntil(Make.IsOpen(), 200, 5000) then
+  begin
+    if Make.Select(0, Make.QUANTITY_ALL, True) then
+    begin
+      WriteDebug('CreateFire | Selected all logs for Forester Campfire');
+      Self.IsBurning := True;
+      Wait(2000, 3000); // Wait for creation animation
+    end
+    else
+    begin
+      WriteDebug('CreateFire | Failed to select All in make interface');
+      Exit(False);
+    end;
+  end
+  else
+  begin
+    WriteDebug('CreateFire | Make interface did not open');
+    Exit(False);
+  end;
+
+  Self.CurrentFireTile := Tile;
+  Self.HasFire := True;
+  Result := True;
+end;
+
+(**
+ * InteractWithFire
+ *
+ * Interacts with the campfire to add logs.
+ *
+ * @return True if interaction was successful
+ *)
+function TForesterCampfire.InteractWithFire(): Boolean;
+var
+  Campfire: TRSObjectV2;
+  ATPA: T2DPointArray;
+begin
+  if Chat.LeveledUp() then
+    Exit(False);
+
+  if Make.IsOpen() then
+  begin
+    if Make.Select(0, Make.QUANTITY_ALL, True) then
+    begin
+      Self.IsBurning := True;
+      Exit(True);
+    end;
+    Exit(False);
+  end;
+
+  if RSInterface.IsOpen() then
+  begin
+    WriteDebug('InteractWithFire | Closing interface');
+    RSInterface.Close();
+    Wait(500, 800);
+  end;
+
+  if Self.CurrentFireTile = [0, 0] then
+  begin
+    if not Self.ScanForFire() then
+      Exit(False);
+  end;
+
+  Campfire.SetupUpText(['Forester', 'Campfire']);
+  Campfire.SetupEx([0.7, 0.8, 0.5], [Self.CurrentFireTile]);
+  Campfire.Finder.Colors += [CTS2(2387591, 19, 0.09, 2.27)];
+  Campfire.Walker := @Map.Walker;
+
+  if not Campfire.Find(ATPA) then
+  begin
+    WriteDebug('InteractWithFire | Fire not found');
+    Self.HasFire := False;
+    Self.CurrentFireTile := [0, 0];
+    Exit(False);
+  end;
+
+  if Campfire.WalkClick() then
+  begin
+    if WaitUntil(Make.IsOpen(), 200, 5000) then
+    begin
+      Result := Make.Select(0, Make.QUANTITY_ALL, True);
+      if Result then
+      begin
+        WriteDebug('InteractWithFire | Selected all logs');
+        Self.IsBurning := True;
+      end;
+      Exit;
+    end;
+
+    // If Make didn't open, we might already be burning
+    WriteDebug('InteractWithFire | Make interface didn''t open, assuming burning');
+    Result := True;
+  end
+  else
+  begin
+    WriteDebug('InteractWithFire | Failed to click fire');
+    Self.HasFire := False;
+    Self.CurrentFireTile := [0, 0];
+    Result := False;
+  end;
+end;
+
+(**
+ * WaitBurning
+ *
+ * Monitor XP gains while logs are burning. Handles interface interruptions and level ups.
+ *
+ * @return True if burning completed normally
+ *)
+function TForesterCampfire.WaitBurning(): Boolean;
+var
+  Timeout: TCountDown;
+  LastXP, CurrentXP: Int32;
+  StartCount, CurrentCount: Int32;
+  NoXPTimer: TCountDown;
+begin
+  Timeout.Init(180000); // 3 mins max
+  NoXPTimer.Init(15000); // 15s without XP timeout
+  LastXP := XPBar.Read();
+  StartCount := Inventory.CountItem(Self.LogType);
+
+  WriteDebug('WaitBurning | Starting burn with ' + ToStr(StartCount) + ' logs');
+
+  while (not Timeout.IsFinished()) and Inventory.ContainsItem(Self.LogType) do
+  begin
+    if Chat.LeveledUp() then
+    begin
+      WriteDebug('WaitBurning | Level up detected');
+      Self.IsBurning := False;
+      Exit(False);
+    end;
+
+    CurrentXP := XPBar.Read();
+    if CurrentXP > LastXP then
+    begin
+      Self.GainedXP := CurrentXP - Self.StartXP;
+      LastXP := CurrentXP;
+      NoXPTimer.Restart(15000);
+      WL.Activity.Restart();
+    end;
+
+    if NoXPTimer.IsFinished() then
+    begin
+      WriteDebug('WaitBurning | No XP detected, checking fire');
+      if not Self.ScanForFire() then
+      begin
+        WriteDebug('WaitBurning | Fire extinguished');
+        Self.IsBurning := False;
+        Exit(False);
+      end;
+      NoXPTimer.Restart(15000);
+    end;
+
+    if Make.IsOpen() then
+    begin
+      WriteDebug('WaitBurning | Make interface reopened, selecting all');
+      Make.Select(0, Make.QUANTITY_ALL, True);
+      Wait(1000, 2000);
+    end;
+
+    Wait(1000, 2000);
+    Self.DoAntiban();
+  end;
+
+  CurrentCount := Inventory.CountItem(Self.LogType);
+  Self.LogsBurned += (StartCount - CurrentCount);
+  Self.TotalActions := Self.LogsBurned;
+  Self.IsBurning := False;
+
+  WriteDebug('WaitBurning | Finished batch');
+  Result := True;
+end;
+
+(**
+ * GetState
+ *
+ * Determines the current state of the bot.
+ *
+ * @return The next EForesterState to execute
+ *)
+function TForesterCampfire.GetState(): EForesterState;
+begin
+  if not RSClient.IsLoggedIn() then
+    Exit(EForesterState.HANDLE_LOGIN);
+
+  if WL.Activity.IsFinished() then
+    Exit(EForesterState.END_SCRIPT);
+
+  if Chat.LeveledUp() then
+    Exit(EForesterState.LEVEL_UP);
+
+  // Bank handling
+  if Bank.IsOpen() then
+  begin
+    if Inventory.ContainsItem(Self.LogType) then
+    begin
+      if not Self.HasFire and not Inventory.ContainsItem(Self.Tinderbox) then
+        Exit(EForesterState.HANDLE_BANK);
+
+      Exit(EForesterState.CLOSE_BANK);
+    end;
+
+    Exit(EForesterState.HANDLE_BANK);
+  end;
+
+  // No logs - need to bank
+  if not Inventory.ContainsItem(Self.LogType) then
+  begin
+    if not Self.HasFire and not Self.HasScannedForFire then
+      Exit(EForesterState.FIND_EXISTING_FIRE);
+
+    Exit(EForesterState.OPEN_BANK);
+  end;
+
+  // Have logs but no fire
+  if not Self.HasFire then
+  begin
+    if Self.HasScannedForFire and not Inventory.ContainsItem(Self.Tinderbox) then
+      Exit(EForesterState.OPEN_BANK);
+
+    Exit(EForesterState.FIND_EXISTING_FIRE);
+  end;
+
+  Exit(EForesterState.BURN_LOGS);
+end;
+
+// -----------------------------------------------------------------------------
+// Main Loop
+// -----------------------------------------------------------------------------
+
+(**
+ * Run
+ *
+ * Main execution loop of the script.
+ *
+ * @param maxActions  Maximum actions
+ * @param maxTime     Maximum runtime
+ *)
+procedure TForesterCampfire.Run(maxActions: UInt32; maxTime: UInt64);
+begin
+  Self.Init(maxActions, maxTime);
+
+  repeat
+    Self.State := Self.GetState();
+    Self.SetAction(ToStr(Self.State));
+
+    if Self.ReportTimer.ElapsedTime() > 300000 then
+    begin
+      Self.Report();
+      Self.ReportTimer.Reset();
+    end;
+
+    case Self.State of
+      EForesterState.HANDLE_LOGIN:
+      begin
+        WriteDebug('HANDLE_LOGIN | Attempting login');
+        if Login.LoginPlayer() then
+        begin
+          Wait(2000, 3000);
+          WL.Activity.Restart();
+        end
+        else
+          Wait(3000, 5000);
+      end;
+
+      EForesterState.OPEN_BANK:
+      begin
+        if Bank.IsOpen() then
+        begin
+          WriteDebug('OPEN_BANK | Bank already open');
+          Wait(500, 1000);
+          Exit;
+        end;
+
+        Self.AdjustCameraForBanking();
+        if Self.FindBank() then
+          WaitUntil(Bank.IsOpen(), 200, 5000)
+        else
+          Wait(1000, 2000);
+      end;
+
+      EForesterState.HANDLE_BANK:
+      begin
+        if not Self.HandleBanking() then
+        begin
+          if Bank.IsOpen() then
+            Bank.Close();
+          Wait(1000, 1500);
+        end;
+      end;
+
+      EForesterState.CLOSE_BANK:
+      begin
+        Bank.Close();
+        Wait(400, 600);
+      end;
+
+      EForesterState.FIND_EXISTING_FIRE:
+      begin
+        if not Self.HasScannedForFire then
+        begin
+          Self.HasScannedForFire := True;
+          Self.ScanForFire();
+        end;
+
+        if not Self.HasFire and Inventory.ContainsItem(Self.LogType) then
+        begin
+          if not Inventory.ContainsItem(Self.Tinderbox) then
+            WriteDebug('FIND_EXISTING_FIRE | Missing tinderbox')
+          else
+          begin
+            if not Self.CreateFire() then
+              Wait(1000, 2000);
+          end;
+        end;
+      end;
+
+      EForesterState.BURN_LOGS:
+      begin
+        if Self.IsBurning then
+          Self.WaitBurning()
+        else
+        begin
+          if Self.InteractWithFire() then
+            Self.WaitBurning()
+          else
+          begin
+            Self.HasFire := False;
+            Self.HasScannedForFire := False;
+          end;
+        end;
+      end;
+
+      EForesterState.LEVEL_UP:
+      begin
+        WriteLn('LEVEL_UP | Firemaking level up!');
+        if RSInterface.IsOpen() then
+        begin
+          RSInterface.Close();
+          Wait(500, 800);
+        end;
+        Chat.HandleLevelUp();
+        Wait(1000, 3000);
+      end;
+
+      EForesterState.END_SCRIPT:
+      begin
+        Self.Report();
+        Break;
+      end;
+    end;
+
+    Self.DoAntiban();
+  until Self.ShouldStop();
+
+  Self.Report();
+end;
+
+(**
+ * BuildTextReport
+ *
+ * Builds the progress report string for the onscreen paint.
+ *
+ * @return Array of report strings
+ *)
+function TForesterCampfire.BuildTextReport(): TStringArray; override;
+var
+  elapsedTime: UInt64;
+begin
+  if Self.Action = Self.PreviousAction then
+    Exit(ProgressReport.ProgressArray);
+
+  elapsedTime := Self.TimeRunning.ElapsedTime();
+
+  Result += ' Action        : ' + Self.Action;
+  Result += ' Runtime       : ' + SRL.MsToTime(elapsedTime, Time_Short).Strip();
+  Result += ' Log Type      : ' + ToStr(Self.LogType);
+  Result += ' Logs Burned   : ' + ToStr(Self.LogsBurned);
+  Result += ' Logs/Hour     : ' + ToStr(NumberPerHour(Self.LogsBurned, elapsedTime));
+  Result += ' XP Gained     : ' + SRL.FormatNumber(XPBar.Read() - Self.StartXP, 2);
+  Result += ' XP/Hour       : ' + SRL.FormatNumber(NumberPerHour(XPBar.Read() - Self.StartXP, elapsedTime), 2);
+end;
+
+// -----------------------------------------------------------------------------
+// GUI & Configuration
+// -----------------------------------------------------------------------------
+
+{$IFNDEF SCRIPT_CHAIN}
+{$IFDEF SCRIPT_GUI}
+type
+  TForesterConfig = record(TScriptForm)
+    LogLabel: TLabel;
+    LogSelector: TComboBox;
+  end;
+
+var
+  ForesterConfig: TForesterConfig;
+
+(**
+ * SaveConfig
+ *
+ * Saves the current GUI configuration to JSON.
+ *)
+procedure SaveConfig();
+begin
+  if not Config.IsSetup then
+    Config.Setup('orka-campfire');
+
+  Config.Put('logType', ForesterConfig.LogSelector.GetItemIndex());
+end;
+
+(**
+ * LoadConfig
+ *
+ * Loads saved configuration from JSON.
+ *)
+procedure LoadConfig();
+begin
+  if not Config.IsSetup then
+    Config.Setup('orka-campfire');
+
+  if Config.Has('logType') then
+    ForesterConfig.LogSelector.SetItemIndex(Config.GetInt('logType'));
+end;
+
+(**
+ * StartScript
+ *
+ * Event handler for the Start button. Configures bot based on GUI inputs.
+ *
+ * @param sender  The object that triggered the event
+ *)
+procedure TForesterConfig.StartScript(sender: TObject); override;
+begin
+  case Self.LogSelector.GetItemIndex() of
+    0: ForesterBot.LogType := 'Logs';
+    1: ForesterBot.LogType := 'Oak logs';
+    2: ForesterBot.LogType := 'Willow logs';
+    3: ForesterBot.LogType := 'Maple logs';
+    4: ForesterBot.LogType := 'Yew logs';
+    5: ForesterBot.LogType := 'Magic logs';
+    6: ForesterBot.LogType := 'Redwood logs';
+  end;
+
+  SaveConfig();
+  inherited;
+end;
+
+(**
+ * Run
+ *
+ * Sets up and displays the GUI.
+ *)
+procedure TForesterConfig.Run(); override;
+var
+  tab, accountTab: TTabSheet;
+  Font: TFont;
+  Img: TPicture;
+  BGImg: TImage;
+  item: String;
+begin
+  Self.Setup('Orka Campfire');
+  Self.Start.setOnClick(@Self.StartScript);
+
+  with Self.Start do
+  begin
+    SetAlign(alNone);
+    SetWidth(TControl.AdjustToDPI(150));
+    SetHeight(TControl.AdjustToDPI(40));
+    SetLeft(Self.Form.GetWidth() - GetWidth() - TControl.AdjustToDPI(20));
+    SetTop(Self.Form.GetHeight() - GetHeight() - TControl.AdjustToDPI(25));
+  end;
+
+  Font.Init();
+  Font.setName('Verdana');
+  Font.SetQuality(fqCleartype);
+  Self.Form.setFont(Font);
+  Self.PageControl.SetFont(Font);
+  Font.Free();
+
+  Self.AddTab('Script Settings');
+  tab := Self.Tabs[High(Self.Tabs)];
+
+  if not FileExists(AppPath + 'Resources\OrkaCampfireBG.jpeg') then
+    DownloadToFile('https://i.imgur.com/GlokJmj.jpeg', AppPath + 'Resources\OrkaCampfireBG.jpeg');
+
+  if FileExists(AppPath + 'Resources\OrkaCampfireBG.jpeg') then
+  begin
+    Img.Init();
+    Img.LoadFromFile(AppPath + 'Resources\OrkaCampfireBG.jpeg');
+    with BGImg do
+    begin
+      Create(tab);
+      SetParent(tab);
+      SetPicture(Img);
+      SetBounds(0, 0, Self.Form.GetWidth(), Self.Form.GetHeight());
+      SetStretch(True);
+      SetAlign(alClient);
+    end;
+  end;
+
+  with Self.LogSelector do
+  begin
+    Create(tab);
+    SetWidth(Self.Start.GetWidth());
+    SetLeft(Self.Start.GetLeft() - TControl.AdjustToDPI(4));
+    SetTop(Self.Start.GetTop() - GetHeight() - TControl.AdjustToDPI(32));
+    SetStyle(csDropDownList);
+    for item in ['Logs', 'Oak logs', 'Willow logs', 'Maple logs', 'Yew logs', 'Magic logs', 'Redwood logs'] do
+      getItems().Add(item);
+    SetItemIndex(3); // Default Maple
+    BringToFront();
+  end;
+
+  with Self.LogLabel do
+  begin
+    Create(tab);
+    SetCaption('Log type:');
+    GetFont.SetStyle([fsBold]);
+    GetFont.SetColor($FFFFFF);
+    SetLeft(Self.LogSelector.GetLeft());
+    SetTop(Self.LogSelector.GetTop() - GetHeight() - TControl.AdjustToDPI(2));
+    BringToFront();
+  end;
+
+  Self.AddTab('Account Manager');
+  accountTab := Self.Tabs[High(Self.Tabs)];
+  Self.CreateAccountManager(accountTab);
+
+  LoadConfig();
+
+  Self.CreateAntibanManager();
+  Self.CreateWaspLibSettings();
+
+  inherited;
+end;
+{$ENDIF}
+{$ENDIF}
+
+begin
+  {$IFDEF SCRIPT_GUI}
+  ForesterConfig.Run();
+  {$ENDIF}
+  ForesterBot.Run(WLSettings.MaxActions, WLSettings.MaxTime);
+end.
