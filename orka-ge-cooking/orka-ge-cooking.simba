@@ -1,0 +1,1825 @@
+(**
+ * ============================================================================
+ * Orka GE Cooking - Credits & Appreciation
+ * ============================================================================
+ *
+ * This script wouldn't exist without the incredible work of the WaspScripts community.
+ *
+ * Special thanks to the admins, moderators, scripters, and testers who
+ * maintain and continuously improve WaspLib, SRL-T, and the entire ecosystem.
+ *
+ * Credits:
+ * Torwent  |  3Garrett3  |  Student  |  BigAussie  |  Kriptic
+ * Fik  |  skunkworks  |  XJ  |  unit
+ *
+ * A huge thank you to everyone in the WaspScripts community who provides
+ * feedback, reports bugs, tests scripts, and helps newcomers learn.
+ *
+ * ============================================================================
+ *)
+
+{$DEFINE SCRIPT_REVISION := '3'}
+program OrkaGECooking;
+{$DEFINE SCRIPT_GUI}
+{$I SRL-T/osr.simba}
+{$I WaspLib/osr.simba}
+
+const
+  SCRIPT_NAME = 'Orka GE Cooking';
+  VERBOSE_LOGGING = True;
+
+  // GE Coordinates
+  LEFT_GE_TILES: TPointArray = [[8552, 36478], [8548, 36474], [8548, 36470], [8552, 36466]];
+  RIGHT_GE_TILES: TPointArray = [[8572, 36478], [8576, 36474], [8576, 36470], [8572, 36466]];
+  LEFT_FIRE_TILE: TPoint = [8548, 36474];
+  RIGHT_FIRE_TILE: TPoint = [8576, 36474];
+  LEFT_SELF_FIRE_TILES: TPointArray = [[8548, 36470], [8548, 36474]];
+  RIGHT_SELF_FIRE_TILES: TPointArray = [[8576, 36470], [8576, 36474]];
+  LEFT_BANK_TILE: TPoint = [8554, 36474];
+  RIGHT_BANK_TILE: TPoint = [8570, 36474];
+
+type
+  TLoadoutItem = record
+    Name: String;
+    Quantity: Int32;
+  end;
+
+  ECookingMode = (MODE_CAMPFIRE, MODE_SELF_FIRE);
+
+  EGECookerState = (
+    HANDLE_LOGIN,
+    SCAN_FOR_FIRE,
+    OPEN_BANK,
+    HANDLE_BANK,
+    CLOSE_BANK,
+    FIND_EXISTING_FIRE,
+    CREATE_FIRE,
+    COOK_FOOD,
+    WAIT_COOKING,
+    LEVEL_UP,
+    END_SCRIPT
+  );
+
+  TGECooker = record(TBaseWalkerScript)
+    State: EGECookerState;
+    CookingMode: ECookingMode;
+    FireTileIndex: Int32;
+    NextCampfireScan: Int64;
+    RawFood: TRSItem;
+    Tinderbox: TRSItem;
+    LogPriorities: TStringArray;
+    SelectedFood: String;
+
+    IsLeftSide: Boolean;
+    BankTile: TPoint;
+    PreferredFireTile: TPoint;
+    CurrentFireTile: TPoint;
+    FireObject: TRSObjectV2;
+
+    StartXP, GainedXP: Int32;
+    FoodCooked: Int32;
+
+    TotalBreakTime, LastBreakStartTime, LastBreakEndTime: Int64;
+
+    HasFire: Boolean;
+    IsCooking: Boolean;
+    HasScannedForFire: Boolean;
+    NeedFireSupplies: Boolean;
+    CachedLog: String;
+
+    ReportTimer: TStopwatch;
+  end;
+
+var
+  CookerBot: TGECooker;
+  Config: TConfigJSON;
+
+// -----------------------------------------------------------------------------
+// Helper Functions
+// -----------------------------------------------------------------------------
+
+(**
+ * WriteDebug
+ *
+ * Writes a debug message to the console if verbose logging is enabled.
+ * Automatically prepends a timestamp and script tag.
+ *
+ * @param msg The message to log
+ *)
+procedure WriteDebug(msg: String);
+begin
+  if VERBOSE_LOGGING then
+    WriteLn(SRL.TimeStamp(), ':[GE Cooking]: ', msg);
+end;
+
+(**
+ * GetTilesInRadius
+ *
+ * Generates a list of all tiles within a specified radius of given center points.
+ * Used for defining search areas or exclusion zones.
+ *
+ * @param Centers      Array of center points to generate tiles around
+ * @param RadiusTiles  Radius in tiles to extend from each center
+ * @return             Array of unique tiles within the radius of any center
+ *)
+function GetTilesInRadius(Centers: TPointArray; RadiusTiles: Int32): TPointArray;
+var
+  Center: TPoint;
+  x, y: Int32;
+  p: TPoint;
+begin
+  for Center in Centers do
+    for x := -RadiusTiles to RadiusTiles do
+      for y := -RadiusTiles to RadiusTiles do
+        if (x*x + y*y) <= (RadiusTiles * RadiusTiles) then
+        begin
+          p := [Center.X + (x * 4), Center.Y + (y * 4)];
+          if not Result.Contains(p) then
+            Result += p;
+        end;
+end;
+
+(**
+ * Campfire_MSToWorld
+ *
+ * Converts a main screen point (MS) to a world tile coordinate.
+ * Used to determine the exact world tile of a found fire object.
+ *
+ * @param MSPt  Point on the Main Screen
+ * @return      The corresponding World Tile
+ *)
+function Campfire_MSToWorld(MSPt: TPoint): TPoint;
+var
+  Me, MMPt: TPoint;
+  Angle: Double;
+  Vec: Vector3;
+begin
+  Me := Map.Position();
+  Vec := MainScreen.PointToMM(MSPt);
+  MMPt := [Round(Vec.X), Round(Vec.Y)];
+  Angle := Minimap.GetCompassAngle(False);
+
+  Result := Me + MMPt - Minimap.Center;
+  Result := Result.Rotate(-Angle, Me);
+end;
+
+(**
+ * RightClickTileAt
+ *
+ * Moves the mouse to a tile and right-clicks to open the context menu.
+ * Attempts to select one of the provided options.
+ *
+ * @param tile     Target world tile to click
+ * @param options  Array of menu options to look for
+ * @return         True if an option was successfully selected
+ *)
+function RightClickTileAt(tile: TPoint; options: TStringArray): Boolean;
+var
+  rect: TRectangle;
+  attempt: Int32;
+begin
+  rect := Map.GetTileMS(tile).Expand(MainScreen.NormalizeDistance(4));
+
+  for attempt := 1 to 4 do
+  begin
+    Mouse.Move(rect);
+    Mouse.Click(MOUSE_RIGHT);
+    if ChooseOption.Select(options) then
+      Exit(True);
+    Wait(150, 250);
+  end;
+
+  WriteDebug('RightClickTileAt | Failed to find options: ' + ToStr(options));
+  Result := False;
+end;
+
+(**
+ * ClickTileAt
+ *
+ * Left clicks a tile on the main screen.
+ *
+ * @param tile  Target world tile
+ * @return      True if clicked
+ *)
+function ClickTileAt(tile: TPoint): Boolean;
+var
+  rect: TRectangle;
+begin
+  rect := Map.GetTileMS(tile).Expand(MainScreen.NormalizeDistance(4));
+  Mouse.Move(rect);
+  Mouse.Click(MOUSE_LEFT);
+  Result := True;
+end;
+
+// -----------------------------------------------------------------------------
+// Stats Report
+// -----------------------------------------------------------------------------
+
+(**
+ * TGECooker.Report
+ *
+ * Prints a formatted progress report to the debug console.
+ * Includes runtime, XP gained, items processed, and break information.
+ *)
+procedure TGECooker.Report();
+var
+  RunTime: Int64;
+  XPPerHour, FoodPerHour: Int32;
+  leftCol, rightCol: String;
+  bannerWidth: Int32 = 59;
+  separator: String;
+  title: String;
+  TimeSinceLastBreak: Int64;
+begin
+  RunTime := GetTimeRunning();
+
+  if RunTime > 0 then
+  begin
+    XPPerHour := Round((Self.GainedXP) / (RunTime / 3600000));
+    FoodPerHour := Round((Self.FoodCooked) / (RunTime / 3600000));
+  end
+  else
+  begin
+    XPPerHour := 0;
+    FoodPerHour := 0;
+  end;
+
+  separator := '|' + StringOfChar('=', bannerWidth - 2) + '|';
+  title := SCRIPT_NAME;
+  title := '|' + PadR(PadL(title, (bannerWidth - 2 + Length(title)) div 2, ' '), bannerWidth - 2, ' ') + '|';
+
+  WriteLn(separator);
+  WriteLn(title);
+  WriteLn(separator);
+
+  leftCol := 'Runtime: ' + SRL.MsToTime(RunTime, Time_Short);
+  if Length(Antiban.Breaks) > 0 then
+    rightCol := 'Next break: ' + SRL.MsToTime(Max(0, Round(Antiban.Breaks[0].NextAtTime - RunTime)), Time_Short)
+  else
+    rightCol := 'Next break: N/A';
+  WriteLn('| ' + PadR(leftCol, 22, ' ') + ' | ' + PadR(rightCol, 30, ' ') + ' |');
+
+  leftCol := 'Food Cooked: ' + ToString(Self.FoodCooked);
+  if Self.LastBreakEndTime > 0 then
+  begin
+    TimeSinceLastBreak := RunTime - Self.LastBreakEndTime;
+    rightCol := 'Since last break: ' + SRL.MsToTime(TimeSinceLastBreak, Time_Short);
+  end
+  else
+    rightCol := 'Since last break: N/A';
+  WriteLn('| ' + PadR(leftCol, 22, ' ') + ' | ' + PadR(rightCol, 30, ' ') + ' |');
+
+  leftCol := 'Food/Hr: ' + ToString(FoodPerHour);
+  if Self.TotalBreakTime > 0 then
+    rightCol := 'Total break time: ' + SRL.MsToTime(Self.TotalBreakTime, Time_Short)
+  else
+    rightCol := 'Total break time: N/A';
+  WriteLn('| ' + PadR(leftCol, 22, ' ') + ' | ' + PadR(rightCol, 30, ' ') + ' |');
+
+  leftCol := 'XP gained: ' + ToString(Round(Self.GainedXP));
+  if Length(Antiban.Sleeps) > 0 then
+    rightCol := 'Next sleep: ' + SRL.MsToTime(Max(0, Round(Antiban.Sleeps[0].NextAtTime - RunTime)), Time_Short)
+  else
+    rightCol := 'Next sleep: N/A';
+  WriteLn('| ' + PadR(leftCol, 22, ' ') + ' | ' + PadR(rightCol, 30, ' ') + ' |');
+
+  leftCol := 'XP/Hr: ' + ToString(XPPerHour);
+  if WLSettings.MaxTime > 0 then
+    rightCol := 'Shutdown: ' + SRL.MsToTime(Max(0, WLSettings.MaxTime - RunTime), Time_Short)
+  else
+    rightCol := 'Shutdown: N/A';
+  WriteLn('| ' + PadR(leftCol, 22, ' ') + ' | ' + PadR(rightCol, 30, ' ') + ' |');
+
+  WriteLn(separator);
+end;
+
+// -----------------------------------------------------------------------------
+// Break Callbacks
+// -----------------------------------------------------------------------------
+
+(**
+ * OnBreakStart
+ *
+ * Callback executed when a break starts. Records break start time.
+ *
+ * @param Task  Pointer to the break task
+ *)
+procedure OnBreakStart(Task: PBreakTask);
+begin
+  Task;
+  CookerBot.LastBreakStartTime := GetTimeRunning();
+end;
+
+(**
+ * OnBreakEnd
+ *
+ * Callback executed when a break ends. Updates total break duration.
+ *
+ * @param Task  Pointer to the break task
+ *)
+procedure OnBreakEnd(Task: PBreakTask);
+var
+  BreakDuration: Int64;
+begin
+  Task;
+  CookerBot.LastBreakEndTime := GetTimeRunning();
+  BreakDuration := CookerBot.LastBreakEndTime - CookerBot.LastBreakStartTime;
+  CookerBot.TotalBreakTime := CookerBot.TotalBreakTime + BreakDuration;
+end;
+
+// -----------------------------------------------------------------------------
+// TGECooker Implementation
+// -----------------------------------------------------------------------------
+
+(**
+ * TAntiban.Setup
+ *
+ * Configures antiban settings including skills, zoom limits, and break callbacks.
+ *)
+procedure TAntiban.Setup(); override;
+begin
+  Self.Skills := [ERSSkill.COOKING];
+  Self.MinZoom := 10;
+  Self.MaxZoom := 60;
+  Self.OnStartBreak := @OnBreakStart;
+  Self.OnFinishBreak := @OnBreakEnd;
+  inherited;
+end;
+
+(**
+ * TGECooker.Init
+ *
+ * Initializes the script, variables, and location settings.
+ * Detects which side of the GE to use based on proximity.
+ *
+ * @param maxActions  Maximum number of actions (unused)
+ * @param maxTime     Maximum runtime (unused)
+ *)
+procedure TGECooker.Init(maxActions: UInt32; maxTime: UInt64); override;
+var
+  MyPos: TPoint;
+  DistLeft, DistRight: Int32;
+begin
+  inherited;
+
+  ItemFinder.Similarity := 0.99999;
+
+  Self.StartXP := XPBar.Read();
+  Self.GainedXP := 0;
+  Self.FoodCooked := 0;
+  if Self.SelectedFood = '' then
+    Self.SelectedFood := 'Shrimps';
+  if Self.RawFood = '' then
+    Self.RawFood := 'Raw shrimps';
+  Self.Tinderbox := 'Tinderbox';
+  Self.LogPriorities := ['Maple logs', 'Oak logs', 'Logs', 'Willow logs'];
+
+  Self.CookingMode := MODE_CAMPFIRE;
+  Self.FireTileIndex := 0;
+  Self.NextCampfireScan := 0;
+
+  Self.HasFire := False;
+  Self.IsCooking := False;
+  Self.HasScannedForFire := False;
+  Self.NeedFireSupplies := False;
+  Self.CachedLog := '';
+  Self.CurrentFireTile := [0, 0];
+
+  Self.TotalBreakTime := 0;
+  Self.LastBreakStartTime := 0;
+  Self.LastBreakEndTime := 0;
+
+  Self.ReportTimer.Start();
+
+  Map.SetupChunk(Chunk([48, 55, 50, 53], 0));
+
+  MyPos := Map.Position();
+  DistLeft := Round(MyPos.DistanceTo(LEFT_GE_TILES.Sorted(MyPos)[0]));
+  DistRight := Round(MyPos.DistanceTo(RIGHT_GE_TILES.Sorted(MyPos)[0]));
+
+  if DistLeft < DistRight then
+  begin
+    WriteDebug('Init | Detected LEFT side (Distance: ' + ToStr(DistLeft) + ')');
+    Self.IsLeftSide := True;
+    Self.BankTile := LEFT_BANK_TILE;
+    Self.PreferredFireTile := LEFT_FIRE_TILE;
+  end
+  else
+  begin
+    WriteDebug('Init | Detected RIGHT side (Distance: ' + ToStr(DistRight) + ')');
+    Self.IsLeftSide := False;
+    Self.BankTile := RIGHT_BANK_TILE;
+    Self.PreferredFireTile := RIGHT_FIRE_TILE;
+  end;
+
+  Writeln('');
+  Writeln(' _____                                           _____ ');
+  Writeln('( ___ )                                         ( ___ )');
+  Writeln(' |   |~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~|   | ');
+  Writeln(' |   |    _______  ______    ___   _  _______    |   | ');
+  Writeln(' |   |   |       ||    _ |  |   | | ||   _   |   |   | ');
+  Writeln(' |   |   |   _   ||   | ||  |   |_| ||  |_|  |   |   | ');
+  Writeln(' |   |   |  | |  ||   |_||_ |      _||       |   |   | ');
+  Writeln(' |   |   |  |_|  ||    __  ||     |_ |       |   |   | ');
+  Writeln(' |   |   |       ||   |  | ||    _  ||   _   |   |   | ');
+  Writeln(' |   |   |_______||___|  |_||___| |_||__| |__|   |   | ');
+  Writeln(' |   |                                           |   | ');
+  Writeln(' |___|~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~|___| ');
+  Writeln('(_____)                                         (_____)');
+
+  // ===== Credits block =====
+  Writeln('');
+  Writeln('  ___                                             ___  ');
+  Writeln(' |   |****************  CREDITS  ****************|   | ');
+  Writeln(' |   |                                           |   | ');
+  Writeln(' |   |    3Garrett3  |  Torwent  |  Student      |   | ');
+  Writeln(' |   |    BigAussie  |  Kriptic  |  Fik          |   | ');
+  Writeln(' |   |    skunkworks |  XJ       |  unit         |   | ');
+  Writeln(' |   |                                           |   | ');
+  Writeln(' |___|~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~|___| ');
+  Writeln('');
+
+  Writeln('  ___                                             ___  ');
+  Writeln(' |   |************  Orka GE Cooking  ************|   | ');
+  Writeln(' |   |                                           |   | ');
+  Writeln(' |   |    ' + PadR('Food Type: ' + Self.SelectedFood, 39) + '|   | ');
+  if Self.IsLeftSide then
+    Writeln(' |   |    ' + PadR('GE Side:   Left', 39) + '|   | ')
+  else
+    Writeln(' |   |    ' + PadR('GE Side:   Right', 39) + '|   | ');
+  Writeln(' |   |                                           |   | ');
+  Writeln(' |___|~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~|___| ');
+  Writeln('');
+end;
+
+(**
+ * TGECooker.AdjustCameraForBanking
+ *
+ * Adjusts the camera angle to optimize bank interaction based on the current side.
+ * Randomizes the angle within a specific range.
+ *)
+procedure TGECooker.AdjustCameraForBanking();
+var
+  currentAngle: Double;
+  minAngle, maxAngle: Double;
+  targetAngle: Double;
+begin
+  currentAngle := Minimap.GetCompassAngle();
+
+  if Self.IsLeftSide then
+  begin
+    minAngle := 230;
+    maxAngle := 310;
+  end
+  else
+  begin
+    minAngle := 50;
+    maxAngle := 130;
+  end;
+
+  if (currentAngle >= minAngle) and (currentAngle <= maxAngle) then
+    Exit;
+
+  targetAngle := Random(Round(minAngle), Round(maxAngle));
+  Minimap.SetCompassAngle(targetAngle);
+  Wait(300, 600);
+end;
+
+(**
+ * TGECooker.AdjustCameraForScanning
+ *
+ * Adjusts the camera angle to optimize fire scanning.
+ *
+ * @param TargetSideLeft  True if scanning the left side of the GE
+ *)
+procedure TGECooker.AdjustCameraForScanning(TargetSideLeft: Boolean);
+var
+  currentAngle: Double;
+  minAngle, maxAngle: Double;
+  targetAngle: Double;
+begin
+  currentAngle := Minimap.GetCompassAngle();
+
+  if TargetSideLeft then
+  begin
+    minAngle := 50;
+    maxAngle := 130;
+  end
+  else
+  begin
+    minAngle := 230;
+    maxAngle := 310;
+  end;
+
+  if (currentAngle >= minAngle) and (currentAngle <= maxAngle) then
+    Exit;
+
+  targetAngle := Random(Round(minAngle), Round(maxAngle));
+  Minimap.SetCompassAngle(targetAngle);
+  Wait(300, 600);
+end;
+
+(**
+ * TGECooker.FindBank
+ *
+ * Locates and opens the bank using object finding with color.
+ *
+ * @return  True if the bank was successfully clicked
+ *)
+function TGECooker.FindBank(): Boolean;
+var
+  BankObj: TRSObjectV2;
+begin
+  BankObj.SetupEx([1, 1, 6], [Self.BankTile]);
+  BankObj.SetupUpText(['Bank Grand Exchange', 'booth']);
+
+  if Self.IsLeftSide then
+    BankObj.Finder.Colors += [CTS2(7112598, 1, 0.01, 0.01)]
+  else
+    BankObj.Finder.Colors += [CTS2(3490121, 1, 0.01, 0.01)];
+
+  BankObj.Walker := @Map.Walker;
+  Result := BankObj.WalkClick();
+end;
+
+(**
+ * TGECooker.GetBestLog
+ *
+ * Finds the best available log in the bank, with caching and exclusion logic.
+ *
+ * @param ForceSearch  If true, forces a fresh search in the bank
+ * @param ExcludeLog   Log name to exclude from selection (e.g. if withdrawal failed)
+ * @return             Name of the best log found, or empty string
+ *)
+function TGECooker.GetBestLog(ForceSearch: Boolean = False; ExcludeLog: String = ''): String;
+var
+  i: Int32;
+begin
+  if (Self.CachedLog <> '') and (not ForceSearch) and (Self.CachedLog <> ExcludeLog) then
+    Exit(Self.CachedLog);
+
+  for i := 0 to High(Self.LogPriorities) do
+  begin
+    if (Self.LogPriorities[i] = ExcludeLog) then Continue;
+
+    if Bank.ContainsItem(Self.LogPriorities[i]) then
+    begin
+      Self.CachedLog := Self.LogPriorities[i];
+      Exit(Self.CachedLog);
+    end;
+  end;
+
+  if Bank.Search('logs') then
+  begin
+     Wait(1000, 1500);
+     for i := 0 to High(Self.LogPriorities) do
+     begin
+       if (Self.LogPriorities[i] = ExcludeLog) then Continue;
+
+       if Bank.ContainsItem(Self.LogPriorities[i]) then
+       begin
+         Self.CachedLog := Self.LogPriorities[i];
+         Exit(Self.CachedLog);
+       end;
+     end;
+  end;
+
+  Result := '';
+end;
+
+//This function is an overkill for this script, I've used it for training purposes only.
+(**
+ * TGECooker.SmartWithdraw
+ *
+ * Batch withdraws a list of items with intelligent retries, space checking, and verification.
+ *
+ * @param loadout  Array of items to withdraw
+ * @return         True if successful
+ *)
+function TGECooker.SmartWithdraw(loadout: array of TLoadoutItem): Boolean;
+var
+  i, attempts: Int32;
+  loadoutItem: TLoadoutItem;
+  itemToWithdraw: TRSBankItem;
+  projectedEmptySlots, requiredSlots: Int32;
+  cachedStackability: array of Boolean;
+  cachedInventoryCounts: array of Int32;
+  currentCount: Int32;
+  verificationFailed: Boolean;
+begin
+  if not Bank.IsOpen() then
+  begin
+    WriteDebug('SmartWithdraw: Bank is not open.');
+    Exit(False);
+  end;
+
+  SetLength(cachedStackability, Length(loadout));
+  SetLength(cachedInventoryCounts, Length(loadout));
+
+  projectedEmptySlots := Inventory.CountEmptySlots();
+
+  for i := 0 to High(loadout) do
+  begin
+    loadoutItem := loadout[i];
+    cachedStackability[i] := ItemData.GetDefinitionBoolean(loadoutItem.Name, 'stackable');
+
+    if cachedStackability[i] then
+      cachedInventoryCounts[i] := Inventory.CountItemStack(loadoutItem.Name)
+    else
+      cachedInventoryCounts[i] := Inventory.CountItem(loadoutItem.Name);
+
+    if (loadoutItem.Quantity <> Bank.QUANTITY_ALL) and (cachedInventoryCounts[i] >= loadoutItem.Quantity) then Continue;
+
+    requiredSlots := 0;
+
+    if cachedStackability[i] then
+    begin
+      if cachedInventoryCounts[i] = 0 then requiredSlots := 1;
+    end
+    else
+    begin
+      if loadoutItem.Quantity = Bank.QUANTITY_ALL then
+      begin
+        if projectedEmptySlots = 0 then
+        begin
+          WriteDebug('SmartWithdraw: No inventory space for ' + loadoutItem.Name);
+          Exit(False);
+        end;
+        requiredSlots := projectedEmptySlots;
+      end
+      else
+        requiredSlots := (loadoutItem.Quantity - cachedInventoryCounts[i]);
+    end;
+
+    if requiredSlots > projectedEmptySlots then
+    begin
+      WriteDebug(ToStr('SmartWithdraw: Not enough space for ', loadoutItem.Name, '. Needed: ', requiredSlots, ', Free: ', projectedEmptySlots));
+      Exit(False);
+    end;
+
+    projectedEmptySlots := projectedEmptySlots - requiredSlots;
+  end;
+
+  for i := 0 to High(loadout) do
+  begin
+    loadoutItem := loadout[i];
+
+    if (loadoutItem.Quantity <> Bank.QUANTITY_ALL) and (cachedInventoryCounts[i] >= loadoutItem.Quantity) then
+    begin
+      WriteDebug('Already have enough: ' + loadoutItem.Name);
+      Continue;
+    end;
+
+    WriteDebug('Attempting to withdraw: ' + loadoutItem.Name);
+    itemToWithdraw := TRSBankItem.Setup(loadoutItem.Name, loadoutItem.Quantity, False);
+
+    for attempts := 1 to 2 do
+    begin
+      if Bank.WithdrawItem(itemToWithdraw, False) then
+      begin
+        if WaitUntil(Inventory.ContainsItem(loadoutItem.Name), 200, 3000) then
+        begin
+          WriteDebug('Successfully withdrew: ' + loadoutItem.Name);
+          Break;
+        end;
+      end;
+
+      if attempts = 2 then
+      begin
+        WriteDebug('SmartWithdraw: Could not find item ' + loadoutItem.Name);
+
+        if (loadoutItem.Name = Self.RawFood) then
+        begin
+          WriteLn('Out of Raw Food: ', loadoutItem.Name);
+          TerminateScript('Out of Raw Food');
+        end;
+
+        Exit(False);
+      end;
+    end;
+  end;
+
+  for i := 0 to High(loadout) do
+  begin
+    loadoutItem := loadout[i];
+    if ItemData.GetDefinitionBoolean(loadoutItem.Name, 'stackable') then
+      currentCount := Inventory.CountItemStack(loadoutItem.Name)
+    else
+      currentCount := Inventory.CountItem(loadoutItem.Name);
+
+    if loadoutItem.Quantity = Bank.QUANTITY_ALL then
+    begin
+      if currentCount = 0 then
+      begin
+        WriteDebug('Verification failed: Missing ' + loadoutItem.Name);
+        verificationFailed := True;
+        Break;
+      end;
+    end
+    else
+    begin
+      if currentCount < loadoutItem.Quantity then
+      begin
+        WriteDebug(ToStr('Verification failed: ', loadoutItem.Name, ' (Has: ', currentCount, ', Needed: ', loadoutItem.Quantity, ')'));
+        verificationFailed := True;
+        Break;
+      end;
+    end;
+  end;
+
+  if not verificationFailed then
+  begin
+    WriteDebug('SmartWithdraw: Verification successful.');
+    Exit(True);
+  end;
+
+  WriteDebug('SmartWithdraw: Failed to withdraw items after 2 attempts.');
+  Result := False;
+end;
+
+(**
+ * TGECooker.HandleBanking
+ *
+ * Manages banking logic: deposits items, withdraws food and fire supplies.
+ * Handles both "Campfire" and "Self Fire" modes logic using SmartWithdraw.
+ *
+ * @return  True if banking was successful
+ *)
+function TGECooker.HandleBanking(): Boolean;
+var
+  loadout: array of TLoadoutItem;
+  foundLog: String;
+  attempt: Int32;
+  retryLog: Boolean;
+  excludedLog: String;
+begin
+  if not Bank.IsOpen() then Exit(False);
+  Wait(800, 1200);
+  if not Bank.IsOpen() then Exit(False);
+
+  excludedLog := '';
+  retryLog := False;
+
+  for attempt := 1 to 2 do
+  begin
+    if Self.CookingMode = MODE_SELF_FIRE then
+    begin
+      foundLog := Self.GetBestLog(retryLog, excludedLog);
+
+      if foundLog = '' then
+      begin
+        WriteDebug('HandleBanking | No logs found.');
+        if attempt = 2 then
+        begin
+           Bank.Close();
+           TerminateScript('No logs found for Self Fire mode');
+        end;
+        retryLog := True;
+        Continue;
+      end;
+
+      if Inventory.CountItem(Self.RawFood) >= 26 then
+        Bank.DepositRandomItems(['Tinderbox', foundLog])
+      else
+        Bank.DepositRandomItems(['Tinderbox', Self.RawFood, foundLog]);
+
+      Wait(600, 1000);
+
+      loadout := [
+        ['Tinderbox', 1],
+        [foundLog, 1],
+        [Self.RawFood, Bank.QUANTITY_ALL]
+      ];
+    end
+    else
+    begin
+      if Inventory.Count() > 0 then
+      begin
+        Bank.DepositAll();
+        Wait(600, 1000);
+      end;
+
+      loadout := [
+        [Self.RawFood, Bank.QUANTITY_ALL]
+      ];
+    end;
+
+    if Self.SmartWithdraw(loadout) then
+    begin
+      if Self.CookingMode = MODE_SELF_FIRE then
+         Self.NeedFireSupplies := False;
+      Result := True;
+      Exit;
+    end;
+
+    // If SmartWithdraw failed
+    if Self.CookingMode = MODE_SELF_FIRE then
+    begin
+       WriteDebug('HandleBanking | SmartWithdraw failed for Self Fire. Retrying with different log if possible.');
+       retryLog := True;
+       if foundLog <> '' then
+          excludedLog := foundLog;
+       Self.CachedLog := ''; // Clear cache
+    end
+    else
+    begin
+       // Campfire mode failure - critical
+       WriteDebug('HandleBanking | SmartWithdraw failed for Campfire mode.');
+       Result := False;
+       Exit;
+    end;
+  end;
+
+  Result := False;
+end;
+
+(**
+ * TGECooker.ScanForFire
+ *
+ * Scans for an existing fire (Forester Campfire) in the vicinity.
+ * Can scan both sides of the GE and switch sides if a fire is found elsewhere.
+ *
+ * @param AllowSideSwitch  If true, allows switching to the other side if fire is found there
+ * @param ScanOnly         If true, only updates fire status without moving or changing state
+ * @return                 True if a fire was found
+ *)
+function TGECooker.ScanForFire(AllowSideSwitch: Boolean = True; ScanOnly: Boolean = False): Boolean;
+var
+  SearchArea: TPointArray;
+  ATPA: T2DPointArray;
+  i, j, k: Int32;
+  CheckAreas: array of TPointArray;
+  ScanSides: array of Boolean;
+  ScanningLeft: Boolean;
+begin
+  if AllowSideSwitch then
+    ScanSides := [Self.IsLeftSide, not Self.IsLeftSide]
+  else
+    ScanSides := [Self.IsLeftSide];
+
+  for j := 0 to High(ScanSides) do
+  begin
+    ScanningLeft := ScanSides[j];
+
+    if ScanningLeft <> Self.IsLeftSide then
+    begin
+      Self.AdjustCameraForScanning(ScanningLeft);
+      Wait(600, 1000);
+    end;
+
+    if ScanningLeft then
+      CheckAreas := [LEFT_SELF_FIRE_TILES, GetTilesInRadius(LEFT_GE_TILES, 5)]
+    else
+      CheckAreas := [RIGHT_SELF_FIRE_TILES, GetTilesInRadius(RIGHT_GE_TILES, 5)];
+
+    for k := 0 to High(CheckAreas) do
+    begin
+      SearchArea := CheckAreas[k];
+
+      for i := High(SearchArea) downto 0 do
+      begin
+        if (SearchArea[i].X >= 8556) and (SearchArea[i].X <= 8568) and
+           (SearchArea[i].Y >= 36466) and (SearchArea[i].Y <= 36478) then
+          Delete(SearchArea, i, 1);
+      end;
+
+      if Length(SearchArea) > 0 then
+      begin
+        Self.FireObject.SetupUpText(['Forester', 'Campfire']);
+        Self.FireObject.SetupEx([0.7, 0.8, 0.5], SearchArea);
+        Self.FireObject.Finder.Colors := [CTS2(2387591, 19, 0.09, 2.27)];
+        Self.FireObject.Walker := @Map.Walker;
+
+        if Self.FireObject.Find(ATPA) then
+        begin
+          for i := 0 to High(ATPA) do
+          begin
+            Mouse.Move(ATPA[i].Mean());
+            if WaitUntil(MainScreen.IsUpText(['Forester', 'Campfire']), 50, 300) then
+            begin
+              Self.CurrentFireTile := Campfire_MSToWorld(ATPA[i].Mean());
+              WriteDebug('ScanForFire | Found existing fire at ' + ToStr(Self.CurrentFireTile));
+
+              Self.FireObject.Coordinates := [Self.CurrentFireTile];
+              Self.FireObject.Rotations := [0.0];
+
+              if ScanOnly then
+              begin
+                Self.HasFire := True;
+                Self.NeedFireSupplies := False;
+                Self.CookingMode := MODE_CAMPFIRE;
+                Self.NextCampfireScan := GetTimeRunning() + Random(12 * 60000, 20 * 60000);
+                Exit(True);
+              end;
+
+              if ScanningLeft <> Self.IsLeftSide then
+              begin
+                  if ScanningLeft then
+                     WriteDebug('ScanForFire | Switching sides to Left')
+                  else
+                     WriteDebug('ScanForFire | Switching sides to Right');
+
+                  Self.IsLeftSide := ScanningLeft;
+                  if Self.IsLeftSide then
+                  begin
+                      Self.BankTile := LEFT_BANK_TILE;
+                      Self.PreferredFireTile := LEFT_FIRE_TILE;
+                  end
+                  else
+                  begin
+                      Self.BankTile := RIGHT_BANK_TILE;
+                      Self.PreferredFireTile := RIGHT_FIRE_TILE;
+                  end;
+
+                  if Self.FindBank() then
+                  begin
+                       WaitUntil(Bank.IsOpen(), 200, 8000);
+                       if Bank.IsOpen() then
+                          Bank.Close();
+                  end;
+              end;
+
+              Self.HasFire := True;
+              Self.NeedFireSupplies := False;
+              Self.CookingMode := MODE_CAMPFIRE;
+              Self.NextCampfireScan := GetTimeRunning() + Random(12 * 60000, 20 * 60000);
+              Exit(True);
+            end;
+          end;
+        end;
+      end;
+    end;
+  end;
+
+  WriteDebug('ScanForFire | No existing fire found');
+  if not ScanOnly then
+  begin
+    Self.HasFire := False;
+    Self.CurrentFireTile := [0, 0];
+    Self.CookingMode := MODE_SELF_FIRE;
+    Self.NextCampfireScan := GetTimeRunning() + Random(12 * 60000, 20 * 60000);
+  end;
+  Result := False;
+end;
+
+(**
+ * TGECooker.CreateFire
+ *
+ * Walks to a designated tile and lights a fire using a tinderbox and logs.
+ * Upgrades the fire to a Forester Campfire if possible.
+ *
+ * @return  True if fire was successfully created
+ *)
+function TGECooker.CreateFire(): Boolean;
+var
+  Tile, startPos: TPoint;
+  MyLog: TRSItem;
+  i: Int32;
+  Tiles: TPointArray;
+  ATPA: T2DPointArray;
+  Timeout: TCountDown;
+  Moved, Blocked: Boolean;
+begin
+  Inventory.SetSelectedSlot(-1);
+
+  if Self.IsLeftSide then
+    Tiles := LEFT_SELF_FIRE_TILES
+  else
+    Tiles := RIGHT_SELF_FIRE_TILES;
+
+  if (Self.FireTileIndex < 0) or (Self.FireTileIndex > High(Tiles)) then
+     Self.FireTileIndex := 0;
+
+  Tile := Tiles[Self.FireTileIndex];
+  Self.FireTileIndex := (Self.FireTileIndex + 1) mod Length(Tiles);
+
+  WriteDebug('CreateFire | Attempting to create fire at ' + ToStr(Tile));
+
+  if not Inventory.ContainsItem(Self.Tinderbox) then
+    Exit(False);
+
+  MyLog := '';
+  for i := 0 to High(Self.LogPriorities) do
+  begin
+    if Inventory.ContainsItem(Self.LogPriorities[i]) then
+    begin
+      MyLog := Self.LogPriorities[i];
+      Break;
+    end;
+  end;
+
+  if MyLog = '' then
+  begin
+    WriteDebug('CreateFire | No known logs in inventory');
+    Exit(False);
+  end;
+
+  if Map.Position().DistanceTo(Tile) > 0 then
+  begin
+    WriteDebug('CreateFire | Walking to tile ' + ToStr(Tile));
+    if Map.Position().DistanceTo(Tile) > 6 then
+    begin
+      Map.Walker.WalkBlind(Tile, 0);
+      WaitUntil(Map.Position().DistanceTo(Tile) <= 5, 200, 8000);
+    end;
+
+    if Map.Position().DistanceTo(Tile) > 0 then
+    begin
+      ClickTileAt(Tile);
+      WaitUntil(Map.Position().DistanceTo(Tile) = 0, 200, 6000);
+    end;
+
+    if Map.Position().DistanceTo(Tile) > 0 then
+    begin
+      WriteDebug('CreateFire | Failed to reach tile');
+      Exit(False);
+    end;
+  end;
+
+  if not Inventory.Use(Self.Tinderbox, MyLog) then
+  begin
+    WriteDebug('CreateFire | Failed to use tinderbox on logs');
+    Exit(False);
+  end;
+
+  startPos := Map.Position();
+  Timeout.Init(8000);
+  Moved := False;
+  Blocked := False;
+
+  while not Timeout.IsFinished() do
+  begin
+    if Map.Position().DistanceTo(startPos) > 0 then
+    begin
+      Moved := True;
+      Break;
+    end;
+
+    if Chat.FindMessage('You can''t light a fire here') then
+    begin
+       Blocked := True;
+       Break;
+    end;
+
+    Wait(100);
+  end;
+
+  if Blocked then
+  begin
+      WriteDebug('CreateFire | Blocked by existing fire (Chat detected). Checking tile...');
+
+      Self.FireObject.SetupUpText(['Fire', 'Campfire']);
+      Self.FireObject.SetupEx([0.7, 0.8, 0.5], [Tile]);
+      Self.FireObject.Finder.Colors := [CTS2(2387591, 19, 0.09, 2.27), CTS2(4625841, 15, 0.16, 1.83)];
+      Self.FireObject.Walker := @Map.Walker;
+
+      if Self.FireObject.Find(ATPA) then
+      begin
+        WriteDebug('CreateFire | Found existing fire at ' + ToStr(Tile));
+
+        if Length(ATPA) > 0 then
+        begin
+          Mouse.Move(ATPA[0].Mean());
+          if WaitUntil(MainScreen.IsUpText(['Campfire', 'Forester']), 50, 500) then
+          begin
+             WriteDebug('CreateFire | Existing fire is a CAMPFIRE. Switching to Campfire Mode.');
+             Self.CookingMode := MODE_CAMPFIRE;
+             Self.NextCampfireScan := GetTimeRunning() + Random(12 * 60000, 20 * 60000);
+          end;
+        end;
+
+        Self.CurrentFireTile := Tile;
+        Self.HasFire := True;
+        Self.NeedFireSupplies := False;
+        Exit(True);
+      end;
+      
+      WriteDebug('CreateFire | Blocked but no fire found on tile?');
+      Exit(False);
+  end;
+
+  if not Moved then
+  begin
+    WriteDebug('CreateFire | Did not move, checking for existing fire (fallback)...');
+    if Self.ScanForFire(True) then
+      Exit(True);
+    WriteDebug('CreateFire | Fire creation failed');
+    Exit(False);
+  end;
+
+  Wait(600, 1200);
+
+  if not Inventory.ClickItem(MyLog, 'Use') then
+  begin
+    if not Inventory.ContainsItem(MyLog) then
+    begin
+      WriteDebug('CreateFire | Lit fire with last log. Assuming fire exists.');
+      Self.CurrentFireTile := Tile;
+      Self.HasFire := True;
+      Self.NeedFireSupplies := False;
+      Exit(True);
+    end;
+  end;
+
+  Self.CurrentFireTile := Tile;
+  Self.HasFire := True;
+  Self.NeedFireSupplies := False;
+  Result := True;
+end;
+
+(**
+ * TGECooker.InteractWithFire
+ *
+ * Interacts with the fire object (Left click or Right click -> Use/Fire).
+ *
+ * @return  True if interaction was successful
+ *)
+function TGECooker.InteractWithFire(): Boolean;
+var
+  ExpectedUpText: TStringArray;
+  ATPA: T2DPointArray;
+  TargetPt: TPoint;
+begin
+  if Self.CurrentFireTile = [0, 0] then Exit(False);
+
+  // Define expected UpText based on mode
+  if Self.CookingMode = MODE_CAMPFIRE then
+    ExpectedUpText := ['Campfire']
+  else
+    ExpectedUpText := ['Fire', 'Campfire'];
+
+  WriteDebug('InteractWithFire | Mode: ' + ToStr(Self.CookingMode) + ' | Tile: ' + ToStr(Self.CurrentFireTile));
+
+  // Update object properties
+  Self.FireObject.Coordinates := [Self.CurrentFireTile];
+  Self.FireObject.Rotations := [0.0];
+  // Clear UpText so Find doesn't filter out valid objects that are covered
+  Self.FireObject.SetupUpText([]);
+  Self.FireObject.Walker := @Map.Walker;
+
+  // Attempt to find object, fallback to tile center
+  TargetPt := [-1, -1];
+  if Self.FireObject.Find(ATPA) then
+  begin
+    if Length(ATPA) > 0 then
+      TargetPt := ATPA[0].Mean();
+  end;
+
+  if TargetPt = [-1, -1] then
+    Mouse.Move(Map.GetTileMS(Self.CurrentFireTile))
+  else
+    Mouse.Move(TargetPt);
+
+  // Wait for UpText to appear
+  Wait(100, 200);
+
+  // If UpText matches, we can Left Click
+  if MainScreen.IsUpText(ExpectedUpText) then
+  begin
+    Mouse.Click(MOUSE_LEFT);
+    Result := True;
+    Exit;
+  end;
+
+  // If UpText doesn't match (e.g. covered by players), Right Click and find option
+  WriteDebug('InteractWithFire | UpText mismatch, trying Right Click');
+  Mouse.Click(MOUSE_RIGHT);
+
+  // Use ChooseOption to find the correct interaction
+  if ChooseOption.Select(ExpectedUpText) then
+  begin
+    Result := True;
+    Exit;
+  end;
+
+  WriteDebug('InteractWithFire | Failed to find option');
+  Result := False;
+end;
+
+(**
+ * TGECooker.CookFood
+ *
+ * Main cooking routine. Handles interface selection and using food on fire.
+ * Includes recovery logic if fire is extinguished.
+ *
+ * @return  True if cooking started successfully
+ *)
+function TGECooker.CookFood(): Boolean;
+var
+  FoodSlots: TIntegerArray;
+begin
+  if Chat.LeveledUp() then
+    Exit(False);
+
+  if Make.IsOpen() then
+  begin
+    if Make.Select(0, Make.QUANTITY_ALL, True) then
+    begin
+      Self.IsCooking := True;
+      Exit(True);
+    end;
+    Exit(False);
+  end;
+
+  if RSInterface.IsOpen() then
+  begin
+    RSInterface.Close();
+    Wait(500, 800);
+  end;
+
+  if Self.CurrentFireTile = [0, 0] then
+  begin
+    if not Self.ScanForFire(True) then
+      Exit(False);
+  end;
+
+  if not Inventory.FindItems([Self.RawFood], FoodSlots) then
+  begin
+    WriteDebug('CookFood | No food found to select');
+    Exit(False);
+  end;
+
+  if not FoodSlots.Contains(Inventory.GetSelectedSlot()) then
+  begin
+    if not MainScreen.IsUpText('Use') then
+    begin
+      if Length(FoodSlots) > 0 then
+      begin
+        Inventory.SetSelectedSlot(FoodSlots[Random(0, Length(FoodSlots) - 1)]);
+        WaitUntil(FoodSlots.Contains(Inventory.GetSelectedSlot()) or MainScreen.IsUpText('Use'), 100, 2000);
+      end;
+    end;
+  end;
+
+  if not Self.InteractWithFire() then
+  begin
+     WriteDebug('CookFood | Failed to interact with fire. Assuming extinguished.');
+     Self.HasFire := False;
+
+     WriteDebug('CookFood | Recovery: Scanning current side...');
+     if not Self.ScanForFire(False) then
+     begin
+       WriteDebug('CookFood | Recovery: Retrying current side...');
+       Wait(1000, 2000);
+       if not Self.ScanForFire(False) then
+       begin
+         WriteDebug('CookFood | Recovery: Scanning OTHER side...');
+         if not Self.ScanForFire(True) then
+         begin
+           WriteDebug('CookFood | Recovery Failed. Switching to SELF_FIRE mode.');
+           Self.CookingMode := MODE_SELF_FIRE;
+           Self.CurrentFireTile := [0, 0];
+           Exit(False);
+         end;
+       end;
+     end;
+
+     Result := Self.CookFood();
+     Exit;
+  end;
+
+  if WaitUntil(Make.IsOpen(), 200, 15000) then
+  begin
+    if Map.Position().DistanceTo(Self.BankTile) > 20 then
+    begin
+       if Map.Position().DistanceTo(LEFT_FIRE_TILE) < Map.Position().DistanceTo(RIGHT_FIRE_TILE) then
+       begin
+          Self.IsLeftSide := True;
+          Self.BankTile := LEFT_BANK_TILE;
+          Self.PreferredFireTile := LEFT_FIRE_TILE;
+       end
+       else
+       begin
+          Self.IsLeftSide := False;
+          Self.BankTile := RIGHT_BANK_TILE;
+          Self.PreferredFireTile := RIGHT_FIRE_TILE;
+       end;
+    end;
+
+    Result := Make.Select(0, Make.QUANTITY_ALL, True);
+    if Result then
+    begin
+      WriteDebug('CookFood | Selected all to cook');
+      Self.IsCooking := True;
+    end;
+    Exit;
+  end;
+
+  WriteDebug('CookFood | Make interface didn''t open, checking for cooking...');
+  Result := True;
+end;
+
+(**
+ * TGECooker.WaitCooking
+ *
+ * Waits while cooking is in progress. Monitors inventory changes and level ups.
+ * Periodically scans for fire renewal in Self Fire mode.
+ *
+ * @return  True if batch finished normally
+ *)
+function TGECooker.WaitCooking(): Boolean;
+var
+  Timeout: TCountDown;
+  CookingTimer: TCountDown;
+  StartCount, LastRawCount, CurrentRawCount: Int32;
+  FoodSlots: TIntegerArray;
+  CurrentXP: Int32;
+  ATPA: T2DPointArray;
+begin
+  Timeout.Init(180000); // 3 mins max
+  CookingTimer.Init(Random(3000, 4000));
+
+  if not Inventory.FindItems([Self.RawFood], FoodSlots) then
+  begin
+    WriteDebug('WaitCooking | No raw food found at start');
+    Self.IsCooking := False;
+    Exit(False);
+  end;
+
+  StartCount := Length(FoodSlots);
+  LastRawCount := StartCount;
+
+  WriteDebug('WaitCooking | Starting cook with ' + ToStr(StartCount) + ' items');
+
+  while (not Timeout.IsFinished()) do
+  begin
+    if Chat.LeveledUp() then
+    begin
+      WriteDebug('WaitCooking | Level up detected');
+      Self.IsCooking := False;
+      Break;
+    end;
+
+    if (Self.CookingMode = MODE_SELF_FIRE) and (Self.CurrentFireTile <> [0,0]) then
+    begin
+       Self.FireObject.Coordinates := [Self.CurrentFireTile];
+       if not Self.FireObject.Find(ATPA) then
+       begin
+          WriteDebug('WaitCooking | Fire extinguished (quick detect) on ' + ToStr(Self.CurrentFireTile));
+          Self.IsCooking := False;
+          Self.HasFire := False;
+
+          Inventory.FindItems([Self.RawFood], FoodSlots);
+          CurrentRawCount := Length(FoodSlots);
+          Self.FoodCooked += (StartCount - CurrentRawCount);
+          Self.TotalActions := Self.FoodCooked;
+
+          Exit(False);
+       end;
+    end;
+
+    if (Self.CookingMode = MODE_SELF_FIRE) and (Self.NextCampfireScan < GetTimeRunning()) then
+    begin
+       if Self.ScanForFire(True, True) then
+          WriteDebug('WaitCooking | Fire found via periodic scan!');
+
+       if (Self.NextCampfireScan < GetTimeRunning()) then
+           Self.NextCampfireScan := GetTimeRunning() + Random(5 * 60000, 10 * 60000);
+    end;
+
+    if Make.IsOpen() then
+    begin
+      Make.Select(0, Make.QUANTITY_ALL, True);
+      Wait(1000, 2000);
+      CookingTimer.Restart(Random(3000, 4000));
+    end;
+
+    if CookingTimer.IsFinished() then
+    begin
+      if not Inventory.FindItems([Self.RawFood], FoodSlots) then
+      begin
+         WriteDebug('WaitCooking | Out of raw food');
+         Break;
+      end;
+
+      CurrentRawCount := Length(FoodSlots);
+
+      if CurrentRawCount < LastRawCount then
+      begin
+         LastRawCount := CurrentRawCount;
+         CookingTimer.Restart(Random(3000, 4000));
+         WL.Activity.Restart();
+
+         CurrentXP := XPBar.Read();
+         Self.GainedXP := CurrentXP - Self.StartXP;
+      end
+      else
+      begin
+         WriteDebug('WaitCooking | No inventory change detected. Fire extinguished?');
+         Self.IsCooking := False;
+         Self.HasFire := False;
+
+         Self.FoodCooked += (StartCount - CurrentRawCount);
+         Self.TotalActions := Self.FoodCooked;
+         Exit(False);
+      end;
+    end;
+
+    Wait(100, 200);
+    Self.DoAntiban();
+  end;
+
+  // Final stats update
+  Inventory.FindItems([Self.RawFood], FoodSlots);
+  CurrentRawCount := Length(FoodSlots);
+
+  Self.FoodCooked += (StartCount - CurrentRawCount);
+  Self.TotalActions := Self.FoodCooked;
+  Self.IsCooking := False;
+
+  WriteDebug('WaitCooking | Finished batch');
+  Result := True;
+end;
+
+(**
+ * TGECooker.GetState
+ *
+ * Determines the current state of the script based on inventory, bank, and fire status.
+ *
+ * @return  The next state to execute
+ *)
+function TGECooker.GetState(): EGECookerState;
+begin
+  if not RSClient.IsLoggedIn() then
+    Exit(EGECookerState.HANDLE_LOGIN);
+
+  if WL.Activity.IsFinished() then
+    Exit(EGECookerState.END_SCRIPT);
+
+  if Chat.LeveledUp() then
+    Exit(EGECookerState.LEVEL_UP);
+
+  if (Self.NextCampfireScan < GetTimeRunning()) and (not Self.IsCooking) and (not Bank.IsOpen()) then
+     Exit(EGECookerState.SCAN_FOR_FIRE);
+
+  if Bank.IsOpen() then
+  begin
+    if Inventory.ContainsItem(Self.RawFood) then
+    begin
+        if (Self.CookingMode = MODE_SELF_FIRE) and Self.NeedFireSupplies then
+           Exit(EGECookerState.HANDLE_BANK);
+
+        Exit(EGECookerState.CLOSE_BANK);
+    end;
+
+    Exit(EGECookerState.HANDLE_BANK);
+  end;
+
+  if not Inventory.ContainsItem(Self.RawFood) then
+  begin
+    Exit(EGECookerState.OPEN_BANK);
+  end;
+
+  if not Self.HasFire then
+  begin
+    if Self.CookingMode = MODE_CAMPFIRE then
+      Exit(EGECookerState.SCAN_FOR_FIRE);
+
+    if Self.NeedFireSupplies then
+       Exit(EGECookerState.OPEN_BANK);
+
+    if Inventory.ContainsItem(Self.Tinderbox) then
+         Exit(EGECookerState.CREATE_FIRE);
+
+    Self.NeedFireSupplies := True;
+    Exit(EGECookerState.OPEN_BANK);
+  end;
+
+  Exit(EGECookerState.COOK_FOOD);
+end;
+
+(**
+ * TGECooker.Run
+ *
+ * Main script loop. Initializes the bot and executes the state machine.
+ *
+ * @param maxActions  Maximum actions before stopping
+ * @param maxTime     Maximum runtime before stopping
+ *)
+procedure TGECooker.Run(maxActions: UInt32; maxTime: UInt64);
+begin
+  Self.Init(maxActions, maxTime);
+
+  repeat
+    Self.State := Self.GetState();
+    Self.SetAction(ToStr(Self.State));
+
+    if Self.ReportTimer.ElapsedTime() > 300000 then
+    begin
+      Self.Report();
+      Self.ReportTimer.Reset();
+    end;
+
+    case Self.State of
+      EGECookerState.HANDLE_LOGIN:
+      begin
+        if Login.LoginPlayer() then
+        begin
+          Wait(2000, 3000);
+          WL.Activity.Restart();
+        end
+        else
+          Wait(3000, 5000);
+      end;
+
+      EGECookerState.OPEN_BANK:
+      begin
+        if Bank.IsOpen() then
+        begin
+          Wait(500, 1000);
+          Exit;
+        end;
+        Self.AdjustCameraForBanking();
+        if Self.FindBank() then
+          WaitUntil(Bank.IsOpen(), 200, 5000)
+        else
+          Wait(1000, 2000);
+      end;
+
+      EGECookerState.HANDLE_BANK:
+      begin
+        if not Self.HandleBanking() then
+        begin
+          if Bank.IsOpen() then
+            Bank.Close();
+          Wait(1000, 1500);
+        end;
+      end;
+
+      EGECookerState.CLOSE_BANK:
+      begin
+        Bank.Close();
+        Wait(400, 600);
+      end;
+
+      EGECookerState.SCAN_FOR_FIRE:
+      begin
+        Self.ScanForFire();
+      end;
+
+      EGECookerState.CREATE_FIRE:
+      begin
+        if not Self.CreateFire() then
+        begin
+            Self.HasScannedForFire := False;
+            Self.NeedFireSupplies := True;
+        end;
+      end;
+
+      EGECookerState.COOK_FOOD:
+      begin
+        if Self.IsCooking then
+        begin
+          if not Self.WaitCooking() then
+            Self.HasFire := False;
+        end
+        else
+        begin
+          if Self.CookFood() then
+          begin
+            if not Self.WaitCooking() then
+              Self.HasFire := False;
+          end
+          else
+          begin
+            Self.HasFire := False;
+            Self.HasScannedForFire := False;
+            // If we fail to cook, fire might be gone.
+          end;
+        end;
+      end;
+
+      EGECookerState.LEVEL_UP:
+      begin
+        if RSInterface.IsOpen() then
+        begin
+          RSInterface.Close();
+          Wait(500, 800);
+        end;
+        Chat.HandleLevelUp();
+        Wait(1000, 3000);
+      end;
+
+      EGECookerState.END_SCRIPT:
+      begin
+        Self.Report();
+        Break;
+      end;
+    end;
+
+    Self.DoAntiban();
+  until Self.ShouldStop();
+
+  Self.Report();
+end;
+
+(**
+ * TGECooker.BuildTextReport
+ *
+ * Generates the text report for the RSWalker/WaspLib overlay.
+ *
+ * @return  Array of strings representing the report
+ *)
+function TGECooker.BuildTextReport(): TStringArray; override;
+var
+  elapsedTime: UInt64;
+begin
+  if Self.Action = Self.PreviousAction then
+    Exit(ProgressReport.ProgressArray);
+
+  elapsedTime := Self.TimeRunning.ElapsedTime();
+
+  Result += ' Action        : ' + Self.Action;
+  Result += ' Runtime       : ' + SRL.MsToTime(elapsedTime, Time_Short).Strip();
+  Result += ' Food Type     : ' + Self.SelectedFood;
+  Result += ' Food Cooked   : ' + ToStr(Self.FoodCooked);
+  Result += ' Food/Hour     : ' + ToStr(NumberPerHour(Self.FoodCooked, elapsedTime));
+  Result += ' XP Gained     : ' + SRL.FormatNumber(XPBar.Read() - Self.StartXP, 2);
+  Result += ' XP/Hour       : ' + SRL.FormatNumber(NumberPerHour(XPBar.Read() - Self.StartXP, elapsedTime), 2);
+end;
+
+// -----------------------------------------------------------------------------
+// GUI & Configuration
+// -----------------------------------------------------------------------------
+
+{$IFNDEF SCRIPT_CHAIN}
+{$IFDEF SCRIPT_GUI}
+type
+  TCookerConfig = record(TScriptForm)
+    // lab_Title, lab_Info, lab_Settings: TLabel;
+    FoodLabel: TLabel;
+    FoodSelector: TComboBox;
+  end;
+
+var
+  CookerConfig: TCookerConfig;
+
+(**
+ * SaveConfig
+ *
+ * Saves the current GUI configuration to a JSON file.
+ *)
+procedure SaveConfig();
+begin
+  if not Config.IsSetup then
+    Config.Setup('orka-ge-cooking');
+
+  Config.Put('foodIndex', CookerConfig.FoodSelector.GetItemIndex());
+end;
+
+(**
+ * LoadConfig
+ *
+ * Loads the GUI configuration from a JSON file.
+ *)
+procedure LoadConfig();
+begin
+  if not Config.IsSetup then
+    Config.Setup('orka-ge-cooking');
+
+  if Config.Has('foodIndex') then
+    CookerConfig.FoodSelector.SetItemIndex(Config.GetInt('foodIndex'));
+end;
+
+(**
+ * TCookerConfig.StartScript
+ *
+ * Event handler for the "Start" button. Applies settings and starts the bot.
+ *
+ * @param sender  The object that triggered the event
+ *)
+procedure TCookerConfig.StartScript(sender: TObject); override;
+var
+  FoodName: String;
+begin
+  FoodName := Self.FoodSelector.GetText();
+  CookerBot.SelectedFood := FoodName;
+
+  case FoodName of
+    'Bass': CookerBot.RawFood := 'Raw bass';
+    'Chicken': CookerBot.RawFood := 'Raw chicken';
+    'Dark crab': CookerBot.RawFood := 'Raw dark crab';
+    'Shrimps': CookerBot.RawFood := 'Raw shrimps';
+    'Anchovies': CookerBot.RawFood := 'Raw anchovies';
+    'Herring': CookerBot.RawFood := 'Raw herring';
+    'Mackerel': CookerBot.RawFood := 'Raw mackerel';
+    'Sardine': CookerBot.RawFood := 'Raw sardine';
+    'Sea turtle': CookerBot.RawFood := 'Raw sea turtle';
+    'Trout': CookerBot.RawFood := 'Raw trout';
+    'Pike': CookerBot.RawFood := 'Raw pike';
+    'Salmon': CookerBot.RawFood := 'Raw salmon';
+    'Tuna': CookerBot.RawFood := 'Raw tuna';
+    'Lobster': CookerBot.RawFood := 'Raw lobster';
+    'Swordfish': CookerBot.RawFood := 'Raw swordfish';
+    'Monkfish': CookerBot.RawFood := 'Raw monkfish';
+    'Shark': CookerBot.RawFood := 'Raw shark';
+    'Anglerfish': CookerBot.RawFood := 'Raw anglerfish';
+    'Manta ray': CookerBot.RawFood := 'Raw manta ray';
+    'Karambwan': CookerBot.RawFood := 'Raw karambwan';
+    else CookerBot.RawFood := 'Raw ' + LowerCase(FoodName);
+  end;
+
+  SaveConfig();
+  inherited;
+end;
+
+(**
+ * TCookerConfig.Run
+ *
+ * Builds and displays the script configuration GUI.
+ *)
+procedure TCookerConfig.Run(); override;
+var
+  tab, accountTab: TTabSheet;
+  Font: TFont;
+  Img: TPicture;
+  BGImg: TImage;
+  item: String;
+begin
+  Self.Setup('Orka GE Cooking');
+  Self.Start.setOnClick(@Self.StartScript);
+
+  with Self.Start do
+  begin
+    SetAlign(alNone);
+    SetWidth(TControl.AdjustToDPI(150));
+    SetHeight(TControl.AdjustToDPI(40));
+    SetLeft(Self.Form.GetWidth() - GetWidth() - TControl.AdjustToDPI(20));
+    SetTop(Self.Form.GetHeight() - GetHeight() - TControl.AdjustToDPI(25));
+  end;
+
+  Font.Init();
+  Font.setName('Verdana');
+  Font.SetQuality(fqCleartype);
+  Self.Form.setFont(Font);
+  Self.PageControl.SetFont(Font);
+  Font.Free();
+
+  Self.AddTab('Script Settings');
+  tab := Self.Tabs[High(Self.Tabs)];
+
+  if not FileExists(AppPath + 'Resources\OrkaGECookingBG.jpeg') then
+    DownloadToFile('https://i.imgur.com/1fnnD9H.jpeg', AppPath + 'Resources\OrkaGECookingBG.jpeg');
+
+  if FileExists(AppPath + 'Resources\OrkaGECookingBG.jpeg') then
+  begin
+    Img.Init();
+    Img.LoadFromFile(AppPath + 'Resources\OrkaGECookingBG.jpeg');
+    with BGImg do
+    begin
+      Create(tab);
+      SetParent(tab);
+      SetPicture(Img);
+      SetBounds(0, 0, Self.Form.GetWidth(), Self.Form.GetHeight());
+      SetStretch(True);
+      SetAlign(alClient);
+    end;
+  end;
+
+  with Self.FoodSelector do
+  begin
+    Create(tab);
+    SetWidth(Self.Start.GetWidth());
+    SetLeft(Self.Start.GetLeft() - TControl.AdjustToDPI(4));
+    SetTop(Self.Start.GetTop() - GetHeight() - TControl.AdjustToDPI(32)); 
+    SetStyle(csDropDownList);
+    for item in ['Anchovies', 'Anglerfish', 'Bass', 'Chicken', 'Dark crab', 'Herring',
+                  'Karambwan', 'Lobster', 'Mackerel', 'Manta ray', 'Monkfish', 'Pike',
+                  'Salmon', 'Sardine', 'Sea turtle', 'Shark', 'Shrimps', 'Swordfish',
+                  'Trout', 'Tuna'] do
+      getItems().Add(item);
+    SetItemIndex(16); // Default Shrimps
+    BringToFront();
+  end;
+
+  with Self.FoodLabel do
+  begin
+    Create(tab);
+    SetCaption('Food type:');
+    GetFont.SetStyle([fsBold]);
+    GetFont.SetColor($FFFFFF);
+    SetLeft(Self.FoodSelector.GetLeft());
+    SetTop(Self.FoodSelector.GetTop() - GetHeight() - TControl.AdjustToDPI(2));
+    BringToFront();
+  end;
+
+  Self.AddTab('Account Manager');
+  accountTab := Self.Tabs[High(Self.Tabs)];
+  Self.CreateAccountManager(accountTab);
+
+  LoadConfig();
+
+  Self.CreateAntibanManager();
+  Self.CreateWaspLibSettings();
+
+  inherited;
+end;
+{$ENDIF}
+{$ENDIF}
+
+begin
+  {$IFDEF SCRIPT_GUI}
+  CookerConfig.Run();
+  {$ENDIF}
+  CookerBot.Run(WLSettings.MaxActions, WLSettings.MaxTime);
+end.

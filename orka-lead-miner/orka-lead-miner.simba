@@ -1,0 +1,1134 @@
+{$DEFINE SCRIPT_REVISION := '1'}
+{$DEFINE SCRIPT_GUI}
+program OrkaLeadMiner;
+{$I SRL-T/osr.simba}
+{$I WaspLib/osr.simba}
+
+const
+  VERBOSE_LOGGING = True;
+  LEAD_ORE_NAME = 'Lead ore';
+
+type
+  TGUI = record(TScriptForm)
+    lab_Title, lab_Info, lab_BreakSettings: TLabel;
+    edit_BreakAfter, edit_BreakFor, edit_ShutdownAfter: TLabeledEdit;
+    edit_SleepAtTime, edit_SleepForHours: TLabeledEdit;
+    cb_BlockInput, cb_TakeBreaks, cb_TakeSleeps: TLabeledCheckbox;
+  end;
+
+  TPandemoniumObjects = record
+    LeadRock1, LeadRock2, LeadRock3, LeadRock4: TRSObjectV2;
+    DungeonExit: TRSObjectV2;
+    DungeonEntrance: TRSObjectV2;
+    Bank: TRSObjectV2;
+  end;
+
+  EState = (HANDLE_LOGIN, CLOSE_INTERFACE, BANKING, ENTER_CAVE,
+            GO_TO_ROCKS, MINE_ORE, EXIT_CAVE, DO_ANTIBAN);
+
+var
+  PandemoniumObjects: TPandemoniumObjects;
+  GUI: TGUI;
+  Config: TConfigJSON;
+  TakeBreaks, TakeSleeps: Boolean;
+  BreakFor, BreakAfter: Int32;
+  SleepAtTime: String;
+  SleepForHours: Int32;
+  ShutdownTime: Int64;
+  StartXP, GainedXP: Int32;
+  LeadOresMined, LeadOresInInventory: Int32;
+  InactivityTimer, ReportTimer: TStopwatch;
+  TotalBreakTime, LastBreakStartTime, LastBreakEndTime: Int64;
+  SetMiningAngle: Boolean;
+  CurrentZoomLevel: Int32;
+
+procedure WriteDebug(Message: String);
+begin
+  if VERBOSE_LOGGING then
+    WriteLn(SRL.TimeStamp(), ':[LeadMiner]: ', Message);
+end;
+
+procedure SetupMapAndWalker();
+begin
+  Map.SetupChunks([
+    Chunk([46,147,48,145], 0),  // Pandemonium Dungeon
+    Chunk([46,47,48,45], 0)     // Pandemonium Island surface
+  ]);
+end;
+
+procedure SetupLeadRocks();
+begin
+  // Rock 1 at [8140, 12926]
+  PandemoniumObjects.LeadRock1.SetupEx([1, 1, 3], [[8140, 12926]]);
+  PandemoniumObjects.LeadRock1.SetupUpText(['Lead']);
+  PandemoniumObjects.LeadRock1.Finder.Colors += [CTS2(8681099, 8, 3.15, 0.73)];
+  PandemoniumObjects.LeadRock1.Finder.Erode := 4;
+  PandemoniumObjects.LeadRock1.Finder.Grow := 5;
+  PandemoniumObjects.LeadRock1.Walker := @Map.Walker;
+
+  // Rock 2 at [8144, 12930]
+  PandemoniumObjects.LeadRock2.SetupEx([1, 1, 3], [[8144, 12930]]);
+  PandemoniumObjects.LeadRock2.SetupUpText(['Lead']);
+  PandemoniumObjects.LeadRock2.Finder.Colors += [CTS2(8681099, 8, 3.15, 0.73)];
+  PandemoniumObjects.LeadRock2.Finder.Erode := 4;
+  PandemoniumObjects.LeadRock2.Finder.Grow := 5;
+  PandemoniumObjects.LeadRock2.Walker := @Map.Walker;
+
+  // Rock 3 at [8144, 12934]
+  PandemoniumObjects.LeadRock3.SetupEx([1, 1, 3], [[8144, 12934]]);
+  PandemoniumObjects.LeadRock3.SetupUpText(['Lead']);
+  PandemoniumObjects.LeadRock3.Finder.Colors += [CTS2(8681099, 8, 3.15, 0.73)];
+  PandemoniumObjects.LeadRock3.Finder.Erode := 4;
+  PandemoniumObjects.LeadRock3.Finder.Grow := 5;
+  PandemoniumObjects.LeadRock3.Walker := @Map.Walker;
+
+  // Rock 4 at [8136, 12938]
+  PandemoniumObjects.LeadRock4.SetupEx([1, 1, 3], [[8136, 12938]]);
+  PandemoniumObjects.LeadRock4.SetupUpText(['Lead']);
+  PandemoniumObjects.LeadRock4.Finder.Colors += [CTS2(8681099, 8, 3.15, 0.73)];
+  PandemoniumObjects.LeadRock4.Finder.Erode := 4;
+  PandemoniumObjects.LeadRock4.Finder.Grow := 5;
+  PandemoniumObjects.LeadRock4.Walker := @Map.Walker;
+end;
+
+procedure SetupDungeonExit();
+begin
+  PandemoniumObjects.DungeonExit.SetupEx([3, 0.8, 8], [[8072, 12840]]);
+  PandemoniumObjects.DungeonExit.SetupUpText(['Opening']);
+  PandemoniumObjects.DungeonExit.Finder.Colors += [CTS2(4869711, 5, 0.74, 0.15)];
+  PandemoniumObjects.DungeonExit.Finder.Grow := 15;
+  PandemoniumObjects.DungeonExit.Walker := @Map.Walker;
+  PandemoniumObjects.DungeonExit.TrackTarget := False;
+end;
+
+procedure SetupDungeonEntrance();
+begin
+  PandemoniumObjects.DungeonEntrance.SetupEx([1.8, 1.2, 7], [[8088, 38440]]);
+  PandemoniumObjects.DungeonEntrance.SetupUpText(['Cave','entrance']);
+  PandemoniumObjects.DungeonEntrance.Finder.Colors += [CTS2(4481126, 19, 0.16, 0.35)];
+  PandemoniumObjects.DungeonEntrance.Finder.Erode := 8;
+  PandemoniumObjects.DungeonEntrance.Finder.Grow := 4;
+  PandemoniumObjects.DungeonEntrance.Walker := @Map.Walker;
+  PandemoniumObjects.DungeonEntrance.TrackTarget := False;
+end;
+
+procedure SetupBank();
+begin
+  PandemoniumObjects.Bank.SetupEx([1, 1, 3], [[8060,38430]]);
+  PandemoniumObjects.Bank.SetupUpText(['Bank']);
+  PandemoniumObjects.Bank.Finder.Colors += [CTS2(3578588, 15, 0.17, 1.51)];
+  PandemoniumObjects.Bank.Walker := @Map.Walker;
+  PandemoniumObjects.Bank.TrackTarget := False;
+end;
+
+procedure SetupPandemoniumObjects();
+begin
+  SetupMapAndWalker();
+  SetupLeadRocks();
+  SetupDungeonExit();
+  SetupDungeonEntrance();
+  SetupBank();
+end;
+
+function IsInCave(): Boolean;
+var
+  pos: TPoint;
+begin
+  pos := Map.Position();
+  Result := (pos.X >= 7950) and (pos.X <= 8170) and (pos.Y >= 12800) and (pos.Y <= 13000);
+end;
+
+function IsOnIsland(): Boolean;
+var
+  pos: TPoint;
+begin
+  pos := Map.Position();
+  Result := (pos.X >= 8000) and (pos.X <= 8200) and (pos.Y >= 38400) and (pos.Y <= 38600);
+end;
+
+function IsAtLeadRocks(): Boolean;
+var
+  pos: TPoint;
+begin
+  pos := Map.Position();
+  Result := (pos.X >= 8134) and (pos.X <= 8150) and (pos.Y >= 12922) and (pos.Y <= 12940);
+end;
+
+function IsAtBank(): Boolean;
+begin
+  Result := Map.Position().DistanceTo([8060, 38430]) < 12;
+end;
+
+function IsAtDungeonEntrance(): Boolean;
+begin
+  Result := Map.Position().DistanceTo([8088, 38440]) < 12;
+end;
+
+function IsAtDungeonExit(): Boolean;
+begin
+  Result := Map.Position().DistanceTo([8072, 12840]) < 12;
+end;
+
+function WaitForTeleportComplete(minDistance: Int32 = 200; timeout: Int32 = 20000): Boolean;
+var
+  startTime: UInt64;
+  startPos, endPos: TPoint;
+  distanceMoved: Double;
+  movementDetected: Boolean;
+begin
+  Result := False;
+  startTime := GetTickCount();
+  startPos := Map.Position();
+
+  WriteDebug(ToStr('Waiting for teleport from position: ', startPos));
+
+  movementDetected := WaitUntil(Minimap.IsPlayerMoving(), 100, 5000);
+  if movementDetected then
+  begin
+    WriteDebug('Movement detected, waiting for teleport to complete...');
+    Minimap.WaitPlayerMoving(500, timeout);
+  end else
+    WriteDebug('Player never started moving - assuming instant teleport or failed click');
+
+  Wait(1000, 1500);
+
+  endPos := Map.Position();
+  distanceMoved := startPos.DistanceTo(endPos);
+
+  if distanceMoved < minDistance then
+  begin
+    WriteDebug(ToStr('Teleport FAILED - only moved ', Round(distanceMoved), ' tiles (need >', minDistance, '). Start: ', startPos, ' End: ', endPos));
+    Exit(False);
+  end;
+
+  Result := True;
+  WriteDebug(ToStr('Teleport SUCCESS! Moved ', Round(distanceMoved), ' tiles. New position: ', endPos, ' (took ', (GetTickCount() - startTime), 'ms)'));
+end;
+
+procedure UpdateOreStats();
+var
+  count: Int32;
+begin
+  count := Inventory.CountItem(LEAD_ORE_NAME);
+
+  if count > LeadOresInInventory then
+    LeadOresMined := LeadOresMined + (count - LeadOresInInventory);
+
+  LeadOresInInventory := count;
+end;
+
+procedure Report();
+var
+  RunTime: Int64;
+  XPPerHour, LeadPerHour: Int32;
+  leftCol, rightCol: String;
+  bannerWidth: Int32 = 59;
+  separator: String;
+  title: String;
+  TimeSinceLastBreak: Int64;
+begin
+  RunTime := GetTimeRunning();
+
+  if RunTime > 0 then
+  begin
+    XPPerHour := Round((GainedXP) / (RunTime / 3600000));
+    LeadPerHour := Round((LeadOresMined) / (RunTime / 3600000));
+  end else
+  begin
+    XPPerHour := 0;
+    LeadPerHour := 0;
+  end;
+
+  separator := '|' + StringOfChar('=', bannerWidth - 2) + '|';
+  title := 'Orka Lead Miner';
+  title := '|' + PadR(PadL(title, (bannerWidth - 2 + Length(title)) div 2, ' '), bannerWidth - 2, ' ') + '|';
+
+  WriteLn(separator);
+  WriteLn(title);
+  WriteLn(separator);
+
+  // Row 1: Runtime | Next break
+  leftCol := 'Runtime: ' + SRL.MsToTime(RunTime, Time_Short);
+  if TakeBreaks and (Length(Antiban.Breaks) > 0) then
+    rightCol := 'Next break: ' + SRL.MsToTime(Max(0, Round(Antiban.Breaks[0].NextAtTime - RunTime)), Time_Short)
+  else
+    rightCol := 'Next break: N/A';
+  WriteLn('| ' + PadR(leftCol, 26, ' ') + ' | ' + PadR(rightCol, 26, ' ') + ' |');
+
+  // Row 2: XP gained | Time since last break
+  leftCol := 'XP gained: ' + ToString(Round(GainedXP));
+  if LastBreakEndTime > 0 then
+  begin
+    TimeSinceLastBreak := RunTime - LastBreakEndTime;
+    rightCol := 'Since last break: ' + SRL.MsToTime(TimeSinceLastBreak, Time_Short);
+  end else
+    rightCol := 'Since last break: N/A';
+  WriteLn('| ' + PadR(leftCol, 26, ' ') + ' | ' + PadR(rightCol, 26, ' ') + ' |');
+
+  // Row 3: XP/Hr | Total break time
+  leftCol := 'XP/Hr: ' + ToString(XPPerHour);
+  if TotalBreakTime > 0 then
+    rightCol := 'Total break time: ' + SRL.MsToTime(TotalBreakTime, Time_Short)
+  else
+    rightCol := 'Total break time: N/A';
+  WriteLn('| ' + PadR(leftCol, 26, ' ') + ' | ' + PadR(rightCol, 26, ' ') + ' |');
+
+  // Row 4: Lead ores | Lead/Hr
+  leftCol := 'Lead ores: ' + ToString(LeadOresMined);
+  rightCol := 'Lead/Hr: ' + ToString(LeadPerHour);
+  WriteLn('| ' + PadR(leftCol, 26, ' ') + ' | ' + PadR(rightCol, 26, ' ') + ' |');
+
+  // Row 5: Shutdown | Next sleep
+  if ShutdownTime > 0 then
+    leftCol := 'Shutdown: ' + SRL.MsToTime(Max(0, ShutdownTime - RunTime), Time_Short)
+  else
+    leftCol := 'Shutdown: Disabled';
+
+  if TakeSleeps and (Length(Antiban.Sleeps) > 0) then
+    rightCol := 'Next sleep: ' + SRL.MsToTime(Max(0, Round(Antiban.Sleeps[0].NextAtTime - RunTime)), Time_Short)
+  else
+    rightCol := 'Next sleep: N/A';
+
+  WriteLn('| ' + PadR(leftCol, 26, ' ') + ' | ' + PadR(rightCol, 26, ' ') + ' |');
+  WriteLn(separator);
+
+  title := 'Orka Scripts';
+  title := '|' + PadR(PadL(title, (bannerWidth - 2 + Length(title)) div 2, ' '), bannerWidth - 2, ' ') + '|';
+  WriteLn(title);
+  WriteLn(separator);
+end;
+
+procedure TAntiban.DoLoseFocus();
+begin
+  Self.LoseFocus(SRL.NormalRange(450, 2750));
+end;
+
+procedure DoSafeRotate();
+var
+  angleBefore, angleAfter: Double;
+begin
+  // Restrict rotation to northern-eastern angles: 0° (N) to 90° (E)
+  // This provides better visibility of the lead rocks
+  angleBefore := Minimap.GetCompassAngle();
+  WriteLn(SRL.TimeStamp(), ':[LeadMiner]: Current angle: ', Round(angleBefore), ' - Rotating to mining angle');
+
+  Minimap.SetCompassAngle(Random(290, 340));
+  Wait(500, 1000);
+
+  angleAfter := Minimap.GetCompassAngle();
+  WriteLn(SRL.TimeStamp(), ':[LeadMiner]: Rotated to angle: ', Round(angleAfter));
+end;
+
+procedure OnBreakStart(Task: PBreakTask);
+var
+  T: PBreakTask;
+begin
+  InactivityTimer.Pause();
+  LastBreakStartTime := GetTimeRunning();
+  T := Task;
+end;
+
+procedure OnBreakEnd(Task: PBreakTask);
+var
+  T: PBreakTask;
+  BreakDuration: Int64;
+begin
+  InactivityTimer.Resume();
+  LastBreakEndTime := GetTimeRunning();
+  BreakDuration := LastBreakEndTime - LastBreakStartTime;
+  TotalBreakTime := TotalBreakTime + BreakDuration;
+  T := Task;
+end;
+
+procedure OnSleepStart(Task: PSleepTask);
+var
+  T: PSleepTask;
+begin
+  InactivityTimer.Pause();
+  T := Task;
+end;
+
+procedure OnSleepEnd(Task: PSleepTask);
+var
+  T: PSleepTask;
+begin
+  InactivityTimer.Resume();
+  T := Task;
+end;
+
+procedure SetZoom(Level: Int32);
+begin
+  Options.SetZoomLevel(Level);
+  CurrentZoomLevel := Level;
+end;
+
+procedure CustomAntibanZoom();
+begin
+  SetZoom(Random(Antiban.MinZoom, Antiban.MaxZoom));
+end;
+
+procedure SetupAntiban();
+begin
+  Antiban.Skills := [ERSSkill.MINING, ERSSkill.TOTAL];
+  Antiban.MinZoom := 12;
+  Antiban.MaxZoom := 38;
+
+  Antiban.AddTask(ONE_MINUTE * 4, @Antiban.RandomMouse, 0.2);
+  Antiban.AddTask(ONE_MINUTE * 7, @Antiban.RandomRightClick, 0.2);
+  Antiban.AddTask(ONE_MINUTE * 5, @Antiban.DoLoseFocus, 0.2);
+  Antiban.AddTask(ONE_MINUTE * 12, @Antiban.RandomTab, 0.25);
+  Antiban.AddTask(ONE_MINUTE * 8, @CustomAntibanZoom, 0.3);
+  Antiban.AddTask(ONE_MINUTE * 7, @Antiban.HoverSkills, 0.25);
+  //Antiban.AddTask(ONE_MINUTE * 5, @DoSafeRotate, 1);
+
+  if TakeBreaks then
+  begin
+    // Main break from GUI settings (can logout)
+    Antiban.AddBreak(BreakAfter * ONE_MINUTE, BreakFor * ONE_MINUTE, 0.25, 0.8);
+
+    // Secondary automatic breaks:
+    Antiban.AddBreak(ONE_MINUTE * 8, ONE_SECOND * 40, 0.3, 0.0);
+    Antiban.AddBreak(ONE_MINUTE * 18, ONE_MINUTE, 0.3, 0.0);
+
+    Antiban.OnStartBreak := @OnBreakStart;
+    Antiban.OnFinishBreak := @OnBreakEnd;
+  end;
+
+  if TakeSleeps then
+  begin
+    Antiban.AddSleep(SleepAtTime, SleepForHours * ONE_HOUR, 0.1, 1);
+    Antiban.OnStartSleep := @OnSleepStart;
+    Antiban.OnFinishSleep := @OnSleepEnd;
+  end;
+end;
+
+function HasGainedXP(): Boolean;
+var
+  t: Int32 := XPBar.Read() - StartXP;
+begin
+  Result := t > GainedXP;
+
+  if Result then
+    GainedXP := t;
+end;
+
+procedure SaveConfig();
+begin
+  if not Config.IsSetup then
+    Config.Setup('orka-lead-miner');
+
+  Config.Put('breakAfter', BreakAfter);
+  Config.Put('breakFor', BreakFor);
+  Config.Put('shutdownAfter', Round(ShutdownTime / 60000));
+  Config.Put('takeBreaks', TakeBreaks);
+  Config.Put('takeSleeps', TakeSleeps);
+  Config.Put('sleepAtTime', SleepAtTime);
+  Config.Put('sleepForHours', SleepForHours);
+
+  WriteDebug('Config saved');
+end;
+
+procedure LoadConfig();
+begin
+  if not Config.IsSetup then
+    Config.Setup('orka-lead-miner');
+
+  if Config.Has('breakAfter') then
+    GUI.edit_BreakAfter.SetText(ToStr(Config.GetInt('breakAfter')));
+
+  if Config.Has('breakFor') then
+    GUI.edit_BreakFor.SetText(ToStr(Config.GetInt('breakFor')));
+
+  if Config.Has('shutdownAfter') then
+    GUI.edit_ShutdownAfter.SetText(ToStr(Config.GetInt('shutdownAfter')));
+
+  if Config.Has('takeBreaks') then
+    GUI.cb_TakeBreaks.SetChecked(Config.GetBoolean('takeBreaks'));
+
+  if Config.Has('takeSleeps') then
+    GUI.cb_TakeSleeps.SetChecked(Config.GetBoolean('takeSleeps'));
+
+  if Config.Has('sleepAtTime') then
+    GUI.edit_SleepAtTime.SetText(Config.GetString('sleepAtTime'));
+
+  if Config.Has('sleepForHours') then
+    GUI.edit_SleepForHours.SetText(ToStr(Config.GetInt('sleepForHours')));
+end;
+
+procedure TGUI.StartScript(Sender: TObject); override;
+var
+  ShutdownMinutes: Int32;
+begin
+  BreakAfter := Self.edit_BreakAfter.GetText().ExtractInteger();
+  BreakFor := Self.edit_BreakFor.GetText().ExtractInteger();
+  SleepAtTime := Self.edit_SleepAtTime.GetText();
+  SleepForHours := Self.edit_SleepForHours.GetText().ExtractInteger();
+  ShutdownMinutes := Self.edit_ShutdownAfter.GetText().ExtractInteger();
+
+  TakeBreaks := Self.cb_TakeBreaks.IsChecked();
+  TakeSleeps := Self.cb_TakeSleeps.IsChecked();
+
+  if ShutdownMinutes > 0 then
+    ShutdownTime := ShutdownMinutes * 60000
+  else
+    ShutdownTime := 0;
+
+  if Self.cb_BlockInput.IsChecked() then
+  begin
+    WLSettings.RemoteInput.BlockInput := True;
+    RSClient.RemoteInput.DisableRealInput();
+  end else
+  begin
+    WLSettings.RemoteInput.BlockInput := False;
+    RSClient.RemoteInput.EnableRealInput();
+  end;
+
+  SaveConfig();
+  inherited;
+end;
+
+procedure TGUI.Run(); override;
+var
+  Tab: TTabSheet;
+  Font: TFont;
+begin
+  Self.Setup('Orka Lead Miner', Point(720, 420), False);
+  Self.Start.SetOnClick(@Self.StartScript);
+
+  Font.Init();
+  Font.SetName('Verdana');
+  Font.SetQuality(fqCleartype);
+  Self.Form.SetFont(Font);
+  Self.PageControl.SetFont(Font);
+  Font.Free();
+
+  Self.AddTab('Settings');
+  Tab := Self.GetTab('Settings');
+  Tab.SetTooltip('');
+
+  with Self.lab_Title do
+  begin
+    Create(Tab);
+    SetFontSize(14);
+    GetFont.SetStyle([fsBold]);
+    SetCaption('Orka Lead Miner');
+    SetLeft(TControl.AdjustToDPI(30));
+    SetTop(TControl.AdjustToDPI(20));
+  end;
+
+  with Self.lab_Info do
+  begin
+    Create(Tab);
+    SetCaption('Mines lead in Pandemonium cave and banks on the island');
+    SetLeft(TControl.AdjustToDPI(30));
+    SetTop(TControl.AdjustToDPI(55));
+  end;
+
+  with Self.lab_BreakSettings do
+  begin
+    Create(Tab);
+    SetFontSize(10);
+    GetFont.SetStyle([fsBold]);
+    SetCaption('Automation Settings');
+    SetLeft(TControl.AdjustToDPI(30));
+    SetTop(TControl.AdjustToDPI(90));
+  end;
+
+  with Self.cb_TakeBreaks do
+  begin
+    Create(Tab);
+    SetCaption('Take breaks');
+    SetLeft(TControl.AdjustToDPI(30));
+    SetTop(TControl.AdjustToDPI(120));
+    SetChecked(True);
+  end;
+
+  with Self.edit_BreakAfter do
+  begin
+    Create(Tab);
+    SetCaption('Break after (minutes):');
+    SetLeft(TControl.AdjustToDPI(30));
+    SetTop(TControl.AdjustToDPI(150));
+    SetWidth(200);
+    SetText('120');
+  end;
+
+  with Self.edit_BreakFor do
+  begin
+    Create(Tab);
+    SetCaption('Break for (minutes):');
+    SetLeft(TControl.AdjustToDPI(30));
+    SetTop(TControl.AdjustToDPI(190));
+    SetWidth(200);
+    SetText('20');
+  end;
+
+  with Self.cb_TakeSleeps do
+  begin
+    Create(Tab);
+    SetCaption('Take sleeps');
+    SetLeft(TControl.AdjustToDPI(270));
+    SetTop(TControl.AdjustToDPI(120));
+    SetChecked(False);
+  end;
+
+  with Self.edit_SleepAtTime do
+  begin
+    Create(Tab);
+    SetCaption('Sleep at (HH:MM:SS):');
+    SetLeft(TControl.AdjustToDPI(270));
+    SetTop(TControl.AdjustToDPI(150));
+    SetWidth(200);
+    SetText('18:00:00');
+    SetHint('Time to start sleeping in 24-hour format');
+  end;
+
+  with Self.edit_SleepForHours do
+  begin
+    Create(Tab);
+    SetCaption('Sleep for (hours):');
+    SetLeft(TControl.AdjustToDPI(270));
+    SetTop(TControl.AdjustToDPI(190));
+    SetWidth(200);
+    SetText('8');
+    SetHint('Number of hours to sleep');
+  end;
+
+  with Self.cb_BlockInput do
+  begin
+    Create(Tab);
+    SetCaption('Block real input');
+    SetLeft(TControl.AdjustToDPI(510));
+    SetTop(TControl.AdjustToDPI(120));
+    SetChecked(True);
+  end;
+
+  with Self.edit_ShutdownAfter do
+  begin
+    Create(Tab);
+    SetCaption('Shutdown after (minutes):');
+    SetLeft(TControl.AdjustToDPI(510));
+    SetTop(TControl.AdjustToDPI(150));
+    SetWidth(200);
+    SetText('0');
+    SetHint('Minutes until script shuts down. 0 = disabled');
+  end;
+
+  Self.AddTab('Account Manager');
+  Tab := Self.GetTab('Account Manager');
+  Tab.SetTooltip('');
+  Self.CreateAccountManager(Tab);
+
+  LoadConfig();
+  inherited;
+end;
+
+procedure EnsureLoggedIn();
+begin
+  if not RSClient.IsLoggedIn() then
+    Login.LoginPlayer();
+
+  if not WaitUntil(RSClient.IsLoggedIn(), 250, 12000) then
+    TerminateScript('Failed to log in');
+end;
+
+procedure Init();
+begin
+  EnsureLoggedIn();
+  StartXP := XPBar.Read();
+
+  if StartXP < 1024 then
+    TerminateScript('Failed to read XP, make sure XPBar is set up correctly');
+
+  CurrentZoomLevel := Options.GetZoomLevel();
+  if not InRange(CurrentZoomLevel, 8, 18) then
+    SetZoom(Random(8, 18));
+
+  Mouse.Speed := SRL.NormalRange(14, 24);
+
+  LeadOresMined := 0;
+  LeadOresInInventory := Inventory.CountItem(LEAD_ORE_NAME);
+
+  TotalBreakTime := 0;
+  LastBreakStartTime := 0;
+  LastBreakEndTime := 0;
+  SetMiningAngle := True;
+
+  SetupAntiban();
+
+  InactivityTimer.Start();
+  ReportTimer.Start();
+end;
+
+procedure WalkToLeadRocks();
+begin
+  if not IsAtLeadRocks() then
+  begin
+    WriteDebug('Walking to lead rocks');
+    Map.Walker.WebWalk([8138, 12932], 2, 0.2);
+    Wait(600, 1200);
+  end;
+end;
+
+procedure WalkToDungeonExit();
+begin
+  if not IsAtDungeonExit() then
+  begin
+    WriteDebug('Walking to dungeon exit');
+    Map.Walker.WebWalk([8072, 12840], 2, 0.2);
+    Wait(600, 1200);
+  end;
+end;
+
+procedure WalkToDungeonEntrance();
+begin
+  if not IsAtDungeonEntrance() then
+  begin
+    WriteDebug('Walking to dungeon entrance');
+    Map.Walker.WebWalk([8088, 38440], 2, 0.2);
+    Wait(600, 1200);
+  end;
+end;
+
+procedure WalkToBank();
+begin
+  if not IsAtBank() then
+  begin
+    WriteDebug('Walking to bank');
+    Map.Walker.WebWalk([8060, 38430], 2, 0.2);
+    Wait(600, 1200);
+  end;
+end;
+
+function EnterDungeon(): Boolean;
+var
+  attempts: Int32;
+begin
+  Result := False;
+
+  if not IsOnIsland() then
+    Exit;
+
+  for attempts := 1 to 5 do
+  begin
+    // WalkClick handles both clicking if visible and walking if not
+    if PandemoniumObjects.DungeonEntrance.WalkClick() then
+    begin
+      // Wait for the cave entrance transition (only moves ~500 tiles)
+      if WaitForTeleportComplete(100, 30000) then
+      begin
+        Wait(1500, 2000);
+        if IsInCave() then
+        begin
+          WriteDebug('Successfully entered dungeon');
+          Exit(True);
+        end;
+      end;
+    end;
+
+    WriteDebug(ToStr('Failed to enter dungeon, attempt ', attempts));
+    Wait(750, 1250);
+  end;
+end;
+
+function ExitDungeon(): Boolean;
+var
+  attempts: Int32;
+begin
+  Result := False;
+
+  if IsOnIsland() then
+    Exit(True);
+
+  if not IsInCave() then
+    Exit;
+
+  for attempts := 1 to 5 do
+  begin
+    if IsOnIsland() then
+      Exit(True);
+
+    WalkToDungeonExit();
+
+    if IsOnIsland() then
+      Exit(True);
+
+    // Face south to see the cave exit
+    WriteLn(SRL.TimeStamp(), ':[LeadMiner]: Rotating to face south (180) to see cave exit');
+    Minimap.SetCompassAngle(Random(170,190),10);
+    Wait(500, 800);
+
+    if PandemoniumObjects.DungeonExit.Click() then
+    begin
+      // Wait for the cave exit transition (only moves ~500 tiles)
+      if WaitForTeleportComplete(100, 30000) then
+      begin
+        Wait(1500, 2000);
+        if IsOnIsland() then
+        begin
+          WriteDebug('Successfully exited dungeon');
+          Exit(True);
+        end;
+      end;
+    end;
+
+    WriteDebug(ToStr('Failed to exit dungeon, attempt ', attempts));
+    Wait(750, 1250);
+  end;
+end;
+
+function IsRockDepleted(rock: TRSObjectV2): Boolean;
+var
+  rockATPA: T2DPointArray;
+  rockTPA: TPointArray;
+  p: TPoint;
+begin
+  Result := True;
+
+  // Find this specific rock on screen
+  // Use rock.Find() to filter by location, avoiding false positives from other rocks/rats
+  if not rock.Find(rockATPA) then
+    Exit(True); // Rock not visible = depleted or out of view
+
+  // Check uptext on the rock
+  rockTPA := rockATPA[0];
+  if Length(rockTPA) > 0 then
+  begin
+    p := rockTPA[Random(Length(rockTPA))];
+    Mouse.Move(p);
+    Wait(80, 150);
+
+    // If we find "Lead" uptext, rock is NOT depleted
+    if MainScreen.IsUpText(['Lead']) then
+      Exit(False);
+  end;
+end;
+
+procedure CheckAndUseSpec();
+var
+  SpecLevel: Int32;
+  T: UInt64;
+begin
+  // Check if we have a spec weapon (colored orb)
+  if not Minimap.IsSpecWeapon() then
+    Exit;
+
+  SpecLevel := Minimap.GetSpecLevel();
+  if SpecLevel >= 100 then
+  begin
+    WriteDebug('Using Dragon Pickaxe special attack');
+    Mouse.Click(Minimap.Orbs[ERSMinimapOrb.SPECIAL_ATTACK], MOUSE_LEFT);
+
+    // Wait for spec to drop to confirm usage
+    T := GetTickCount() + 2000;
+    while (GetTickCount() < T) do
+    begin
+      if Minimap.GetSpecLevel() < SpecLevel then
+        Break;
+      Wait(100);
+    end;
+  end;
+end;
+
+function MineRock(rock: TRSObjectV2): Boolean;
+var
+  timeout: UInt64;
+  invBefore: Int32;
+begin
+  Result := False;
+  invBefore := Inventory.CountItem(LEAD_ORE_NAME);
+
+  WriteDebug(ToStr('Mining rock at: ', rock.Coordinates[0]));
+
+  // Use WalkClick which handles both on-screen and off-screen rocks
+  if not rock.WalkClick() then
+  begin
+    WriteDebug('Failed to click rock');
+    Exit(False);
+  end;
+
+  Minimap.WaitPlayerMoving(300, 10000);
+  Wait(1200, 1700);
+
+  // Wait until rock is depleted
+  timeout := GetTickCount() + Random(1500, 3000);
+
+  while (GetTickCount() < timeout) and not Inventory.IsFull() do
+  begin
+    // Check if we got ore
+    if Inventory.CountItem(LEAD_ORE_NAME) > invBefore then
+    begin
+      UpdateOreStats();
+      invBefore := Inventory.CountItem(LEAD_ORE_NAME);
+      Result := True;
+    end;
+
+    // Check if rock is depleted
+    if IsRockDepleted(rock) then
+    begin
+      WriteDebug('Rock depleted');
+      Exit(Result);
+    end;
+
+    Wait(500, 1000);
+  end;
+
+  WriteDebug('Mining timeout or inventory full');
+end;
+
+procedure MineUntilFull();
+var
+  rockIndex, failCount: Int32;
+  currentRock: TRSObjectV2;
+begin
+  WriteDebug('Mining until inventory is full');
+  rockIndex := 0;
+  failCount := 0;
+
+  while not Inventory.IsFull() do
+  begin
+    if not RSClient.IsLoggedIn() then
+    begin
+      WriteDebug('Player logged out, exiting mining loop');
+      Break;
+    end;
+
+    CheckAndUseSpec();
+
+    // Ensure camera is facing a good angle (North/North-East)
+    // Avoid South facing angles (90-270) which obstruct view
+    if InRange(Minimap.GetCompassAngle(), 10, 270) then
+      DoSafeRotate();
+
+    if not IsAtLeadRocks() then
+    begin
+      WalkToLeadRocks();
+      rockIndex := 0;
+    end;
+
+    // Get next rock in rotation
+    case rockIndex of
+      0: currentRock := PandemoniumObjects.LeadRock1;
+      1: currentRock := PandemoniumObjects.LeadRock2;
+      2: currentRock := PandemoniumObjects.LeadRock3;
+      3: currentRock := PandemoniumObjects.LeadRock4;
+    end;
+
+    rockIndex := (rockIndex + 1) mod 4;
+
+    // Mine this rock until depleted
+    if MineRock(currentRock) then
+    begin
+      InactivityTimer.Reset();
+      failCount := 0;
+    end
+    else
+    begin
+      Inc(failCount);
+      WriteDebug(ToStr('Failed to mine, fail count: ', failCount));
+
+      if failCount >= 10 then
+      begin
+        WriteDebug('Too many failures, repositioning');
+        //DoSafeRotate(); // Rotate to a safe angle when repositioning
+        Map.Walker.WebWalk([8138, 12932], 2, 0.2);
+        Wait(500, 1000);
+        failCount := 0;
+        rockIndex := 0;
+      end;
+    end;
+
+    if SRL.Dice(25) then
+      Antiban.DoAntiban(True, True);
+  end;
+
+  WriteDebug('Inventory full');
+
+  if not InRange(CurrentZoomLevel, 15, 35) then
+  begin
+    WriteDebug('Adjusting zoom for banking navigation');
+    SetZoom(Random(15, 35));
+  end;
+end;
+
+function BankInventory(): Boolean;
+begin
+  Result := False;
+
+  if not IsOnIsland() then
+  begin
+    WriteDebug('Attempted to bank while not on island');
+    Exit;
+  end;
+
+  // WalkClick handles both clicking if visible and walking if not
+  if not PandemoniumObjects.Bank.WalkClick() then
+  begin
+    DoSafeRotate();
+    Exit;
+  end;
+
+  if not WaitUntil(Bank.IsOpen(), 500, 7500) then
+  begin
+    WriteDebug('Failed to open bank');
+    Exit;
+  end;
+
+  Wait(400, 700);
+  Bank.DepositAll();
+  Wait(600, 900);
+  LeadOresInInventory := 0;
+
+  if Bank.IsOpen() then
+  begin
+    Bank.Close(50);
+    Wait(300, 500);
+  end;
+
+  SetMiningAngle := True; // Reset so camera rotates on next trip to mining area
+  Result := True;
+end;
+
+function GetState(): EState;
+begin
+  if not RSClient.IsLoggedIn() then
+    Exit(HANDLE_LOGIN);
+
+  if RSInterface.IsOpen() then
+    Exit(CLOSE_INTERFACE);
+
+  if Inventory.IsFull() then
+  begin
+    if IsInCave() then
+      Exit(EXIT_CAVE)
+    else
+      Exit(BANKING);
+  end;
+
+  if (Inventory.CountItem(LEAD_ORE_NAME) > 0) and IsOnIsland() then
+    Exit(BANKING);
+
+  if IsOnIsland() then
+    Exit(ENTER_CAVE);
+
+  if IsInCave() then
+  begin
+    if not IsAtLeadRocks() then
+      Exit(GO_TO_ROCKS)
+    else
+      Exit(MINE_ORE);
+  end;
+
+  Exit(DO_ANTIBAN);
+end;
+
+procedure Loop();
+var
+  State: EState;
+begin
+  if HasGainedXP() then
+    InactivityTimer.Reset();
+
+  if ReportTimer.ElapsedTime() > 300000 then
+  begin
+    Report();
+    ReportTimer.Reset();
+  end;
+
+  if (ShutdownTime > 0) and (GetTimeRunning() >= ShutdownTime) then
+    TerminateScript('Shutdown timer reached');
+
+  State := GetState();
+
+  case State of
+    HANDLE_LOGIN: Login.LoginPlayer();
+    CLOSE_INTERFACE: RSInterface.Close(50);
+    BANKING:
+      begin
+        if BankInventory() and IsOnIsland() then
+        begin
+          Wait(500, 900);
+          LeadOresInInventory := Inventory.CountItem(LEAD_ORE_NAME);
+        end;
+      end;
+    ENTER_CAVE:
+      begin
+        if EnterDungeon() then
+        begin
+          Wait(1000, 1500);
+          WalkToLeadRocks();
+
+          // Rotate camera to mining angle when arriving at mining area
+          if SetMiningAngle then
+          begin
+            DoSafeRotate();
+            SetMiningAngle := False;
+          end;
+        end;
+      end;
+    GO_TO_ROCKS: WalkToLeadRocks();
+    MINE_ORE: MineUntilFull();
+    EXIT_CAVE:
+      begin
+        if ExitDungeon() then
+        begin
+          Wait(1000, 1500);
+          BankInventory();
+        end;
+      end;
+    DO_ANTIBAN: Antiban.DoAntiban(True, True);
+  end;
+
+  WaitEx(100, 70);
+end;
+
+begin
+  GUI.Run();
+  SetupPandemoniumObjects();
+  Init();
+
+  repeat
+    Loop();
+  until False;
+end.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

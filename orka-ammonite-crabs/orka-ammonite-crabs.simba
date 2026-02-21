@@ -1,0 +1,4361 @@
+(**
+ * ============================================================================
+ * Orka Ammonite Crabs - Credits & Appreciation
+ * ============================================================================
+ *
+ * This script wouldn't exist without the incredible work of the WaspScripts community.
+ *
+ * Special thanks to the admins, moderators, scripters, and testers who
+ * maintain and continuously improve WaspLib, SRL-T, and the entire ecosystem.
+ *
+ * Credits:
+ * Torwent  |  3Garrett3  |  Student  |  BigAussie  |  Kriptic
+ * Fik  |  unit  | Caping | Sebastiaan  |  skunkworks  |  XJ  
+ *
+ * A huge thank you to everyone in the WaspScripts community who provides
+ * feedback, reports bugs, tests scripts, and helps newcomers learn.
+ *
+ * ============================================================================
+ *)
+{$DEFINE SCRIPT_REVISION := '1'}
+{$DEFINE SCRIPT_GUI}
+program OrkaAmmoniteCrabs;
+{$I SRL-T/osr.simba}
+{$I WaspLib/osr.simba}
+{$I WaspLib/optional/handlers/birdhouserunner.simba}
+
+// =============================================================================
+// Constants
+// =============================================================================
+const
+  SCRIPT_NAME = 'Orka Ammonite Crabs';
+  VERBOSE_LOGGING = True;
+
+  // --- Location bounds (Walker V2 coordinates) ---
+  FOSSIL_ISLAND_BOUNDS: TBox = [10396, 34778, 11304, 35638];
+  CRAFTING_GUILD_BOX: TBox = [7580, 37240, 7680, 37360];
+  CRAFTING_GUILD_BANK_TILE: TPoint = [7648, 37310];
+  COMBAT_AREA_RADIUS = 25;  // tiles (1 tile = 4 walker units)
+
+  // --- Timing intervals ---
+  AGGRO_TIMEOUT = 10 * ONE_MINUTE;
+  BH_MIN_TASK_INTERVAL = 50 * ONE_MINUTE;
+  DROP_CHECK_MIN = 90 * ONE_SECOND;
+  DROP_CHECK_MODE = 100 * ONE_SECOND;
+  DROP_CHECK_MAX = 150 * ONE_SECOND;
+  POTION_DURATION = 270 * ONE_SECOND;  // ~4.5 minutes
+  REPORT_INTERVAL = 5 * ONE_MINUTE;
+  
+
+  // --- Combat tuning ---
+  COMBAT_TIMEOUT_MIN = 10 * ONE_SECOND;
+  COMBAT_TIMEOUT_MAX = 14 * ONE_SECOND;
+  HEAL_HP_MIN_PERCENTAGE = 55;
+  HEAL_HP_MAX_PERCENTAGE = 65;
+  SPEC_CHECK_INTERVAL = 12 * ONE_SECOND;
+  SPEC_DICE_CHANCE = 20;
+
+  // --- Mouse speed ---
+  MOUSE_SPEED_MIN = 14;
+  MOUSE_SPEED_MAX = 24;
+
+  // --- Report formatting ---
+  REPORT_BANNER_WIDTH = 42;
+
+  // --- Chat detection ---
+  CLUE_LIMIT_MESSAGE = 'sneaking suspicion';
+
+// =============================================================================
+// Type Definitions
+// =============================================================================
+type
+  EBankLocation = (
+    BANK_FOSSIL_ISLAND,
+    BANK_CRAFTING_GUILD
+  );
+
+  ECombatXPType = (
+    XP_ATTACK,       // 75% Attack, 25% HP
+    XP_STRENGTH,     // 75% Strength, 25% HP
+    XP_DEFENCE,      // 75% Defence, 25% HP
+    XP_CONTROLLED,   // 25% each: Att/Str/Def/HP
+    XP_RANGED,       // 75% Ranged, 25% HP
+    XP_RANGED_DEF,   // 50% Ranged, 25% Def, 25% HP (Longrange)
+    XP_MAGIC,        // 60% Magic, 40% HP
+    XP_UNKNOWN
+  );
+
+  EState = (
+    HANDLE_LOGIN,
+    CLOSE_INTERFACE,
+    TELEPORT_TO_BANK,
+    HANDLE_BANK,
+    TELEPORT_TO_ISLAND,
+    WALK_TO_COMBAT,
+    CHECK_DROPS,
+    HEAL,
+    BOOST,
+    RESET_AGGRO,
+    FIGHTING,
+    DO_ANTIBAN
+  );
+
+  TAmmoniteObjects = record
+    BankChest: TRSObjectV2;
+    CraftingGuildBank: TRSObjectV2;
+    ResetAreaNorth, ResetAreaSouth: TBox;
+    CombatTile: TPoint;
+  end;
+
+  TGUI = record(TScriptForm)
+    // Combat settings
+    combo_BankLocation, combo_Food, combo_Potion: TLabeledCombobox;
+    combo_PotionQuantity, combo_FoodQuantity: TLabeledCombobox;
+    cb_UseSpec: TLabeledCheckbox;
+
+    // Additional settings
+    cb_PickupFossils, cb_PickupClues, cb_EnableBirdhouse: TLabeledCheckbox;
+
+    // Automation settings
+    cb_TakeBreaks, cb_TakeSleeps: TLabeledCheckbox;
+    edit_BreakAfter, edit_BreakFor: TLabeledEdit;
+    edit_SleepAtTime, edit_SleepForHours: TLabeledEdit;
+    edit_ShutdownAfter: TLabeledEdit;
+
+    // Birdhouse settings (custom implementation)
+    BHLogLabel: TLabel;
+    BHLogSelector: TComboBox;
+    BHSeedLabel: TLabel;
+    BHSeedEdit: TEdit;
+    BHBestLogCheckbox: TLabeledCheckBox;
+    BHCraftCheckbox: TLabeledCheckBox;
+    BHCraftDescLabel: TLabel;
+    BHIntervalLabel: TLabel;
+    BHNowRadio: TRadioButton;
+    BHNowLabel: TLabel;
+    BHLaterRadio: TRadioButton;
+    BHLaterLabel: TLabel;
+
+    // Account Manager extras
+    cb_RecordCrashes: TLabeledCheckbox;
+    edit_VideoTime: TLabeledEdit;
+  end;
+
+// =============================================================================
+// Global Variables
+// =============================================================================
+var
+  AmmoniteObjects: TAmmoniteObjects;
+  GUI: TGUI;
+  Config: TConfigJSON;
+
+  // Configuration from GUI
+  BankLocation: EBankLocation;
+  Food, Potion: TRSItem;
+  PotionAmount, FoodAmount: Int32;
+  UseFood, UsePotions, UseSpecs: Boolean;
+  PickupFossils, PickupClues, DoBHRuns: Boolean;
+
+  // Break/Sleep settings
+  TakeBreaks, TakeSleeps: Boolean;
+  BreakAfter, BreakFor, SleepForHours: Int32;
+  SleepAtTime: String;
+  ShutdownTime: Int64;
+
+  // Stats tracking
+  StartXP, GainedXP: Int32;
+  SmallFossilsCollected, MediumFossilsCollected, LargeFossilsCollected, RareFossilsCollected: Int32;
+  CluesCollected: Int32;
+
+  // Break tracking
+  TotalBreakTime, LastBreakStartTime, LastBreakEndTime: Int64;
+
+  // Timers
+  PotionTimer, DropCheckTimer, AggroTimer, ReportTimer, SpecTimer: TStopwatch;
+  NextDropCheckInterval: Int32;
+
+  // Combat tracking
+  WeaponSpecCost: Int32;
+  CanReceiveClues: Boolean;
+  CheckDropsEnabled: Boolean;
+  LastResetWasNorth: Boolean;
+  FoodDepleted, PotionDepleted: Boolean;
+
+  // Cached stats (to avoid checking stats tab while bank is open)
+  CachedHunterLevel: Int32;
+
+  // Combat XP tracking
+  CombatXPType: ECombatXPType;
+
+  // BH run tracking
+  LastBHRunEndTime: Int64;
+
+// =============================================================================
+// Debug Logging
+// =============================================================================
+
+(**
+ * WriteDebug
+ *
+ * Logs a timestamped debug message to the console when verbose logging is enabled.
+ *
+ * @param msg  The message to log
+ *)
+procedure WriteDebug(msg: String);
+begin
+  if VERBOSE_LOGGING then
+    WriteLn(SRL.TimeStamp(), ':[', SCRIPT_NAME, ']: ', msg);
+end;
+
+(**
+ * FormatNumber
+ *
+ * Formats an integer with thousand separators (e.g., 125000 -> "125,000").
+ *
+ * @param n  The number to format
+ * @return   Formatted string with commas as thousand separators
+ *)
+function FormatNumber(n: Int32): String;
+var
+  s: String;
+  i, count: Int32;
+begin
+  s := IntToStr(Abs(n));
+  Result := '';
+  count := 0;
+  for i := Length(s) downto 1 do
+  begin
+    if (count > 0) and (count mod 3 = 0) then
+      Result := ',' + Result;
+    Result := s[i] + Result;
+    Inc(count);
+  end;
+  if n < 0 then
+    Result := '-' + Result;
+end;
+
+(**
+ * GetCombatStyleName
+ *
+ * Returns a human-readable name for the current combat XP type.
+ *
+ * @return  The combat style name (e.g., "Strength", "Controlled")
+ *)
+function GetCombatStyleName(): String;
+begin
+  case CombatXPType of
+    ECombatXPType.XP_ATTACK:     Result := 'Attack';
+    ECombatXPType.XP_STRENGTH:   Result := 'Strength';
+    ECombatXPType.XP_DEFENCE:    Result := 'Defence';
+    ECombatXPType.XP_CONTROLLED: Result := 'Controlled';
+    ECombatXPType.XP_RANGED:     Result := 'Ranged';
+    ECombatXPType.XP_RANGED_DEF: Result := 'Ranged+Def';
+    ECombatXPType.XP_MAGIC:      Result := 'Magic';
+  else
+    Result := 'Unknown';
+  end;
+end;
+
+// =============================================================================
+// Map & Object Setup
+// =============================================================================
+
+(**
+ * SetupMapAndWalker
+ *
+ * Initializes the map walker with appropriate map chunks based on the
+ * selected bank location. Loads Fossil Island chunks always, and adds
+ * Crafting Guild chunks when that bank is selected.
+ *)
+procedure SetupMapAndWalker();
+begin
+  WriteDebug('Setting up map and walker...');
+
+  if BankLocation = EBankLocation.BANK_CRAFTING_GUILD then
+  begin
+    Map.SetupChunks([
+      Chunk([56,61,60,57], 0),  // Fossil Island
+      Chunk([44,52,46,50], 0)   // Crafting Guild area
+    ]);
+    WriteDebug('Loaded Fossil Island + Crafting Guild map chunks');
+  end
+  else
+  begin
+    Map.SetupChunks([
+      Chunk([56,61,60,57], 0)   // Fossil Island only
+    ]);
+    WriteDebug('Loaded Fossil Island map chunk');
+  end;
+end;
+
+(**
+ * SetupObjects
+ *
+ * Configures all game objects used by the script including bank chests,
+ * aggression reset areas, and the combat tile position.
+ *)
+procedure SetupObjects();
+begin
+  WriteDebug('Setting up objects...');
+  RSObjects.Setup();
+
+  // Fossil Island bank setup
+  with AmmoniteObjects.BankChest do
+  begin
+    SetupEx([0.7, 1, 5], [[10872, 35210]]);
+    SetupUpText(['Bank', 'chest']);
+    Finder.Colors += [
+      CTS2(530532, 10, 0.18, 1.61),
+      CTS2(2372, 3, 0.76, 0.01)
+    ];
+    Finder.Erode := 5;
+    TrackTarget := True;
+    Walker := @Map.Walker;
+  end;
+
+  // Crafting Guild bank setup
+  with AmmoniteObjects.CraftingGuildBank do
+  begin
+    SetupEx([0.9, 0.9, 1], [CRAFTING_GUILD_BANK_TILE]);
+    SetupUpText(['Bank', 'chest']);
+    Finder.Colors += [CTS2(3237499, 16, 0.05, 0.78)];
+    Finder.Grow := 3;
+    Finder.Erode := 4;
+    Walker := @Map.Walker;
+    TrackTarget := False;
+  end;
+
+  // Reset areas and combat tile from object mapper
+  AmmoniteObjects.ResetAreaNorth := [10656, 34838, 10660, 34846];
+  AmmoniteObjects.ResetAreaSouth := [10588, 35082, 10596, 35094];
+  AmmoniteObjects.CombatTile := [10532, 34930];
+
+  WriteDebug('Objects setup complete');
+end;
+
+// =============================================================================
+// Position Check Functions
+// =============================================================================
+
+(**
+ * IsOnFossilIsland
+ *
+ * Checks if the player's current map position is within the Fossil Island bounds.
+ *
+ * @return  True if the player is on Fossil Island
+ *)
+function IsOnFossilIsland(): Boolean;
+var
+  pos: TPoint;
+begin
+  pos := Map.Position();
+  Result := FOSSIL_ISLAND_BOUNDS.Contains(pos);
+end;
+
+(**
+ * IsAtCombatTile
+ *
+ * Checks if the player is standing on or very near the designated combat tile.
+ *
+ * @return  True if within 1 unit of the combat tile
+ *)
+function IsAtCombatTile(): Boolean;
+var
+  pos: TPoint;
+begin
+  pos := Map.Position();
+  // ~1/4 tile accuracy (matching reanimation script precision)
+  Result := pos.DistanceTo(AmmoniteObjects.CombatTile) <= 1;
+end;
+
+(**
+ * IsInCraftingGuild
+ *
+ * Checks if the player's current map position is within the Crafting Guild bounds.
+ *
+ * @return  True if the player is inside the Crafting Guild
+ *)
+function IsInCraftingGuild(): Boolean;
+var
+  pos: TPoint;
+begin
+  pos := Map.Position();
+  Result := CRAFTING_GUILD_BOX.Contains(pos);
+end;
+
+(**
+ * IsNearBank
+ *
+ * Checks if the player is within walking distance of the Fossil Island bank chest.
+ *
+ * @return  True if within ~10 tiles of the bank
+ *)
+function IsNearBank(): Boolean;
+var
+  pos: TPoint;
+begin
+  pos := Map.Position();
+  if BankLocation = EBankLocation.BANK_CRAFTING_GUILD then
+    Result := CRAFTING_GUILD_BOX.Contains(pos) or (pos.DistanceTo([10872, 35210]) < 40)
+  else
+    Result := pos.DistanceTo([10872, 35210]) < 40;
+end;
+
+(**
+ * IsInCombatArea
+ *
+ * Checks if the player is within COMBAT_AREA_RADIUS tiles of the combat tile.
+ * Used on startup to decide whether to bank or walk directly to the combat tile.
+ *
+ * @return  True if within COMBAT_AREA_RADIUS tiles of the combat tile
+ *)
+function IsInCombatArea(): Boolean;
+begin
+  Result := Map.Position().DistanceTo(AmmoniteObjects.CombatTile) <= (COMBAT_AREA_RADIUS * 4);
+end;
+
+(**
+ * HasDesiredLoadout
+ *
+ * Checks if the inventory already contains the full configured combat loadout.
+ * Used on startup to decide if we can skip banking entirely.
+ *
+ * @return  True if food count >= FoodAmount and potion count >= PotionAmount
+ *)
+function HasDesiredLoadout(): Boolean;
+var
+  potionCount, i: Int32;
+  logName: String;
+begin
+  Result := True;
+
+  // Check birdhouse run items if BH runs are enabled
+  if DoBHRuns then
+  begin
+    if not Inventory.ContainsItem('Chisel') then
+      Exit(False);
+    if not Inventory.ContainsItem('Hammer') then
+      Exit(False);
+
+    logName := BirdHouseRunner.GetLogString(BirdHouseRunner.LogType);
+    if Inventory.CountItem(logName) < 4 then
+      Exit(False);
+
+    if Inventory.CountItemStack(BirdHouseRunner.Seed) < 5 then
+      Exit(False);
+
+    if BirdHouseRunner.NeedClockworks then
+      if not Inventory.ContainsItem('Clockwork') then
+        Exit(False);
+  end;
+
+  if UseFood and (Length(String(Food)) > 0) then
+    if Inventory.CountItem(Food) < FoodAmount then
+      Exit(False);
+
+  if UsePotions and (Length(String(Potion)) > 0) then
+  begin
+    potionCount := 0;
+    for i := 1 to 4 do
+      potionCount += Inventory.CountItem(Potion + '(' + ToStr(i) + ')');
+    if potionCount < PotionAmount then
+      Exit(False);
+  end;
+end;
+
+// =============================================================================
+// Teleport Functions
+// =============================================================================
+
+(**
+ * TeleportToCraftingGuild
+ *
+ * Teleports the player to the Crafting Guild using a crafting cape.
+ * Tries inventory first, then equipped cape. Retries up to 5 times.
+ *
+ * @return  True if successfully teleported to the Crafting Guild
+ *)
+function TeleportToCraftingGuild(): Boolean;
+var
+  attempts: Int32;
+begin
+  Result := False;
+
+  if IsInCraftingGuild() then
+  begin
+    WriteDebug('TeleportToCraftingGuild | Already in Crafting Guild');
+    Exit(True);
+  end;
+
+  WriteDebug('TeleportToCraftingGuild | Attempting teleport...');
+
+  for attempts := 1 to 5 do
+  begin
+    // Try inventory first, then equipment
+    if Inventory.ClickItem('Crafting cape(t)', 'Teleport') or
+       Inventory.ClickItem('Crafting cape', 'Teleport') or
+       Equipment.ClickItem('Crafting cape(t)', 'Teleport') or
+       Equipment.ClickItem('Crafting cape', 'Teleport') then
+    begin
+      if WaitUntil(IsInCraftingGuild(), 200, 8000) then
+      begin
+        WriteDebug('TeleportToCraftingGuild | Successfully teleported');
+        Wait(1000, 1500);
+        Exit(True);
+      end;
+    end;
+
+    WriteDebug('TeleportToCraftingGuild | Attempt ' + ToStr(attempts) + ' failed, retrying...');
+    Wait(1000, 2000);
+  end;
+
+  WriteDebug('TeleportToCraftingGuild | Failed to teleport');
+end;
+
+(**
+ * TeleportToFossilIsland
+ *
+ * Teleports the player to Fossil Island via digsite pendant, then uses the
+ * mushtree at House on the Hill to travel to Mushroom Meadow.
+ *
+ * @return  True if successfully arrived on Fossil Island
+ *)
+function TeleportToFossilIsland(): Boolean;
+var
+  attempts: Int32;
+  transporter: TUniversalTransport;
+  pendantNames: TRSItemArray;
+  cachedWalker: PRSWalker;
+begin
+  Result := False;
+
+  if IsOnFossilIsland() then
+  begin
+    WriteDebug('TeleportToFossilIsland | Already on Fossil Island');
+    Exit(True);
+  end;
+
+  // Check if we have a digsite pendant before attempting teleport
+  pendantNames := getChargedJewelleryNames('Digsite Pendant');
+  if not Inventory.ContainsAny(pendantNames) and not Equipment.ContainsAny(pendantNames) then
+  begin
+    WriteDebug('TeleportToFossilIsland | No digsite pendant found - need to bank');
+    Exit(False);
+  end;
+
+  // Switch to BirdHouseRunner walker (V1) for Fossil Island coordinates
+  cachedWalker := ScriptWalker;
+  ScriptWalker := @BirdHouseRunner.RSW;
+
+  WriteDebug('TeleportToFossilIsland | Attempting teleport via digsite pendant...');
+
+  for attempts := 1 to 5 do
+  begin
+    // Use transport system to handle charged jewellery properly
+    transporter.Setup();
+    if transporter.run(RSTeleports.FOSSIL_ISLAND) then
+    begin
+      // Wait for teleport to House on the Hill (using BirdHouseRunner's V1 walker)
+      if WaitUntil(BirdHouseRunner.GetHouseOnHillRegion().Contains(BirdHouseRunner.RSW.GetMyPos()), 200, 8000) then
+      begin
+        WriteDebug('TeleportToFossilIsland | Arrived at House on the Hill');
+        Wait(1500, 2500);
+
+        // Use mushtree to teleport to Mushroom Meadow
+        WriteDebug('TeleportToFossilIsland | Walking to mushtree...');
+        if BirdHouseRunner.WalkToMushroom(0) then  // Index 0 = HouseHillShroom
+        begin
+          if MushTree.IsOpen() then
+          begin
+            WriteDebug('TeleportToFossilIsland | Using mushtree to Mushroom Meadow...');
+            MushTree.ClickButton(ERSMushTreeLocation.MUSHROOM_MEADOW);
+            Wait(2000, 3000);  // Initial wait for teleport animation
+
+            // Restore main walker (V2) to use Map.Position() for verification
+            ScriptWalker := cachedWalker;
+
+            // Verify we arrived at Mushroom Meadow using V2 coordinates
+            // MushTree coordinates: MUSHROOM_MEADOW = [10602, 34944]
+            if WaitUntil(Map.Position().InRange([10602, 34944], 60), 300, 4000) then
+            begin
+              WriteDebug('TeleportToFossilIsland | Arrived at Mushroom Meadow');
+              Exit(True);
+            end
+            else
+            begin
+              // Verification failed - switch back to V1 for potential retry
+              WriteDebug('TeleportToFossilIsland | Failed to verify Mushroom Meadow arrival');
+              ScriptWalker := @BirdHouseRunner.RSW;
+            end;
+          end;
+        end;
+      end;
+    end;
+
+    WriteDebug('TeleportToFossilIsland | Attempt ' + ToStr(attempts) + ' failed, pos=' + ToStr(BirdHouseRunner.RSW.GetMyPos()) + ' region=' + ToStr(BirdHouseRunner.GetHouseOnHillRegion()));
+    Wait(1000, 2000);
+  end;
+
+  // Restore main walker on failure
+  ScriptWalker := cachedWalker;
+  WriteDebug('TeleportToFossilIsland | Failed to teleport');
+end;
+
+// =============================================================================
+// Camera Helpers
+// =============================================================================
+
+(**
+ * AdjustCameraForTask
+ *
+ * Checks if the current compass angle is within [minAngle, maxAngle].
+ * If not, rotates the camera to a random angle within that range.
+ *
+ * @param minAngle The minimum desired angle
+ * @param maxAngle The maximum desired angle (if < minAngle, minAngle is adjusted by -360)
+ *)
+procedure AdjustCameraForTask(minAngle, maxAngle: Double);
+var
+  currentAngle: Double;
+begin
+  if minAngle > maxAngle then
+    minAngle -= 360;
+
+  currentAngle := Minimap.GetCompassAngle();
+
+  if SRL.Modulo(currentAngle - minAngle, 360) <= SRL.Modulo(maxAngle - minAngle, 360) then
+    Exit;
+
+  Minimap.SetCompassAngle(Random(Round(minAngle), Round(maxAngle)));
+  Wait(100, 300);
+end;
+
+// =============================================================================
+// Banking Functions
+// =============================================================================
+
+(**
+ * OpenBank
+ *
+ * Opens the bank interface using the appropriate bank chest based on the
+ * player's current location. Retries up to 10 times with camera adjustment
+ * for Fossil Island bank.
+ *
+ * @return  True if the bank was successfully opened
+ *)
+function OpenBank(): Boolean;
+var
+  i: Int32;
+begin
+  Result := False;
+
+  if Bank.IsOpen() then
+    Exit(True);
+
+  WriteDebug('OpenBank | Opening bank...');
+
+  for i := 1 to 10 do
+  begin
+    if Bank.IsOpen() then Exit(True);
+
+    // Use location-appropriate banking
+    if IsInCraftingGuild() then
+    begin
+      WriteDebug('OpenBank | Using Crafting Guild bank...');
+      if AmmoniteObjects.CraftingGuildBank.WalkClick() then
+        if Bank.IsOpen(8000, 200) then
+          Exit(True);
+    end
+    else
+    begin
+      // Adjust camera on first attempt and every 3 failures for FI bank
+      if (i = 1) or (i mod 3 = 1) then
+        AdjustCameraForTask(200, 340);
+
+      if AmmoniteObjects.BankChest.WalkClick() then
+        if Bank.IsOpen(5000, 200) then
+          Exit(True);
+    end;
+
+    WriteDebug('OpenBank | Attempt ' + ToStr(i) + ' failed, retrying...');
+    Wait(1000, 2000);
+  end;
+
+  WriteDebug('OpenBank | Failed to open bank');
+end;
+
+(**
+ * HasPotions
+ *
+ * Checks if the player has any dose of the configured potion in inventory.
+ *
+ * @return  True if any potion dose (1-4) is found
+ *)
+function HasPotions(): Boolean;
+var
+  i: Int32;
+begin
+  for i := 1 to 4 do
+    if Inventory.ContainsItem(Potion + '(' + ToStr(i) + ')') then
+      Exit(True);
+end;
+
+(**
+ * NeedsRestock
+ *
+ * Determines if the player needs to visit the bank for food or potions.
+ *
+ * @return  True if food or potions are needed and not in inventory
+ *)
+function NeedsRestock(): Boolean;
+begin
+  Result := False;
+
+  // Rule 1: Food depleted from inventory (skip if food depleted from bank)
+  if UseFood and (Length(String(Food)) > 0) and (not FoodDepleted) then
+    if not Inventory.ContainsItem(Food) then
+      Exit(True);
+
+  // Rule 2: Potions depleted (skip if potions depleted from bank)
+  // Skip banking for potions if BH runs are enabled (BH run will restock)
+  if UsePotions and (Length(String(Potion)) > 0) and (not PotionDepleted) then
+    if not HasPotions() then
+      if not DoBHRuns then
+        Exit(True);
+
+  // Rule 3: Fossil inventory management - full inventory with no supplies left
+  if PickupFossils and Inventory.IsFull() then
+  begin
+    if HasPotions() then
+      Exit(False);
+    if UseFood and Inventory.ContainsItem(Food) then
+      Exit(False);
+    // No potions and no food - bank the fossils
+    Exit(True);
+  end;
+
+end;
+
+(**
+ * RestockSupplies
+ *
+ * Deposits all items except teleport equipment, then withdraws the specified
+ * quantities of potions and food from the bank.
+ *
+ * @param potionCount  Number of 4-dose potions to withdraw
+ * @param foodCount    Number of food items to withdraw (0 = fill remaining slots)
+ *)
+procedure RestockSupplies(potionCount, foodCount: Int32);
+var
+  keepItems: TRSItemArray;
+  potionItem, foodItem: TRSBankItem;
+  emptySlots: Int32;
+  transporter: TUniversalTransport;
+begin
+  if not Bank.IsOpen() then
+  begin
+    WriteDebug('RestockSupplies | Bank not open!');
+    Exit;
+  end;
+
+  WriteDebug('RestockSupplies | Restocking with ' + ToStr(potionCount) + ' potions, ' + ToStr(foodCount) + ' food');
+
+  // Deposit everything except teleport items and BH materials based on bank location
+  if BankLocation = EBankLocation.BANK_CRAFTING_GUILD then
+  begin
+    keepItems := ['Crafting cape', 'Crafting cape(t)'];
+    keepItems += getChargedJewelleryNames('Digsite Pendant');
+  end
+  else
+    keepItems := [];
+
+  // Preserve BH materials in inventory when doing birdhouse runs (any bank location)
+  if DoBHRuns then
+  begin
+    keepItems += ['Chisel', 'Hammer'];
+    keepItems += [BirdHouseRunner.GetLogString(BirdHouseRunner.LogType)];
+    keepItems += [BirdHouseRunner.Seed];
+    if BirdHouseRunner.NeedClockworks then
+      keepItems += ['Clockwork'];
+  end;
+
+  Bank.DepositRandomItems(keepItems);
+  Wait(500, 750);
+
+  // Ensure digsite pendant is in inventory when using Crafting Guild bank
+  // Uses transport system to withdraw lowest charge pendant first (1→2→3→4→5)
+  if BankLocation = EBankLocation.BANK_CRAFTING_GUILD then
+  begin
+    if not Inventory.ContainsAny(getChargedJewelleryNames('Digsite Pendant')) then
+    begin
+      WriteDebug('RestockSupplies | Withdrawing digsite pendant for return teleport...');
+      transporter.Setup();
+      if not transporter.withdrawTeleportItem(RSTeleports.FOSSIL_ISLAND) then
+        WriteDebug('RestockSupplies | Warning: Could not withdraw digsite pendant');
+      Wait(400, 600);
+    end;
+  end;
+
+  // Withdraw potions first (if enabled and amount > 0)
+  if UsePotions and (potionCount > 0) and (Length(String(Potion)) > 0) then
+  begin
+    potionItem := TRSBankItem.Setup(Potion + '(4)', potionCount, False);
+    if Bank.WithdrawItem(potionItem, False) then
+      WriteDebug('RestockSupplies | Withdrew ' + ToStr(potionCount) + ' potions')
+    else
+    begin
+      WriteDebug('RestockSupplies | Failed to withdraw potions - bank supply depleted');
+      PotionDepleted := True;
+    end;
+    Wait(600, 900);
+  end;
+
+  // Withdraw food to fill remaining slots (if enabled)
+  if UseFood and (Length(String(Food)) > 0) then
+  begin
+    if foodCount <= 0 then
+      emptySlots := Inventory.CountEmptySlots()
+    else
+    begin
+      emptySlots := Min(foodCount, Inventory.CountEmptySlots());
+      if emptySlots < foodCount then
+        WriteDebug('RestockSupplies | Clamped food from ' + ToStr(foodCount) + ' to ' + ToStr(emptySlots));
+    end;
+
+    if emptySlots > 0 then
+    begin
+      foodItem := TRSBankItem.Setup(Food, emptySlots, False);
+      if Bank.WithdrawItem(foodItem, False) then
+        WriteDebug('RestockSupplies | Withdrew ' + ToStr(emptySlots) + ' food')
+      else
+      begin
+        WriteDebug('RestockSupplies | Failed to withdraw food - bank supply depleted');
+        FoodDepleted := True;
+      end;
+      Wait(600, 900);
+    end;
+  end;
+
+  Bank.Close();
+  WaitUntil(not Bank.IsOpen(), 200, 3000);
+end;
+
+// =============================================================================
+// Combat Functions
+// =============================================================================
+
+(**
+ * WalkToCombatTile
+ *
+ * Walks the player to the designated combat tile using WebWalk for long
+ * distances and precise clicking when close. Includes recovery logic to
+ * prevent infinite loops when stuck on adjacent tiles: rotates camera every
+ * 3 failed close attempts, and walks to a recovery tile after 10 failed
+ * attempts before retrying. Resets the aggression timer on arrival.
+ *
+ * @return  True when the player arrives at the exact combat tile
+ *)
+function WalkToCombatTile(): Boolean;
+var
+  closeAttempts: Int32;
+  recoveryTile, playerPos, minimapPoint: TPoint;
+begin
+  WriteDebug('WalkToCombatTile | Walking to combat position...');
+  closeAttempts := 0;
+  recoveryTile := [10544, 34930];
+
+  while not Map.Position().InRange(AmmoniteObjects.CombatTile, 0) do
+  begin
+    if Map.Position().InRange(AmmoniteObjects.CombatTile, 8) then
+    begin
+      Inc(closeAttempts);
+
+      if closeAttempts >= 10 then
+      begin
+        WriteDebug('WalkToCombatTile | Stuck after 10 close attempts, walking to recovery tile');
+        Map.Walker.WebWalk(recoveryTile, 2, 0.2);
+        Wait(500, 750);
+        closeAttempts := 0;
+        Continue;
+      end;
+
+      if (closeAttempts mod 3 = 0) then
+      begin
+        WriteDebug('WalkToCombatTile | Rotating camera after ' + ToStr(closeAttempts) + ' close attempts');
+        Antiban.RandomRotate();
+      end;
+
+      // Convert world coordinate to minimap point before clicking
+      playerPos := Map.Position();
+      minimapPoint := Map.Walker.PointToMM(playerPos, AmmoniteObjects.CombatTile, Minimap.GetCompassAngle(False));
+      Map.Walker.Click(minimapPoint, 0);
+    end
+    else
+      Map.Walker.WebWalk(AmmoniteObjects.CombatTile, 1, 0.2);
+
+    Wait(100, 200);
+  end;
+
+  AggroTimer.Reset();
+  WriteDebug('WalkToCombatTile | Arrived at combat tile, aggro timer reset');
+  Result := True;
+end;
+
+(**
+ * ResetAggression
+ *
+ * Resets NPC aggression by walking to a distant reset area, alternating
+ * between north and south each time, then returning to the combat tile.
+ *)
+procedure ResetAggression();
+var
+  resetBox: TBox;
+  resetTile: TPoint;
+begin
+  WL.Activity.Restart();
+  WriteDebug('ResetAggression | Starting aggression reset...');
+
+  // Alternate between north and south reset area
+  if not LastResetWasNorth then
+  begin
+    resetBox := AmmoniteObjects.ResetAreaNorth;
+    LastResetWasNorth := True;
+    WriteDebug('ResetAggression | Using north reset area');
+  end
+  else
+  begin
+    resetBox := AmmoniteObjects.ResetAreaSouth;
+    LastResetWasNorth := False;
+    WriteDebug('ResetAggression | Using south reset area');
+  end;
+
+  // Pick random tile within box
+  resetTile.X := Random(resetBox.X1, resetBox.X2);
+  resetTile.Y := Random(resetBox.Y1, resetBox.Y2);
+
+  WriteDebug('ResetAggression | Walking to reset tile: ' + ToStr(resetTile));
+
+  while not Map.Position.InRange(resetTile, 4) do
+  begin
+    try
+      Map.Walker.WebWalk(resetTile, 4);
+    except
+      Map.Walker.WalkBlind(resetTile, 4);
+    end;
+    Wait(100);
+  end;
+
+  WriteDebug('ResetAggression | Returning to combat tile...');
+  WalkToCombatTile();
+end;
+
+(**
+ * InCombat
+ *
+ * Checks if the player is currently in combat by looking for hitsplats.
+ *
+ * @param waitTime  Maximum time in ms to wait for a hitsplat (default 1000)
+ * @return          True if hitsplats are detected within the wait time
+ *)
+function InCombat(waitTime: Int32 = 1000): Boolean;
+begin
+  Result := WaitUntil(Length(Mainscreen.FindHitsplats()) > 0, 250, waitTime);
+end;
+
+(**
+ * GetCombatTimeout
+ *
+ * Returns a randomized timeout value for combat detection checks.
+ *
+ * @return  A random value between 13000 and 17000 ms
+ *)
+function GetCombatTimeout(): Int32;
+begin
+  Result := SRL.NormalRange(COMBAT_TIMEOUT_MIN, COMBAT_TIMEOUT_MAX);
+end;
+
+(**
+ * EatFood
+ *
+ * Clicks the configured food item in inventory to heal the player.
+ *)
+procedure EatFood();
+begin
+  if (Length(String(Food)) > 0) and Inventory.ClickItem(Food) then
+  begin
+    WriteDebug('EatFood | Eating food');
+    Wait(2225, 3275);
+  end
+  else
+    WriteDebug('EatFood | Failed to eat food');
+end;
+
+(**
+ * DropEmptyVials
+ *
+ * Shift-drops all empty vials from the inventory using a random drop pattern.
+ *)
+procedure DropEmptyVials();
+begin
+  if Inventory.ContainsItem('Vial') then
+  begin
+    WriteDebug('DropEmptyVials | Dropping empty vials');
+    Inventory.ShiftDrop(['Vial'], Inventory.RandomPattern());
+  end;
+end;
+
+(**
+ * DrinkPotion
+ *
+ * Drinks the highest available dose of the configured potion and resets the
+ * potion timer. Drops the empty vial immediately after drinking.
+ *)
+procedure DrinkPotion();
+var
+  i: Int32;
+begin
+  for i := 1 to 4 do
+    if Inventory.ClickItem(Potion + '(' + ToStr(i) + ')') then
+    begin
+      WriteDebug('DrinkPotion | Drinking potion');
+      PotionTimer.Reset();
+      Wait(2225, 3275);
+      DropEmptyVials();
+      Exit;
+    end;
+end;
+
+(**
+ * HasBHMaterials
+ *
+ * Checks if the inventory already contains all needed birdhouse run items.
+ * Used to decide whether to bank before a manual BH run.
+ *
+ * @return  True if all BH materials are present in inventory
+ *)
+function HasBHMaterials(): Boolean;
+var
+  logName: String;
+begin
+  Result := False;
+
+  if not Inventory.ContainsItem('Chisel') then Exit;
+  if not Inventory.ContainsItem('Hammer') then Exit;
+
+  logName := BirdHouseRunner.GetLogString(BirdHouseRunner.LogType);
+  if Inventory.CountItem(logName) < 4 then Exit;
+
+  if Inventory.CountItemStack(BirdHouseRunner.Seed) < 5 then Exit;
+
+  if BirdHouseRunner.NeedClockworks then
+    if not Inventory.ContainsItem('Clockwork') then Exit;
+
+  Result := True;
+end;
+
+(**
+ * WithdrawBHMaterials
+ *
+ * Withdraws birdhouse run materials from the bank without the digsite pendant.
+ * Items: chisel, hammer, 4 logs, seeds, and clockwork if needed.
+ * Updates log type to best available if AlwaysUseBestLog is enabled.
+ * Bank must already be open.
+ *
+ * @return  True if all items were successfully withdrawn
+ *)
+function WithdrawBHMaterials(): Boolean;
+var
+  item: TRSBankItem;
+  logName: String;
+  logsNeeded: Int32;
+begin
+  Result := False;
+
+  if not Bank.IsOpen() then
+  begin
+    WriteDebug('WithdrawBHMaterials | Bank not open!');
+    Exit;
+  end;
+
+  logName := BirdHouseRunner.GetLogString(BirdHouseRunner.LogType);
+
+  // Withdraw chisel (skip if already in inventory)
+  if Inventory.ContainsItem('Chisel') then
+    WriteDebug('WithdrawBHMaterials | Chisel already in inventory')
+  else
+  begin
+    item := TRSBankItem.Setup('Chisel', 1, False);
+    if not Bank.WithdrawItem(item, False) then
+    begin
+      WriteDebug('WithdrawBHMaterials | Failed to withdraw chisel');
+      Exit;
+    end;
+    if not WaitUntil(Inventory.ContainsItem('Chisel'), 100, 2000) then
+    begin
+      WriteDebug('WithdrawBHMaterials | Chisel not found in inventory after withdraw');
+      Exit;
+    end;
+    Wait(300, 500);
+  end;
+
+  // Withdraw hammer (skip if already in inventory)
+  if Inventory.ContainsItem('Hammer') then
+    WriteDebug('WithdrawBHMaterials | Hammer already in inventory')
+  else
+  begin
+    item := TRSBankItem.Setup('Hammer', 1, False);
+    if not Bank.WithdrawItem(item, False) then
+    begin
+      WriteDebug('WithdrawBHMaterials | Failed to withdraw hammer');
+      Exit;
+    end;
+    if not WaitUntil(Inventory.ContainsItem('Hammer'), 100, 2000) then
+    begin
+      WriteDebug('WithdrawBHMaterials | Hammer not found in inventory after withdraw');
+      Exit;
+    end;
+    Wait(300, 500);
+  end;
+
+  // Withdraw logs (only what's needed to reach 4)
+  logsNeeded := 4 - Inventory.CountItem(logName);
+  if logsNeeded <= 0 then
+    WriteDebug('WithdrawBHMaterials | Already have 4+ ' + logName)
+  else
+  begin
+    item := TRSBankItem.Setup(logName, logsNeeded, False);
+    if not Bank.WithdrawItem(item, False) then
+    begin
+      WriteDebug('WithdrawBHMaterials | Failed to withdraw logs: ' + logName);
+      Exit;
+    end;
+    if not WaitUntil(Inventory.CountItem(logName) >= 4, 100, 2000) then
+    begin
+      WriteDebug('WithdrawBHMaterials | Logs not found in inventory after withdraw');
+      Exit;
+    end;
+    Wait(300, 500);
+  end;
+
+  // Withdraw seeds (skip if already have enough)
+  if Inventory.CountItemStack(BirdHouseRunner.Seed) >= 40 then
+    WriteDebug('WithdrawBHMaterials | Already have 40+ seeds')
+  else
+  begin
+    item := TRSBankItem.Setup(BirdHouseRunner.Seed, 40, False);
+    if not Bank.WithdrawItem(item, False) then
+    begin
+      WriteDebug('WithdrawBHMaterials | Failed to withdraw seeds: ' + String(BirdHouseRunner.Seed));
+      Exit;
+    end;
+    if not WaitUntil(Inventory.CountItemStack(BirdHouseRunner.Seed) >= 5, 100, 2000) then
+    begin
+      WriteDebug('WithdrawBHMaterials | Seeds not found in inventory after withdraw');
+      Exit;
+    end;
+    Wait(300, 500);
+  end;
+
+  // Withdraw clockwork if needed (skip if already in inventory)
+  if BirdHouseRunner.NeedClockworks then
+  begin
+    if Inventory.ContainsItem('Clockwork') then
+      WriteDebug('WithdrawBHMaterials | Clockwork already in inventory')
+    else
+    begin
+      item := TRSBankItem.Setup('Clockwork', 1, False);
+      if not Bank.WithdrawItem(item, False) then
+      begin
+        WriteDebug('WithdrawBHMaterials | Failed to withdraw clockwork');
+        Exit;
+      end;
+      if not WaitUntil(Inventory.ContainsItem('Clockwork'), 100, 2000) then
+      begin
+        WriteDebug('WithdrawBHMaterials | Clockwork not found in inventory after withdraw');
+        Exit;
+      end;
+      Wait(300, 500);
+    end;
+  end;
+
+  WriteDebug('WithdrawBHMaterials | Successfully withdrew all BH materials');
+  Result := True;
+end;
+
+(**
+ * WaitForMushroomTeleport
+ *
+ * Waits for a mushroom teleport to complete by checking that the player's
+ * position has changed significantly from the starting position.
+ *
+ * @param startPos  The player's position before the teleport
+ * @return          True if position changed significantly (teleport succeeded)
+ *)
+function WaitForMushroomTeleport(startPos: TPoint): Boolean;
+var
+  currentPos: TPoint;
+begin
+  Result := WaitUntil(Map.Position().DistanceTo(startPos) > 50, 400, 8000);
+
+  if Result then
+  begin
+    // Wait for position to stabilize
+    currentPos := Map.Position();
+    Wait(600, 1000);
+    WriteDebug('WaitForMushroomTeleport | Teleport successful, new position: ' + ToStr(Map.Position()));
+  end
+  else
+    WriteDebug('WaitForMushroomTeleport | Teleport failed - position unchanged');
+end;
+
+(**
+ * AttemptSpec
+ *
+ * Attempts to use the weapon's special attack. Includes learning logic to
+ * auto-detect the spec cost on first use, and a 25% dice roll to add variance.
+ *)
+procedure AttemptSpec();
+var
+  StartLevel, EndLevel: Int32;
+  CurrentSpec: Int32;
+begin
+  // Check if spec usage is enabled
+  if not UseSpecs then
+    Exit;
+
+  // Check if we even have a spec weapon equipped
+  if not Minimap.IsSpecWeapon() then
+    Exit;
+
+  CurrentSpec := Minimap.GetSpecLevel();
+
+  // Dice roll (25% chance) unless we are learning (Cost=0)
+  if (WeaponSpecCost > 0) and (not SRL.Dice(SPEC_DICE_CHANCE)) then
+    Exit;
+
+  // If we already know the cost, check if we have enough energy
+  if (WeaponSpecCost > 0) then
+  begin
+    if CurrentSpec < WeaponSpecCost then
+    begin
+      WriteDebug('AttemptSpec | Not enough spec energy (' + ToStr(CurrentSpec) + '% < ' + ToStr(WeaponSpecCost) + '%)');
+      Exit;
+    end;
+  end;
+
+  // Attempt to enable spec
+  StartLevel := Minimap.GetSpecLevel();
+
+  if Minimap.EnableSpec(0) then
+  begin
+    Wait(200, 300);
+
+    // Learning Logic
+    if (WeaponSpecCost = 0) then
+    begin
+      EndLevel := Minimap.GetSpecLevel();
+
+      if (StartLevel > EndLevel) then
+        WeaponSpecCost := StartLevel - EndLevel
+      else
+      begin
+        if WaitUntil(Minimap.GetSpecLevel() < StartLevel, 100, 10000) then
+        begin
+          EndLevel := Minimap.GetSpecLevel();
+          WeaponSpecCost := StartLevel - EndLevel;
+          WriteDebug('AttemptSpec | Learned Spec Cost: ' + ToStr(WeaponSpecCost) + '%');
+        end
+        else
+          WriteDebug('AttemptSpec | Failed to learn cost (no drop detected)');
+      end;
+    end
+    else
+    begin
+      EndLevel := Minimap.GetSpecLevel();
+      if (StartLevel = EndLevel) then
+        WriteDebug('AttemptSpec | Spec Queued')
+      else
+        WriteDebug('AttemptSpec | Spec Used');
+    end;
+  end;
+end;
+
+// =============================================================================
+// Drop Handling
+// =============================================================================
+
+(**
+ * CheckClueScrollMessage
+ *
+ * Checks the chat for the clue scroll limit message. If detected, disables
+ * further clue pickup attempts to avoid wasting time.
+ *)
+procedure CheckClueScrollMessage();
+begin
+  if (not PickupClues) or (not CanReceiveClues) then Exit;
+
+  if Chat.FindMessage(CLUE_LIMIT_MESSAGE, [CHAT_COLOR_BLACK]) then
+  begin
+    WriteDebug('CheckClueScrollMessage | Clue scroll limit reached - disabling clue checks');
+    CanReceiveClues := False;
+    CheckDropsEnabled := PickupFossils;
+  end;
+end;
+
+(**
+ * CheckAndPickupDrops
+ *
+ * Scans for item dots on the minimap and attempts to pick up fossils and
+ * clue scrolls via right-click menu. Loops until no more desired items are
+ * found or inventory is full.
+ *
+ * @param ReturnToSpot  If True, walks back to the combat tile after picking up items
+ *)
+procedure CheckAndPickupDrops(ReturnToSpot: Boolean = True);
+var
+  searchItems: TStringArray;
+  dots: TPointArray;
+  rect: TRectangle;
+  angle: Double;
+  dot: TPoint;
+  i, initialCount, pickedType: Int32;
+  found, pickedAny: Boolean;
+  foodSlot: Int32;
+begin
+  // If inventory is full and we have food, drop one food to make room for fossils
+  if Inventory.IsFull() then
+  begin
+    if PickupFossils and UseFood and Inventory.FindItem(Food, foodSlot) then
+    begin
+      WriteDebug('CheckAndPickupDrops | Inventory full, dropping one food for fossil space');
+      Inventory.ShiftDrop([foodSlot]);
+      Wait(300, 500);
+    end
+    else
+      Exit;
+  end;
+  if not CheckDropsEnabled then Exit;
+
+  // Build search list manually
+  searchItems := [];
+  
+  if PickupFossils then
+  begin
+    searchItems := searchItems + [
+      'Unidentified small fossil', 
+      'Unidentified medium fossil', 
+      'Unidentified large fossil', 
+      'Unidentified rare fossil'
+    ];
+  end;
+
+  if PickupClues and CanReceiveClues then
+  begin
+    searchItems := searchItems + ['Clue scroll (easy)', 'Scroll box (easy)', 'Clue scroll', 'Scroll box'];
+  end;
+
+  if Length(searchItems) = 0 then Exit;
+
+  WriteDebug('CheckAndPickupDrops | Checking for drops...');
+  pickedAny := False;
+
+  repeat
+    found := False;
+    if Inventory.IsFull() then Break;
+
+    dots := Minimap.GetDots(ERSMinimapDot.ITEM);
+    if Length(dots) = 0 then Break;
+
+    dots.Sort(Minimap.Center);
+
+    for i := 0 to High(dots) do
+    begin
+      dot := dots[i];
+      angle := Minimap.GetCompassAngle(False);
+      rect := Minimap.VectorToMSRect(Vec3(dot.X + 2, dot.Y + 2, 0), 1, 1, angle);
+
+      if not Mainscreen.Bounds.Contains(rect.Mean()) then
+        Continue;
+
+      Mouse.Move(rect.Mean());
+      Wait(100, 200);
+
+      // Always right click to check all items in pile
+      if ChooseOption.Open() then
+      begin
+        if ChooseOption.HasOption(searchItems, True, False) then
+        begin
+          // Determine which item type is available, then select it
+          // pickedType: 0=none, 1=small, 2=medium, 3=large, 4=rare, 5=clue
+          pickedType := 0;
+          if PickupFossils and ChooseOption.HasOption(['Unidentified small fossil'], True, False) then
+            pickedType := 1
+          else if PickupFossils and ChooseOption.HasOption(['Unidentified medium fossil'], True, False) then
+            pickedType := 2
+          else if PickupFossils and ChooseOption.HasOption(['Unidentified large fossil'], True, False) then
+            pickedType := 3
+          else if PickupFossils and ChooseOption.HasOption(['Unidentified rare fossil'], True, False) then
+            pickedType := 4
+          else if PickupClues and CanReceiveClues and ChooseOption.HasOption(['Clue scroll (easy)', 'Scroll box (easy)', 'Clue scroll', 'Scroll box'], True, False) then
+            pickedType := 5;
+
+          if pickedType = 0 then
+          begin
+            ChooseOption.Close();
+            Continue;
+          end;
+
+          // Select the identified item
+          case pickedType of
+            1: ChooseOption.Select(['Unidentified small fossil']);
+            2: ChooseOption.Select(['Unidentified medium fossil']);
+            3: ChooseOption.Select(['Unidentified large fossil']);
+            4: ChooseOption.Select(['Unidentified rare fossil']);
+            5: ChooseOption.Select(['Clue scroll (easy)', 'Scroll box (easy)', 'Clue scroll', 'Scroll box']);
+          end;
+          WriteDebug('CheckAndPickupDrops | Selected item type: ' + ToString(pickedType));
+
+          // Wait for pickup
+          initialCount := Inventory.Count();
+          if WaitUntil(Inventory.Count() > initialCount, 250, 4000) then
+          begin
+            WriteDebug('CheckAndPickupDrops | Pickup successful');
+            found := True;
+            pickedAny := True;
+
+            case pickedType of
+              1: Inc(SmallFossilsCollected);
+              2: Inc(MediumFossilsCollected);
+              3: Inc(LargeFossilsCollected);
+              4: Inc(RareFossilsCollected);
+              5: Inc(CluesCollected);
+            end;
+
+            if CanReceiveClues and Inventory.IsFull() then
+              CanReceiveClues := False;
+          end;
+        end
+        else
+        begin
+          ChooseOption.Close();
+        end;
+      end;
+
+      if found then Break; // Break inner loop to refresh dots/check inventory
+    end;
+
+    if not found then Break; // No items found in any dots
+    
+  until False;
+
+  if pickedAny and ReturnToSpot then
+    WalkToCombatTile();
+
+  DropCheckTimer.Reset();
+  NextDropCheckInterval := SRL.SkewedRand(DROP_CHECK_MODE, DROP_CHECK_MIN, DROP_CHECK_MAX);
+end;
+
+// =============================================================================
+// Birdhouse Integration
+// =============================================================================
+
+(**
+ * TBirdHouseInclude.OnStart
+ *
+ * Prepares for a birdhouse run by pausing antiban, banking, depositing
+ * inventory, withdrawing birdhouse materials, and teleporting.
+ * Branches logic based on the current BankLocation setting.
+ * Only used for Crafting Guild bank; Fossil Island uses DoManualBirdHouseRun.
+ *
+ * @return  True if preparation was successful
+ *)
+function TBirdHouseInclude.OnStart(): Boolean; override;
+var
+  i: Int32;
+begin
+  WriteDebug('BirdHouseRunner.OnStart | Starting birdhouse run preparation...');
+
+  // Restart activity timer — BH runs take several minutes before earning XP
+  WL.Activity.Restart();
+
+  // Pause antiban tasks during birdhouse run
+  for i := 0 to High(Antiban.Tasks) do
+    Antiban.Tasks[i].Countdown.Pause();
+
+  // Update log type if using best log
+  if BirdHouseRunner.AlwaysUseBestLog then
+  begin
+    Self.SuggestedLogType := BirdHouseRunner.GetLogForHunterLevel(CachedHunterLevel);
+    if Self.LogType <> Self.SuggestedLogType then
+      Self.LogType := Self.SuggestedLogType;
+  end;
+
+  // Teleport to Crafting Guild
+  WriteDebug('BirdHouseRunner.OnStart | Teleporting to Crafting Guild...');
+  if not TeleportToCraftingGuild() then
+  begin
+    WriteDebug('BirdHouseRunner.OnStart | Failed to teleport to Crafting Guild');
+    Exit(False);
+  end;
+
+  // Open bank
+  for i := 1 to 5 do
+  begin
+    if Bank.IsOpen() then Break;
+
+    if AmmoniteObjects.CraftingGuildBank.WalkClick() then
+      if Bank.IsOpen(5000, 200) then
+        Break;
+
+    WriteDebug('BirdHouseRunner.OnStart | Failed to open bank, retrying (' + ToStr(i) + '/5)...');
+    Wait(1000, 2000);
+  end;
+
+  if not Bank.IsOpen() then
+  begin
+    WriteDebug('BirdHouseRunner.OnStart | Failed to open bank');
+    Exit(False);
+  end;
+
+  // Deposit all items
+  WriteDebug('BirdHouseRunner.OnStart | Depositing inventory...');
+  Bank.DepositAll();
+  Wait(500, 750);
+
+  // Withdraw BH materials (includes digsite pendant via transport system)
+  if not Self.WithdrawNextRun() then
+  begin
+    WriteDebug('BirdHouseRunner.OnStart | Failed to withdraw birdhouse items');
+    BirdHouseRunner.IsDisabled := True;
+    Bank.Close();
+    Exit(False);
+  end;
+
+  Bank.Close();
+  WaitUntil(not Bank.IsOpen(), 200, 3000);
+
+  // Set zoom for Fossil Island navigation
+  WriteDebug('BirdHouseRunner.OnStart | Setting zoom for Fossil Island...');
+  Options.SetZoomLevel(Random(10, 20));
+  Wait(300, 500);
+
+  // Teleport to island via digsite pendant
+  WriteDebug('BirdHouseRunner.OnStart | Teleporting to Fossil Island...');
+  if Self.TeleportToIsland() then
+  begin
+    WriteDebug('BirdHouseRunner.OnStart | Waiting for Fossil Island load...');
+    Wait(2500, 3500);
+  end;
+
+  Result := True;
+end;
+
+(**
+ * TBirdHouseInclude.OnComplete
+ *
+ * Finishes a birdhouse run by teleporting to bank, depositing loot,
+ * restocking supplies with GUI-configured amounts, resuming antiban,
+ * teleporting back to Fossil Island, and walking to combat tile.
+ * Only used for Crafting Guild bank; Fossil Island uses DoManualBirdHouseRun.
+ *)
+procedure TBirdHouseInclude.OnComplete(); override;
+var
+  i: Int32;
+  item: TRSBankItem;
+  transporter: TUniversalTransport;
+begin
+  WriteDebug('BirdHouseRunner.OnComplete | Finishing birdhouse run...');
+
+  // Handle any chat continues
+  if Chat.HasContinue() then
+    Chat.ClickContinue();
+
+  // Teleport to Crafting Guild
+  WriteDebug('BirdHouseRunner.OnComplete | Teleporting to Crafting Guild...');
+  if not TeleportToCraftingGuild() then
+  begin
+    WriteDebug('BirdHouseRunner.OnComplete | Failed to teleport, retrying...');
+    Wait(2000, 3000);
+    TeleportToCraftingGuild();
+  end;
+
+  // Open bank
+  for i := 1 to 5 do
+  begin
+    if Bank.IsOpen() then Break;
+
+    if AmmoniteObjects.CraftingGuildBank.WalkClick() then
+      if Bank.IsOpen(5000, 200) then
+        Break;
+
+    WriteDebug('BirdHouseRunner.OnComplete | Failed to open bank, retrying (' + ToStr(i) + '/5)...');
+    Wait(1000, 2000);
+  end;
+
+  if Bank.IsOpen() then
+  begin
+    // Deposit all (bird nests and BH items)
+    Bank.DepositAll();
+    Wait(600, 900);
+
+    // Restock with GUI-configured amounts
+    WriteDebug('BirdHouseRunner.OnComplete | Restocking supplies (' + ToStr(PotionAmount) + ' potions, ' + ToStr(FoodAmount) + ' food)...');
+
+    if UsePotions and (PotionAmount > 0) and (not PotionDepleted) then
+    begin
+      item := TRSBankItem.Setup(Potion + '(4)', PotionAmount, False);
+      if not Bank.WithdrawItem(item, False) then
+      begin
+        WriteDebug('BirdHouseRunner.OnComplete | Potion bank supply depleted');
+        PotionDepleted := True;
+      end;
+      Wait(600, 900);
+    end;
+
+    if UseFood and (FoodAmount > 0) and (not FoodDepleted) then
+    begin
+      item := TRSBankItem.Setup(Food, FoodAmount, False);
+      if not Bank.WithdrawItem(item, False) then
+      begin
+        WriteDebug('BirdHouseRunner.OnComplete | Food bank supply depleted');
+        FoodDepleted := True;
+      end;
+      Wait(600, 900);
+    end;
+
+    // Ensure digsite pendant is in inventory for return teleport
+    // Uses transport system to withdraw lowest charge pendant first (1→2→3→4→5)
+    if not Inventory.ContainsAny(getChargedJewelleryNames('Digsite Pendant')) then
+    begin
+      WriteDebug('BirdHouseRunner.OnComplete | Withdrawing digsite pendant for return...');
+      transporter.Setup();
+      if not transporter.withdrawTeleportItem(RSTeleports.FOSSIL_ISLAND) then
+        WriteDebug('BirdHouseRunner.OnComplete | Warning: Could not withdraw digsite pendant');
+      Wait(400, 600);
+    end;
+
+    Bank.Close();
+    WaitUntil(not Bank.IsOpen(), 200, 3000);
+  end;
+
+  // Resume antiban tasks
+  for i := 0 to High(Antiban.Tasks) do
+    Antiban.Tasks[i].Countdown.Resume();
+
+  // Teleport back to Fossil Island
+  WriteDebug('BirdHouseRunner.OnComplete | Teleporting to Fossil Island...');
+  TeleportToFossilIsland();
+
+  // Walk to combat tile
+  WriteDebug('BirdHouseRunner.OnComplete | Walking to combat tile...');
+  WalkToCombatTile();
+
+  // Track when this BH run ended for report
+  LastBHRunEndTime := GetTimeRunning();
+
+  WriteDebug('BirdHouseRunner.OnComplete | Birdhouse run complete, resuming combat');
+end;
+
+// =============================================================================
+// Manual Birdhouse Run (Fossil Island Bank)
+// =============================================================================
+
+(**
+ * DoManualBirdHouseRun
+ *
+ * Performs a birdhouse run when the player is already on Fossil Island
+ * (using FI bank). If BH materials are already in inventory, skips banking
+ * before the run. Uses WithdrawBHMaterials (no digsite pendant) instead of
+ * WithdrawNextRun. Includes mushroom teleport retry logic with position
+ * verification. After completion, banks loot and restocks BH materials +
+ * combat supplies for the next run.
+ *)
+procedure DoManualBirdHouseRun();
+var
+  i, attempts, retryAttempt: Int32;
+  cachedWalker: PRSWalker;
+  item: TRSBankItem;
+  needsBank: Boolean;
+  keepItems: TRSItemArray;
+  logName: String;
+begin
+  WriteDebug('DoManualBirdHouseRun | Starting manual birdhouse run...');
+
+  // Restart activity timer — BH runs take several minutes before earning XP
+  WL.Activity.Restart();
+
+  // Pause antiban tasks
+  for i := 0 to High(Antiban.Tasks) do
+    Antiban.Tasks[i].Countdown.Pause();
+
+  // Update log type if using best log
+  if BirdHouseRunner.AlwaysUseBestLog then
+  begin
+    BirdHouseRunner.SuggestedLogType := BirdHouseRunner.GetLogForHunterLevel(CachedHunterLevel);
+    if BirdHouseRunner.LogType <> BirdHouseRunner.SuggestedLogType then
+      BirdHouseRunner.LogType := BirdHouseRunner.SuggestedLogType;
+  end;
+
+  // Step 0: Check if we already have BH materials — skip banking if so
+  needsBank := not HasBHMaterials();
+
+  if needsBank then
+  begin
+    WriteDebug('DoManualBirdHouseRun | Missing BH materials, banking first...');
+
+    for i := 1 to 10 do
+    begin
+      if Bank.IsOpen() then Break;
+
+      // Adjust camera on first attempt and every 3 failures
+      if (i = 1) or (i mod 3 = 1) then
+        AdjustCameraForTask(200, 340);
+
+      if AmmoniteObjects.BankChest.WalkClick() then
+        if Bank.IsOpen(5000, 200) then
+          Break;
+
+      WriteDebug('DoManualBirdHouseRun | Failed to open bank, retrying (' + ToStr(i) + '/10)...');
+      Wait(1000, 2000);
+    end;
+
+    if not Bank.IsOpen() then
+    begin
+      WriteDebug('DoManualBirdHouseRun | Failed to open bank, aborting');
+      for i := 0 to High(Antiban.Tasks) do
+        Antiban.Tasks[i].Countdown.Resume();
+      Exit;
+    end;
+
+    // Deposit everything except BH materials we may already have
+    logName := BirdHouseRunner.GetLogString(BirdHouseRunner.LogType);
+    keepItems := ['Chisel', 'Hammer', logName, BirdHouseRunner.Seed];
+    if BirdHouseRunner.NeedClockworks then
+      keepItems += ['Clockwork'];
+
+    Bank.DepositRandomItems(keepItems);
+    Wait(500, 750);
+
+    // Withdraw BH materials with retry (no digsite pendant — we're already on the island)
+    for retryAttempt := 1 to 2 do
+    begin
+      if WithdrawBHMaterials() then Break;
+
+      WriteDebug('DoManualBirdHouseRun | WithdrawBHMaterials attempt ' + ToStr(retryAttempt) + ' failed');
+      if retryAttempt < 2 then
+        Wait(600, 1000);
+    end;
+
+    if not HasBHMaterials() then
+    begin
+      WriteDebug('DoManualBirdHouseRun | Failed to withdraw BH materials after retries, skipping this run');
+      Bank.Close();
+      for i := 0 to High(Antiban.Tasks) do
+        Antiban.Tasks[i].Countdown.Resume();
+      Exit;
+    end;
+
+    Bank.Close();
+    WaitUntil(not Bank.IsOpen(), 200, 3000);
+  end
+  else
+    WriteDebug('DoManualBirdHouseRun | Already have BH materials, skipping bank');
+
+  // Set zoom for Fossil Island navigation
+  Options.SetZoomLevel(Random(10, 20));
+  Wait(300, 500);
+
+  // Step 1: Switch to BH runner walker and reset state
+  cachedWalker := ScriptWalker;
+  ScriptWalker := @BirdHouseRunner.RSW;
+  BirdHouseRunner.Reset();
+  BirdHouseRunner.HasRunFinished := False;
+  BirdHouseRunner.HasRunStarted := True;
+  BirdHouseRunner.RunStartXp := XPBar.Read();
+
+  // Step 2: Walk to Mushroom Meadow mushtree (index 2) and teleport to Verdant Valley
+  // Use BirdHouseRunner.WalkToMushroom which uses the correct walker coordinates
+  WriteDebug('DoManualBirdHouseRun | Walking to Mushroom Meadow mushtree...');
+  for attempts := 1 to 3 do
+  begin
+    // Walk to mushroom and open interface using BirdHouseRunner's walker
+    if BirdHouseRunner.WalkToMushroom(2) then
+    begin
+      if MushTree.IsOpen() then
+      begin
+        WriteDebug('DoManualBirdHouseRun | Clicking Verdant Valley button (attempt ' + ToStr(attempts) + ')...');
+
+        // Click VERDANT_VALLEY button directly (not using GetMushButton circular route)
+        if MushTree.ClickButton(ERSMushTreeLocation.VERDANT_VALLEY) then
+        begin
+          // Wait for teleport - verify we're near Verdant Valley at [9426, 1272]
+          if WaitUntil(BirdHouseRunner.RSW.GetMyPos().InRange([9426, 1272], 60), 300, 6000) then
+          begin
+            WriteDebug('DoManualBirdHouseRun | Teleport to Verdant Valley verified');
+            // Set MushIndex to 1 so state machine knows next teleport goes to Meadow
+            BirdHouseRunner.MushIndex := 1;
+            Wait(1000, 1500); // Wait for screen to stabilize
+            Break;
+          end
+          else
+            WriteDebug('DoManualBirdHouseRun | Position verification failed');
+        end
+        else
+          WriteDebug('DoManualBirdHouseRun | Failed to click Verdant Valley button');
+      end
+      else
+        WriteDebug('DoManualBirdHouseRun | MushTree interface did not open');
+    end
+    else
+      WriteDebug('DoManualBirdHouseRun | Failed to walk to mushroom');
+
+    if attempts < 3 then
+    begin
+      WriteDebug('DoManualBirdHouseRun | Retrying teleport...');
+      Wait(1000, 2000);
+    end
+    else
+    begin
+      WriteDebug('DoManualBirdHouseRun | All teleport attempts failed, ABORTING birdhouse run');
+      ScriptWalker := cachedWalker;
+      for i := 0 to High(Antiban.Tasks) do
+        Antiban.Tasks[i].Countdown.Resume();
+      Exit;
+    end;
+  end;
+
+  // Step 3: Run the BH include's internal state machine loop
+  // Starting from Valley, this handles: 2 Valley BHs -> mushtree to Meadow -> 1 Meadow BH -> walk to Tar -> 1 Tar BH
+  WriteDebug('DoManualBirdHouseRun | Running BH include state machine...');
+  while not BirdHouseRunner.HasRunFinished do
+  begin
+    WL.Activity.Restart();
+    if not RSClient.IsLoggedIn() then
+    begin
+      if not Login.LoginPlayer() then
+      begin
+        WriteDebug('DoManualBirdHouseRun | Failed to log in during run');
+        Break;
+      end;
+      Wait(2000, 3000);
+    end;
+
+    BirdHouseRunner.State := BirdHouseRunner.GetState();
+
+    if BirdHouseRunner.State <> EScriptState.DO_NOTHING then
+      WriteDebug('DoManualBirdHouseRun | BH State: ' + ToStr(BirdHouseRunner.State));
+
+    case BirdHouseRunner.State of
+      EScriptState.BUILD_BIRDHOUSE: BirdHouseRunner.BuildBirdHouseItem();
+      EScriptState.INTERACT_BIRDHOUSES: BirdHouseRunner.HandleBirdHouse();
+      EScriptState.CLICK_MUSHROOM: BirdHouseRunner.WalkToMushroom();
+      EScriptState.USE_MUSHROOM: BirdHouseRunner.HandleMushroomTeleport();
+      EScriptState.NAVIGATING: BirdHouseRunner.HandleNavigating();
+      EScriptState.DO_NOTHING: ;
+      EScriptState.TELEPORTING: ;
+    end;
+  end;
+
+  // Step 4: Restore walker
+  BirdHouseRunner.HasRunFinished := False;
+  ScriptWalker := cachedWalker;
+
+  // Step 5: Bank results and restock on Fossil Island (BH materials + combat supplies)
+  WriteDebug('DoManualBirdHouseRun | Banking results and restocking...');
+
+  // Handle any chat continues
+  if Chat.HasContinue() then
+    Chat.ClickContinue();
+
+  for i := 1 to 10 do
+  begin
+    if Bank.IsOpen() then Break;
+
+    // Adjust camera on first attempt and every 3 failures
+    if (i = 1) or (i mod 3 = 1) then
+      AdjustCameraForTask(200, 340);
+
+    if AmmoniteObjects.BankChest.WalkClick() then
+      if Bank.IsOpen(5000, 200) then
+        Break;
+
+    WriteDebug('DoManualBirdHouseRun | Failed to open bank for restock, retrying (' + ToStr(i) + '/10)...');
+    Wait(1000, 2000);
+  end;
+
+  if Bank.IsOpen() then
+  begin
+    // Deposit everything except BH materials for next run
+    logName := BirdHouseRunner.GetLogString(BirdHouseRunner.LogType);
+    keepItems := ['Chisel', 'Hammer', logName, BirdHouseRunner.Seed];
+    if BirdHouseRunner.NeedClockworks then
+      keepItems += ['Clockwork'];
+
+    Bank.DepositRandomItems(keepItems);
+    Wait(600, 900);
+
+    // Withdraw any missing BH materials for next run
+    if not WithdrawBHMaterials() then
+      WriteDebug('DoManualBirdHouseRun | Warning: failed to withdraw BH materials for next run');
+
+    // Withdraw potions
+    if UsePotions and (PotionAmount > 0) and (not PotionDepleted) then
+    begin
+      item := TRSBankItem.Setup(Potion + '(4)', PotionAmount, False);
+      if not Bank.WithdrawItem(item, False) then
+      begin
+        WriteDebug('DoManualBirdHouseRun | Potion bank supply depleted');
+        PotionDepleted := True;
+      end;
+      Wait(600, 900);
+    end;
+
+    // Withdraw food
+    if UseFood and (FoodAmount > 0) and (not FoodDepleted) then
+    begin
+      item := TRSBankItem.Setup(Food, FoodAmount, False);
+      if not Bank.WithdrawItem(item, False) then
+      begin
+        WriteDebug('DoManualBirdHouseRun | Food bank supply depleted');
+        FoodDepleted := True;
+      end;
+      Wait(600, 900);
+    end;
+
+    Bank.Close();
+    WaitUntil(not Bank.IsOpen(), 200, 3000);
+  end;
+
+  // Step 6: Resume and return to combat
+  for i := 0 to High(Antiban.Tasks) do
+    Antiban.Tasks[i].Countdown.Resume();
+
+  // Reset BH timer for next run
+  if BirdHouseRunner.TaskInterval < BH_MIN_TASK_INTERVAL then
+    BirdHouseRunner.TaskInterval := BH_MIN_TASK_INTERVAL;
+  BirdHouseRunner.ScriptIntervalTimer.Init(BirdHouseRunner.GetNewRunInterval());
+  BirdHouseRunner.PrintReport();
+
+  WriteDebug('DoManualBirdHouseRun | Walking to combat tile...');
+  WalkToCombatTile();
+  AggroTimer.Reset();
+
+  // Track when this BH run ended for report
+  LastBHRunEndTime := GetTimeRunning();
+
+  WriteDebug('DoManualBirdHouseRun | Manual birdhouse run complete');
+end;
+
+// =============================================================================
+// Combat Style Detection for Antiban
+// =============================================================================
+
+(**
+ * GetTrainedSkills
+ *
+ * Detects the player's current combat style and returns the corresponding
+ * skills being trained. Used by the antiban system for skill hover tasks.
+ *
+ * @return  Array of ERSSkill values matching the active combat style
+ *)
+function GetTrainedSkills(): array of ERSSkill;
+var
+  style: String;
+  combatStyle: TRSCombatStyle;
+  combatType: ERSCombatType;
+begin
+  style := Combat.GetCombatStyle();
+  combatType := combatStyle.GetCombatType();
+  WriteDebug('GetTrainedSkills | Detected combat style: ' + style + ' | Combat type: ' + ToStr(combatType));
+
+  case combatType of
+    ERSCombatType.MELEE:
+    begin
+      // Attack styles
+      if style.ContainsAny(['Stab', 'Lunge', 'Bash', 'Pound', 'Spike', 'Jab', 'Hack', 'Accurate']) then
+      begin
+        WriteDebug('GetTrainedSkills | Training Attack skill');
+        CombatXPType := ECombatXPType.XP_ATTACK;
+        Result := [ERSSkill.ATTACK, ERSSkill.HITPOINTS, ERSSkill.TOTAL];
+        Exit;
+      end;
+
+      // Strength styles
+      if style.ContainsAny(['Aggressive', 'Slash', 'Chop', 'Pummel', 'Impale', 'Swipe', 'Smash', 'Punch', 'Kick']) then
+      begin
+        WriteDebug('GetTrainedSkills | Training Strength skill');
+        CombatXPType := ECombatXPType.XP_STRENGTH;
+        Result := [ERSSkill.STRENGTH, ERSSkill.HITPOINTS, ERSSkill.TOTAL];
+        Exit;
+      end;
+
+      // Defence styles
+      if style.ContainsAny(['Defensive', 'Block', 'Fend', 'Deflect']) then
+      begin
+        WriteDebug('GetTrainedSkills | Training Defence skill');
+        CombatXPType := ECombatXPType.XP_DEFENCE;
+        Result := [ERSSkill.DEFENCE, ERSSkill.HITPOINTS, ERSSkill.TOTAL];
+        Exit;
+      end;
+
+      // Controlled/Shared styles
+      if style.ContainsAny(['Controlled', 'Lash', 'Flick', 'Focus']) then
+      begin
+        WriteDebug('GetTrainedSkills | Training Controlled (Attack, Strength, Defence)');
+        CombatXPType := ECombatXPType.XP_CONTROLLED;
+        Result := [ERSSkill.ATTACK, ERSSkill.STRENGTH, ERSSkill.DEFENCE, ERSSkill.HITPOINTS, ERSSkill.TOTAL];
+        Exit;
+      end;
+    end;
+
+    ERSCombatType.RANGED:
+    begin
+      if style.ContainsAny(['Longrange']) then
+      begin
+        WriteDebug('GetTrainedSkills | Training Ranged + Defence (Longrange)');
+        CombatXPType := ECombatXPType.XP_RANGED_DEF;
+        Result := [ERSSkill.RANGE, ERSSkill.DEFENCE, ERSSkill.HITPOINTS, ERSSkill.TOTAL];
+        Exit;
+      end;
+
+      // Accurate or Rapid for ranged
+      WriteDebug('GetTrainedSkills | Training Ranged skill');
+      CombatXPType := ECombatXPType.XP_RANGED;
+      Result := [ERSSkill.RANGE, ERSSkill.HITPOINTS, ERSSkill.TOTAL];
+      Exit;
+    end;
+
+    ERSCombatType.MAGIC:
+    begin
+      WriteDebug('GetTrainedSkills | Training Magic skill');
+      CombatXPType := ECombatXPType.XP_MAGIC;
+      Result := [ERSSkill.MAGIC, ERSSkill.HITPOINTS, ERSSkill.TOTAL];
+      Exit;
+    end;
+  end;
+
+  // Fallback: all combat skills
+  WriteDebug('GetTrainedSkills | Could not detect combat type, defaulting to all combat skills');
+  CombatXPType := ECombatXPType.XP_UNKNOWN;
+  Result := [ERSSkill.ATTACK, ERSSkill.STRENGTH, ERSSkill.DEFENCE,
+             ERSSkill.HITPOINTS, ERSSkill.RANGE, ERSSkill.MAGIC, ERSSkill.TOTAL];
+end;
+
+// =============================================================================
+// Antiban Setup & Callbacks
+// =============================================================================
+
+(**
+ * TAntiban.DoLoseFocus
+ *
+ * Antiban task that briefly loses focus on the game client window.
+ *)
+procedure TAntiban.DoLoseFocus();
+begin
+  Self.LoseFocus(SRL.NormalRange(450, 2750));
+end;
+
+(**
+ * OnBreakStart
+ *
+ * Callback invoked when an antiban break begins. Pauses the inactivity timer
+ * and records the break start time.
+ *
+ * @param Task  Pointer to the break task data
+ *)
+procedure OnBreakStart(Task: PBreakTask);
+var
+  T: PBreakTask;
+begin
+  LastBreakStartTime := GetTimeRunning();
+  T := Task;
+end;
+
+(**
+ * OnBreakEnd
+ *
+ * Callback invoked when an antiban break ends. Resumes timers, accumulates
+ * total break time, and logs the player back in if needed.
+ *
+ * @param Task  Pointer to the break task data
+ *)
+procedure OnBreakEnd(Task: PBreakTask);
+var
+  T: PBreakTask;
+  BreakDuration: Int64;
+begin
+  LastBreakEndTime := GetTimeRunning();
+  BreakDuration := LastBreakEndTime - LastBreakStartTime;
+  TotalBreakTime := TotalBreakTime + BreakDuration;
+  T := Task;
+
+  // Log back in if player was logged out during break
+  if not RSClient.IsLoggedIn() then
+  begin
+    WriteDebug('OnBreakEnd | Logging player back in after break');
+    Login.LoginPlayer();
+
+    if not WaitUntil(RSClient.IsLoggedIn(), 250, 12000) then
+      TerminateScript('Failed to log back in after break');
+
+    Wait(1000, 2000);
+  end;
+end;
+
+(**
+ * OnSleepStart
+ *
+ * Callback invoked when an antiban sleep begins. Pauses the inactivity timer.
+ *
+ * @param Task  Pointer to the sleep task data
+ *)
+procedure OnSleepStart(Task: PSleepTask);
+var
+  T: PSleepTask;
+begin
+  T := Task;
+end;
+
+(**
+ * OnSleepEnd
+ *
+ * Callback invoked when an antiban sleep ends. Resumes the inactivity timer
+ * and logs the player back in if needed.
+ *
+ * @param Task  Pointer to the sleep task data
+ *)
+procedure OnSleepEnd(Task: PSleepTask);
+var
+  T: PSleepTask;
+begin
+  T := Task;
+
+  // Log back in if player was logged out during sleep
+  if not RSClient.IsLoggedIn() then
+  begin
+    WriteDebug('OnSleepEnd | Logging player back in after sleep');
+    Login.LoginPlayer();
+
+    if not WaitUntil(RSClient.IsLoggedIn(), 250, 12000) then
+      TerminateScript('Failed to log back in after sleep');
+
+    Wait(1000, 2000);
+  end;
+end;
+
+(**
+ * SetupAntiban
+ *
+ * Configures the antiban system with randomized tasks, breaks, and sleep
+ * schedules based on the user's GUI settings.
+ *)
+procedure CustomAntibanZoom();
+begin
+  Options.SetZoomLevel(Random(Antiban.MinZoom, Antiban.MaxZoom));
+end;
+
+procedure DoShortPause();
+var
+  duration: Int32;
+begin
+  duration := SRL.NormalRange(28000, 52000);
+  WriteDebug('DoShortPause | Taking a ' + ToStr(duration div 1000) + 's pause');
+  Antiban.LoseFocus(duration);
+end;
+
+procedure DoMediumPause();
+var
+  duration: Int32;
+begin
+  duration := SRL.NormalRange(42000, 78000);
+  WriteDebug('DoMediumPause | Taking a ' + ToStr(duration div 1000) + 's pause');
+  Antiban.LoseFocus(duration);
+end;
+
+procedure SetupAntiban();
+begin
+  Antiban.Skills := GetTrainedSkills();
+  Antiban.MinZoom := 10;
+  Antiban.MaxZoom := 35;
+
+  Antiban.AddTask(ONE_MINUTE * 4, @Antiban.RandomMouse, 0.25);
+  Antiban.AddTask(ONE_MINUTE * 15, @Antiban.RandomRightClick, 0.25);
+  Antiban.AddTask(ONE_MINUTE * 4, @Antiban.DoLoseFocus, 0.25);
+  Antiban.AddTask(ONE_MINUTE * 7, @Antiban.RandomRotate, 0.3);
+  Antiban.AddTask(ONE_MINUTE * 14, @Antiban.HoverSkills, 0.5);
+  Antiban.AddTask(ONE_MINUTE * 15, @Antiban.RandomTab, 0.5);
+  Antiban.AddTask(ONE_MINUTE * 11, @CustomAntibanZoom, 0.3);
+
+  if TakeBreaks then
+  begin
+    Antiban.AddTask(ONE_MINUTE * 12, @DoShortPause, 0.3);
+    Antiban.AddTask(ONE_MINUTE * 22, @DoMediumPause, 0.3);
+    Antiban.AddBreak(BreakAfter * ONE_MINUTE, BreakFor * ONE_MINUTE, 0.3, 1);
+    Antiban.OnStartBreak := @OnBreakStart;
+    Antiban.OnFinishBreak := @OnBreakEnd;
+  end;
+
+  if TakeSleeps then
+  begin
+    Antiban.AddSleep(SleepAtTime, SleepForHours * ONE_HOUR, 0.1, 1);
+    Antiban.OnStartSleep := @OnSleepStart;
+    Antiban.OnFinishSleep := @OnSleepEnd;
+  end;
+end;
+
+// =============================================================================
+// State Machine
+// =============================================================================
+
+(**
+ * TAntiban.HasTaskWaiting
+ *
+ * Checks if any antiban task has its countdown finished and is ready to execute.
+ *
+ * @return  True if at least one task is waiting
+ *)
+function TAntiban.HasTaskWaiting(): Boolean;
+var
+  i: Int32;
+begin
+  for i := 0 to High(Self.Tasks) do
+    if Self.Tasks[i].Countdown.IsFinished() then
+      Exit(True);
+end;
+
+// =============================================================================
+// Break/Sleep/Shutdown Safety Functions
+// =============================================================================
+
+(**
+ * IsBreakDue
+ *
+ * Checks if any scheduled break is ready to trigger.
+ *
+ * @return  True if a break timer has expired
+ *)
+function IsBreakDue(): Boolean;
+var
+  i: Int32;
+begin
+  Result := False;
+  if not TakeBreaks then Exit;
+  if Length(Antiban.Breaks) = 0 then Exit;
+
+  for i := 0 to High(Antiban.Breaks) do
+    if GetTimeRunning() >= Antiban.Breaks[i].NextAtTime then
+      Exit(True);
+end;
+
+(**
+ * IsSleepDue
+ *
+ * Checks if any scheduled sleep is ready to trigger.
+ *
+ * @return  True if a sleep timer has expired
+ *)
+function IsSleepDue(): Boolean;
+var
+  i: Int32;
+begin
+  Result := False;
+  if not TakeSleeps then Exit;
+  if Length(Antiban.Sleeps) = 0 then Exit;
+
+  for i := 0 to High(Antiban.Sleeps) do
+    if GetTimeRunning() >= Antiban.Sleeps[i].NextAtTime then
+      Exit(True);
+end;
+
+(**
+ * IsShutdownDue
+ *
+ * Checks if the shutdown timer has expired.
+ *
+ * @return  True if shutdown time has been reached
+ *)
+function IsShutdownDue(): Boolean;
+begin
+  Result := (ShutdownTime > 0) and (GetTimeRunning() >= ShutdownTime);
+end;
+
+(**
+ * DoShutdownIfDue
+ *
+ * Logs out and terminates the script if shutdown timer has expired.
+ * Only executes when at the combat tile for safety.
+ *)
+procedure DoShutdownIfDue();
+begin
+  if not IsShutdownDue() then Exit;
+  if not IsAtCombatTile() then Exit;
+
+  WriteDebug('DoShutdownIfDue | Shutdown timer reached - logging out and terminating');
+
+  if RSClient.IsLoggedIn() then
+  begin
+    if Logout.ClickLogout() then
+    begin
+      WriteDebug('DoShutdownIfDue | Player successfully logged out');
+      Wait(1000, 2000);
+    end
+    else
+      WriteDebug('DoShutdownIfDue | Warning: Failed to logout player');
+  end;
+
+  TerminateScript('Shutdown timer reached');
+end;
+
+(**
+ * TakeBreakIfDue
+ *
+ * Takes a scheduled break if one is due and we are at the combat tile.
+ * Logs back in after the break completes.
+ *)
+procedure TakeBreakIfDue();
+begin
+  if not IsBreakDue() then Exit;
+  if not IsAtCombatTile() then Exit;
+
+  WriteDebug('TakeBreakIfDue | Break timer reached - taking scheduled break');
+  Antiban.DoAntiban(True, False);
+
+  // Re-login if logged out during break
+  if not RSClient.IsLoggedIn() then
+  begin
+    WriteDebug('TakeBreakIfDue | Logging back in after break');
+    Login.LoginPlayer();
+    if not WaitUntil(RSClient.IsLoggedIn(), 250, 12000) then
+      TerminateScript('Failed to log back in after break');
+    Wait(2000, 3000);
+  end;
+
+  WL.Activity.Restart();
+  AggroTimer.Reset();
+end;
+
+(**
+ * TakeSleepIfDue
+ *
+ * Takes a scheduled sleep if one is due and we are at the combat tile.
+ * Logs back in after the sleep completes.
+ *)
+procedure TakeSleepIfDue();
+begin
+  if not IsSleepDue() then Exit;
+  if not IsAtCombatTile() then Exit;
+
+  WriteDebug('TakeSleepIfDue | Sleep timer reached - taking scheduled sleep');
+  Antiban.DoAntiban(True, False);
+
+  // Re-login if logged out during sleep
+  if not RSClient.IsLoggedIn() then
+  begin
+    WriteDebug('TakeSleepIfDue | Logging back in after sleep');
+    Login.LoginPlayer();
+    if not WaitUntil(RSClient.IsLoggedIn(), 250, 12000) then
+      TerminateScript('Failed to log back in after sleep');
+    Wait(2000, 3000);
+  end;
+
+  WL.Activity.Restart();
+  AggroTimer.Reset();
+end;
+
+(**
+ * GetState
+ *
+ * Evaluates the current game state and returns the highest-priority action.
+ * Priority order: login > interfaces > healing > banking > movement > drops >
+ * potions > aggro reset > antiban > fighting.
+ *
+ * @return  The EState value representing the next action to take
+ *)
+function GetState(): EState;
+begin
+  // Priority 1: Login check
+  if not RSClient.IsLoggedIn() then
+    Exit(HANDLE_LOGIN);
+
+  // Priority 2: Close interfaces
+  if RSInterface.IsOpen() then
+    Exit(CLOSE_INTERFACE);
+
+  // Priority 3: Healing
+  if UseFood and (Length(String(Food)) > 0) then
+    if Minimap.GetHPPercent() < SRL.NormalRange(HEAL_HP_MIN_PERCENTAGE, HEAL_HP_MAX_PERCENTAGE) then
+      if Inventory.ContainsItem(Food) then
+        Exit(HEAL)
+      else if (not FoodDepleted) and (not IsNearBank()) then
+        Exit(TELEPORT_TO_BANK);
+
+  // Priority 4: Banking/restocking
+  if NeedsRestock() then
+  begin
+    if IsNearBank() or Bank.IsOpen() then
+      Exit(HANDLE_BANK)
+    else
+      Exit(TELEPORT_TO_BANK);
+  end;
+
+  // Priority 5: Return to Fossil Island (if at Crafting Guild after banking)
+  if IsInCraftingGuild() then
+    Exit(TELEPORT_TO_ISLAND);
+
+  // Priority 6: Walk to combat tile
+  if IsOnFossilIsland() and (not IsAtCombatTile()) then
+    Exit(WALK_TO_COMBAT);
+
+  // Priority 7: Drop checking (randomized interval)
+  if CheckDropsEnabled and (not Inventory.IsFull()) then
+    if DropCheckTimer.ElapsedTime() > NextDropCheckInterval then
+      Exit(CHECK_DROPS);
+
+  // Priority 8: Potions
+  if UsePotions then
+    if PotionTimer.ElapsedTime() > POTION_DURATION then
+      if HasPotions() then
+        Exit(BOOST);
+
+  // Priority 9: Aggression reset (includes BH run check)
+  if AggroTimer.ElapsedTime() > AGGRO_TIMEOUT then
+    if not InCombat(GetCombatTimeout()) then
+      Exit(RESET_AGGRO);
+
+  // Priority 11: Antiban
+  if Antiban.HasTaskWaiting() then
+    Exit(DO_ANTIBAN);
+
+  // Default: Fighting
+  if InCombat(GetCombatTimeout()) then
+    Exit(FIGHTING);
+
+  // Not in combat and aggro not expired - likely aggro ended early
+  Exit(RESET_AGGRO);
+end;
+
+// =============================================================================
+// Report Function
+// =============================================================================
+
+(**
+ * HasGainedXP
+ *
+ * Checks if the player has gained XP since the last check and updates the
+ * tracked XP amount.
+ *
+ * @return  True if new XP has been gained
+ *)
+function HasGainedXP(): Boolean;
+var
+  t: Int32;
+begin
+  t := XPBar.Read() - StartXP;
+  Result := t > GainedXP;
+
+  if Result then
+    GainedXP := t;
+end;
+
+(**
+ * GetSkillName
+ *
+ * Converts an ERSSkill enum value to a display-friendly string.
+ *
+ * @param skill  The skill enum value to convert
+ * @return       Human-readable skill name (e.g., "Strength", "Hitpoints")
+ *)
+function GetSkillName(skill: ERSSkill): String;
+begin
+  case skill of
+    ERSSkill.ATTACK: Result := 'Attack';
+    ERSSkill.HITPOINTS: Result := 'Hitpoints';
+    ERSSkill.STRENGTH: Result := 'Strength';
+    ERSSkill.DEFENCE: Result := 'Defence';
+    ERSSkill.RANGE: Result := 'Ranged';
+    ERSSkill.MAGIC: Result := 'Magic';
+    else Result := 'Unknown';
+  end;
+end;
+
+(**
+ * CalculateSkillXP
+ *
+ * Calculates the XP earned for a specific skill based on the combat XP type
+ * and OSRS XP distribution ratios.
+ *
+ * @param totalXP       Total combat XP earned
+ * @param xpType        The combat XP distribution type
+ * @param skill         The skill to calculate XP for
+ * @return              Estimated XP for the specified skill
+ *)
+function CalculateSkillXP(totalXP: Int32; xpType: ECombatXPType; skill: ERSSkill): Int32;
+begin
+  Result := 0;
+
+  case xpType of
+    ECombatXPType.XP_ATTACK:
+    begin
+      if skill = ERSSkill.ATTACK then Result := Round(totalXP * 0.75);
+      if skill = ERSSkill.HITPOINTS then Result := Round(totalXP * 0.25);
+    end;
+
+    ECombatXPType.XP_STRENGTH:
+    begin
+      if skill = ERSSkill.STRENGTH then Result := Round(totalXP * 0.75);
+      if skill = ERSSkill.HITPOINTS then Result := Round(totalXP * 0.25);
+    end;
+
+    ECombatXPType.XP_DEFENCE:
+    begin
+      if skill = ERSSkill.DEFENCE then Result := Round(totalXP * 0.75);
+      if skill = ERSSkill.HITPOINTS then Result := Round(totalXP * 0.25);
+    end;
+
+    ECombatXPType.XP_CONTROLLED:
+    begin
+      if skill = ERSSkill.ATTACK then Result := Round(totalXP * 0.25);
+      if skill = ERSSkill.STRENGTH then Result := Round(totalXP * 0.25);
+      if skill = ERSSkill.DEFENCE then Result := Round(totalXP * 0.25);
+      if skill = ERSSkill.HITPOINTS then Result := Round(totalXP * 0.25);
+    end;
+
+    ECombatXPType.XP_RANGED:
+    begin
+      if skill = ERSSkill.RANGE then Result := Round(totalXP * 0.75);
+      if skill = ERSSkill.HITPOINTS then Result := Round(totalXP * 0.25);
+    end;
+
+    ECombatXPType.XP_RANGED_DEF:
+    begin
+      if skill = ERSSkill.RANGE then Result := Round(totalXP * 0.50);
+      if skill = ERSSkill.DEFENCE then Result := Round(totalXP * 0.25);
+      if skill = ERSSkill.HITPOINTS then Result := Round(totalXP * 0.25);
+    end;
+
+    ECombatXPType.XP_MAGIC:
+    begin
+      if skill = ERSSkill.MAGIC then Result := Round(totalXP * 0.60);
+      if skill = ERSSkill.HITPOINTS then Result := Round(totalXP * 0.40);
+    end;
+  end;
+end;
+
+(**
+ * Report
+ *
+ * Prints a formatted status report to the console with organized subgroups:
+ * Progress (runtime, skill-specific XP), Breaks & Sleeps, Birdhouse Runs, Drops.
+ *)
+procedure Report();
+
+  procedure WriteXPRow(skillName: String; xp, xpPerHour: Int32; colWidth: Int32);
+  var
+    line: String;
+  begin
+    line := '     ' + PadR(skillName, 12, ' ') +
+            PadR(FormatNumber(xp), 12, ' ') +
+            FormatNumber(xpPerHour);
+    WriteLn('| ' + PadR(line, colWidth, ' ') + ' |');
+  end;
+
+var
+  RunTime: Int64;
+  line: String;
+  bannerWidth: Int32 = REPORT_BANNER_WIDTH;
+  colWidth: Int32;
+  borderLine, dividerLine, sectionHeader, title: String;
+  TimeSinceLastBreak, TimeSinceLastBH: Int64;
+  skillXP, skillXPPerHour, totalXPPerHour: Int32;
+begin
+  RunTime := GetTimeRunning();
+  colWidth := bannerWidth - 4; // accounts for '| ' and ' |'
+  borderLine := '+' + StringOfChar('-', bannerWidth - 2) + '+';
+  dividerLine := '|' + StringOfChar('-', bannerWidth - 2) + '|';
+
+  // Center the title
+  title := SCRIPT_NAME;
+  title := '|' + PadR(PadL(title, (bannerWidth - 2 + Length(title)) div 2, ' '), bannerWidth - 2, ' ') + '|';
+
+  WriteLn('');
+  WriteLn(borderLine);
+  WriteLn(title);
+  WriteLn(borderLine);
+
+  // =========================================================================
+  // Section 1: Progress
+  // =========================================================================
+  sectionHeader := '| >> Progress';
+  WriteLn(PadR(sectionHeader, bannerWidth - 1, ' ') + '|');
+
+  // Runtime
+  line := '     Runtime: ' + SRL.MsToTime(RunTime, Time_Short);
+  WriteLn('| ' + PadR(line, colWidth, ' ') + ' |');
+  WriteLn(dividerLine);
+
+  // =========================================================================
+  // Section 2: Combat XP Table
+  // =========================================================================
+  sectionHeader := '| >> Combat XP (' + GetCombatStyleName() + ')';
+  WriteLn(PadR(sectionHeader, bannerWidth - 1, ' ') + '|');
+
+  // Column headers
+  line := '     ' + PadR('Skill', 12, ' ') + PadR('Gained', 12, ' ') + 'XP/Hour';
+  WriteLn('| ' + PadR(line, colWidth, ' ') + ' |');
+
+  // Skill rows based on CombatXPType
+  case CombatXPType of
+    ECombatXPType.XP_ATTACK:
+    begin
+      skillXP := CalculateSkillXP(GainedXP, CombatXPType, ERSSkill.ATTACK);
+      if RunTime > 0 then skillXPPerHour := Round(skillXP / (RunTime / 3600000)) else skillXPPerHour := 0;
+      WriteXPRow('Attack', skillXP, skillXPPerHour, colWidth);
+
+      skillXP := CalculateSkillXP(GainedXP, CombatXPType, ERSSkill.HITPOINTS);
+      if RunTime > 0 then skillXPPerHour := Round(skillXP / (RunTime / 3600000)) else skillXPPerHour := 0;
+      WriteXPRow('Hitpoints', skillXP, skillXPPerHour, colWidth);
+    end;
+
+    ECombatXPType.XP_STRENGTH:
+    begin
+      skillXP := CalculateSkillXP(GainedXP, CombatXPType, ERSSkill.STRENGTH);
+      if RunTime > 0 then skillXPPerHour := Round(skillXP / (RunTime / 3600000)) else skillXPPerHour := 0;
+      WriteXPRow('Strength', skillXP, skillXPPerHour, colWidth);
+
+      skillXP := CalculateSkillXP(GainedXP, CombatXPType, ERSSkill.HITPOINTS);
+      if RunTime > 0 then skillXPPerHour := Round(skillXP / (RunTime / 3600000)) else skillXPPerHour := 0;
+      WriteXPRow('Hitpoints', skillXP, skillXPPerHour, colWidth);
+    end;
+
+    ECombatXPType.XP_DEFENCE:
+    begin
+      skillXP := CalculateSkillXP(GainedXP, CombatXPType, ERSSkill.DEFENCE);
+      if RunTime > 0 then skillXPPerHour := Round(skillXP / (RunTime / 3600000)) else skillXPPerHour := 0;
+      WriteXPRow('Defence', skillXP, skillXPPerHour, colWidth);
+
+      skillXP := CalculateSkillXP(GainedXP, CombatXPType, ERSSkill.HITPOINTS);
+      if RunTime > 0 then skillXPPerHour := Round(skillXP / (RunTime / 3600000)) else skillXPPerHour := 0;
+      WriteXPRow('Hitpoints', skillXP, skillXPPerHour, colWidth);
+    end;
+
+    ECombatXPType.XP_CONTROLLED:
+    begin
+      skillXP := CalculateSkillXP(GainedXP, CombatXPType, ERSSkill.ATTACK);
+      if RunTime > 0 then skillXPPerHour := Round(skillXP / (RunTime / 3600000)) else skillXPPerHour := 0;
+      WriteXPRow('Attack', skillXP, skillXPPerHour, colWidth);
+
+      skillXP := CalculateSkillXP(GainedXP, CombatXPType, ERSSkill.STRENGTH);
+      if RunTime > 0 then skillXPPerHour := Round(skillXP / (RunTime / 3600000)) else skillXPPerHour := 0;
+      WriteXPRow('Strength', skillXP, skillXPPerHour, colWidth);
+
+      skillXP := CalculateSkillXP(GainedXP, CombatXPType, ERSSkill.DEFENCE);
+      if RunTime > 0 then skillXPPerHour := Round(skillXP / (RunTime / 3600000)) else skillXPPerHour := 0;
+      WriteXPRow('Defence', skillXP, skillXPPerHour, colWidth);
+
+      skillXP := CalculateSkillXP(GainedXP, CombatXPType, ERSSkill.HITPOINTS);
+      if RunTime > 0 then skillXPPerHour := Round(skillXP / (RunTime / 3600000)) else skillXPPerHour := 0;
+      WriteXPRow('Hitpoints', skillXP, skillXPPerHour, colWidth);
+    end;
+
+    ECombatXPType.XP_RANGED:
+    begin
+      skillXP := CalculateSkillXP(GainedXP, CombatXPType, ERSSkill.RANGE);
+      if RunTime > 0 then skillXPPerHour := Round(skillXP / (RunTime / 3600000)) else skillXPPerHour := 0;
+      WriteXPRow('Ranged', skillXP, skillXPPerHour, colWidth);
+
+      skillXP := CalculateSkillXP(GainedXP, CombatXPType, ERSSkill.HITPOINTS);
+      if RunTime > 0 then skillXPPerHour := Round(skillXP / (RunTime / 3600000)) else skillXPPerHour := 0;
+      WriteXPRow('Hitpoints', skillXP, skillXPPerHour, colWidth);
+    end;
+
+    ECombatXPType.XP_RANGED_DEF:
+    begin
+      skillXP := CalculateSkillXP(GainedXP, CombatXPType, ERSSkill.RANGE);
+      if RunTime > 0 then skillXPPerHour := Round(skillXP / (RunTime / 3600000)) else skillXPPerHour := 0;
+      WriteXPRow('Ranged', skillXP, skillXPPerHour, colWidth);
+
+      skillXP := CalculateSkillXP(GainedXP, CombatXPType, ERSSkill.DEFENCE);
+      if RunTime > 0 then skillXPPerHour := Round(skillXP / (RunTime / 3600000)) else skillXPPerHour := 0;
+      WriteXPRow('Defence', skillXP, skillXPPerHour, colWidth);
+
+      skillXP := CalculateSkillXP(GainedXP, CombatXPType, ERSSkill.HITPOINTS);
+      if RunTime > 0 then skillXPPerHour := Round(skillXP / (RunTime / 3600000)) else skillXPPerHour := 0;
+      WriteXPRow('Hitpoints', skillXP, skillXPPerHour, colWidth);
+    end;
+
+    ECombatXPType.XP_MAGIC:
+    begin
+      skillXP := CalculateSkillXP(GainedXP, CombatXPType, ERSSkill.MAGIC);
+      if RunTime > 0 then skillXPPerHour := Round(skillXP / (RunTime / 3600000)) else skillXPPerHour := 0;
+      WriteXPRow('Magic', skillXP, skillXPPerHour, colWidth);
+
+      skillXP := CalculateSkillXP(GainedXP, CombatXPType, ERSSkill.HITPOINTS);
+      if RunTime > 0 then skillXPPerHour := Round(skillXP / (RunTime / 3600000)) else skillXPPerHour := 0;
+      WriteXPRow('Hitpoints', skillXP, skillXPPerHour, colWidth);
+    end;
+  end;
+
+  // Total row
+  if RunTime > 0 then totalXPPerHour := Round(GainedXP / (RunTime / 3600000)) else totalXPPerHour := 0;
+  WriteXPRow('Total', GainedXP, totalXPPerHour, colWidth);
+  WriteLn(dividerLine);
+
+  // =========================================================================
+  // Section 3: Breaks & Sleeps
+  // =========================================================================
+  sectionHeader := '| >> Breaks & Sleeps';
+  WriteLn(PadR(sectionHeader, bannerWidth - 1, ' ') + '|');
+
+  if TakeBreaks then
+  begin
+    // Next break
+    if Length(Antiban.Breaks) > 0 then
+      line := '     Next break: ' + SRL.MsToTime(Max(0, Round(Antiban.Breaks[0].NextAtTime - RunTime)), Time_Short)
+    else
+      line := '     Next break: N/A';
+    WriteLn('| ' + PadR(line, colWidth, ' ') + ' |');
+
+    // Since last break
+    if LastBreakEndTime > 0 then
+    begin
+      TimeSinceLastBreak := RunTime - LastBreakEndTime;
+      line := '     Since last: ' + SRL.MsToTime(TimeSinceLastBreak, Time_Short);
+    end
+    else
+      line := '     Since last: N/A';
+    WriteLn('| ' + PadR(line, colWidth, ' ') + ' |');
+
+    // Total break time
+    if TotalBreakTime > 0 then
+      line := '     Total break time: ' + SRL.MsToTime(TotalBreakTime, Time_Short)
+    else
+      line := '     Total break time: 0s';
+    WriteLn('| ' + PadR(line, colWidth, ' ') + ' |');
+  end
+  else
+  begin
+    line := '     Breaks: Disabled';
+    WriteLn('| ' + PadR(line, colWidth, ' ') + ' |');
+  end;
+
+  // Sleeps
+  if TakeSleeps then
+  begin
+    if Length(Antiban.Sleeps) > 0 then
+      line := '     Next sleep: ' + SRL.MsToTime(Max(0, Round(Antiban.Sleeps[0].NextAtTime - RunTime)), Time_Short)
+    else
+      line := '     Next sleep: N/A';
+    WriteLn('| ' + PadR(line, colWidth, ' ') + ' |');
+  end
+  else
+  begin
+    line := '     Next sleep: Disabled';
+    WriteLn('| ' + PadR(line, colWidth, ' ') + ' |');
+  end;
+
+  // Shutdown timer
+  if ShutdownTime > 0 then
+    line := '     Shutdown: ' + SRL.MsToTime(Max(0, ShutdownTime - RunTime), Time_Short)
+  else
+    line := '     Shutdown: Disabled';
+  WriteLn('| ' + PadR(line, colWidth, ' ') + ' |');
+
+  // =========================================================================
+  // Section 4: Birdhouse Runs (if enabled)
+  // =========================================================================
+  if DoBHRuns then
+  begin
+    WriteLn(dividerLine);
+    sectionHeader := '| >> Birdhouse Runs';
+    WriteLn(PadR(sectionHeader, bannerWidth - 1, ' ') + '|');
+
+    // Timing line: Next run | Since last
+    if LastBHRunEndTime > 0 then
+      TimeSinceLastBH := RunTime - LastBHRunEndTime
+    else
+      TimeSinceLastBH := 0;
+
+    line := '     Next: ' + SRL.MsToTime(BirdHouseRunner.ScriptIntervalTimer.TimeRemaining(), Time_Short);
+    if TimeSinceLastBH > 0 then
+      line := line + ' | Last: ' + SRL.MsToTime(TimeSinceLastBH, Time_Short);
+    WriteLn('| ' + PadR(line, colWidth, ' ') + ' |');
+
+    // Stats line: XP | Runs | Nests
+    line := '     XP: ' + FormatNumber(BirdHouseRunner.TotalXPEarned) +
+            ' | Runs: ' + ToString(BirdHouseRunner.RunsCompleted) +
+            ' | Nests: ' + ToString(BirdHouseRunner.NestsLooted);
+    WriteLn('| ' + PadR(line, colWidth, ' ') + ' |');
+  end;
+
+  // =========================================================================
+  // Section 5: Drops (if fossils or clues enabled)
+  // =========================================================================
+  if PickupFossils or PickupClues then
+  begin
+    WriteLn(dividerLine);
+    sectionHeader := '| >> Drops';
+    WriteLn(PadR(sectionHeader, bannerWidth - 1, ' ') + '|');
+
+    // Fossils compact single line
+    if PickupFossils then
+    begin
+      line := '     Fossils: ' + ToString(SmallFossilsCollected) + ' S / ' +
+              ToString(MediumFossilsCollected) + ' M / ' +
+              ToString(LargeFossilsCollected) + ' L / ' +
+              ToString(RareFossilsCollected) + ' R';
+      WriteLn('| ' + PadR(line, colWidth, ' ') + ' |');
+    end;
+
+    // Clues
+    if PickupClues then
+    begin
+      line := '     Easy clues: ' + ToString(CluesCollected);
+      WriteLn('| ' + PadR(line, colWidth, ' ') + ' |');
+    end;
+  end;
+
+  // =========================================================================
+  // Footer
+  // =========================================================================
+  WriteLn(borderLine);
+  title := 'Orka Scripts';
+  title := '|' + PadR(PadL(title, (bannerWidth - 2 + Length(title)) div 2, ' '), bannerWidth - 2, ' ') + '|';
+  WriteLn(title);
+  WriteLn(borderLine);
+  WriteLn('');
+end;
+
+// =============================================================================
+// Main Loop
+// =============================================================================
+
+(**
+ * Loop
+ *
+ * Main script loop iteration. Handles XP tracking, periodic reporting,
+ * state evaluation, and dispatching to the appropriate handler.
+ * Breaks, sleeps, and shutdown are handled safely during RESET_AGGRO state.
+ *)
+procedure Loop();
+var
+  State: EState;
+begin
+  // XP tracking and activity restart
+  if HasGainedXP() then
+    WL.Activity.Restart();
+
+  // Inactivity threshold: terminate if no activity detected
+  if WL.Activity.IsFinished() then
+  begin
+    WriteDebug('No activity detected - terminating');
+    if RSClient.IsLoggedIn() then
+      Logout.ClickLogout();
+    TerminateScript('No activity detected');
+  end;
+
+  // Report every 5 minutes
+  if ReportTimer.ElapsedTime() > REPORT_INTERVAL then
+  begin
+    Report();
+    ReportTimer.Reset();
+  end;
+
+  State := GetState();
+
+  if State <> EState.FIGHTING then
+    WriteDebug('State: ' + ToStr(State));
+
+  case State of
+    HANDLE_LOGIN:
+    begin
+      WriteDebug('HANDLE_LOGIN | Logging in...');
+      Login.LoginPlayer();
+      Wait(2000, 3000);
+      WL.Activity.Restart();
+    end;
+
+    CLOSE_INTERFACE:
+      RSInterface.Close(50);
+
+    TELEPORT_TO_BANK:
+    begin
+      // Restart activity timer — banking round-trip can take over a minute
+      WL.Activity.Restart();
+      if BankLocation = EBankLocation.BANK_CRAFTING_GUILD then
+        TeleportToCraftingGuild()
+      else
+        AmmoniteObjects.BankChest.WalkClick();
+    end;
+
+    HANDLE_BANK:
+    begin
+      WL.Activity.Restart();
+      if not Bank.IsOpen() then
+        OpenBank();
+
+      if Bank.IsOpen() then
+        RestockSupplies(PotionAmount, FoodAmount);
+    end;
+
+    TELEPORT_TO_ISLAND:
+    begin
+      WL.Activity.Restart();
+      TeleportToFossilIsland();
+    end;
+
+    WALK_TO_COMBAT:
+      WalkToCombatTile();
+
+    CHECK_DROPS:
+    begin
+      CheckClueScrollMessage();
+      CheckAndPickupDrops();
+    end;
+
+    HEAL:
+      EatFood();
+
+    BOOST:
+      DrinkPotion();
+
+    RESET_AGGRO:
+    begin
+      WL.Activity.Restart();
+      // Priority 1: Check shutdown/break/sleep at safest moment (at combat tile, before reset)
+      DoShutdownIfDue();  // Will terminate script if due
+      TakeBreakIfDue();
+      TakeSleepIfDue();
+
+      // Priority 2: Final drop check before leaving
+      CheckClueScrollMessage();
+      if CheckDropsEnabled and (not Inventory.IsFull()) then
+        CheckAndPickupDrops(False);
+
+      // Priority 3: Check if birdhouse run is due
+      if DoBHRuns and BirdHouseRunner.ScriptIntervalTimer.IsFinished() then
+      begin
+        WriteDebug('RESET_AGGRO | Birdhouse run due - executing before aggro reset');
+        if BankLocation = EBankLocation.BANK_CRAFTING_GUILD then
+          BirdHouseRunner.DoBirdHouseRun()
+        else
+          DoManualBirdHouseRun();
+        AggroTimer.Reset();
+      end
+      else
+        ResetAggression();
+    end;
+
+    DO_ANTIBAN:
+      Antiban.DoAntiban(False, False);
+
+    FIGHTING:
+    begin
+      if UseSpecs and (SpecTimer.ElapsedTime() > SRL.NormalRange(SPEC_CHECK_INTERVAL - 1000, SPEC_CHECK_INTERVAL + 1000)) then
+      begin
+        AttemptSpec();
+        SpecTimer.Reset();
+      end;
+      Wait(1000);
+    end;
+  end;
+
+  Wait(50, 250);
+end;
+
+// =============================================================================
+// Config Save/Load
+// =============================================================================
+
+(**
+ * SaveConfig
+ *
+ * Persists the current GUI settings to a JSON configuration file so they
+ * can be restored on subsequent runs.
+ *)
+procedure SaveConfig();
+begin
+  if not Config.IsSetup then
+    Config.Setup('orka-ammonite-crabs');
+
+  Config.Put('bankLocation', Ord(BankLocation));
+  Config.Put('food_index', GUI.combo_Food.GetItemIndex());
+  Config.Put('food_quantity_index', GUI.combo_FoodQuantity.GetItemIndex());
+  Config.Put('potion_index', GUI.combo_Potion.GetItemIndex());
+  Config.Put('potion_quantity_index', GUI.combo_PotionQuantity.GetItemIndex());
+  Config.Put('useSpec', UseSpecs);
+  Config.Put('pickupFossils', PickupFossils);
+  Config.Put('pickupClues', PickupClues);
+  Config.Put('enableBirdhouse', DoBHRuns);
+
+  // Birdhouse settings
+  Config.Put('bh_useBestLog', BirdHouseRunner.AlwaysUseBestLog);
+  Config.Put('bh_craftWhileNav', BirdHouseRunner.NeedClockworks);
+  Config.Put('bh_logType', Ord(BirdHouseRunner.LogType));
+  Config.Put('bh_seed', String(BirdHouseRunner.Seed));
+
+  Config.Put('takeBreaks', TakeBreaks);
+  Config.Put('breakAfter', BreakAfter);
+  Config.Put('breakFor', BreakFor);
+  Config.Put('takeSleeps', TakeSleeps);
+  Config.Put('sleepAtTime', SleepAtTime);
+  Config.Put('sleepForHours', SleepForHours);
+  Config.Put('shutdownAfter', Round(ShutdownTime / 60000));
+
+  WriteDebug('Config saved');
+end;
+
+(**
+ * LoadConfig
+ *
+ * Loads previously saved GUI settings from the JSON configuration file
+ * and applies them to the GUI controls.
+ *)
+procedure LoadConfig();
+begin
+  if not Config.IsSetup then
+    Config.Setup('orka-ammonite-crabs');
+
+  if Config.Has('bankLocation') then
+    GUI.combo_BankLocation.SetItemIndex(Config.GetInt('bankLocation'));
+
+  if Config.Has('food_index') then
+    GUI.combo_Food.SetItemIndex(Config.GetInt('food_index'));
+
+  if Config.Has('food_quantity_index') then
+    GUI.combo_FoodQuantity.SetItemIndex(Config.GetInt('food_quantity_index'));
+
+  if Config.Has('potion_index') then
+    GUI.combo_Potion.SetItemIndex(Config.GetInt('potion_index'));
+
+  if Config.Has('potion_quantity_index') then
+    GUI.combo_PotionQuantity.SetItemIndex(Config.GetInt('potion_quantity_index'));
+
+  if Config.Has('useSpec') then
+    GUI.cb_UseSpec.SetChecked(Config.GetBoolean('useSpec'));
+
+  if Config.Has('pickupFossils') then
+    GUI.cb_PickupFossils.SetChecked(Config.GetBoolean('pickupFossils'));
+
+  if Config.Has('pickupClues') then
+    GUI.cb_PickupClues.SetChecked(Config.GetBoolean('pickupClues'));
+
+  if Config.Has('enableBirdhouse') then
+    GUI.cb_EnableBirdhouse.SetChecked(Config.GetBoolean('enableBirdhouse'));
+
+  if Config.Has('takeBreaks') then
+    GUI.cb_TakeBreaks.SetChecked(Config.GetBoolean('takeBreaks'));
+
+  if Config.Has('breakAfter') then
+    GUI.edit_BreakAfter.SetText(ToStr(Config.GetInt('breakAfter')));
+
+  if Config.Has('breakFor') then
+    GUI.edit_BreakFor.SetText(ToStr(Config.GetInt('breakFor')));
+
+  if Config.Has('takeSleeps') then
+    GUI.cb_TakeSleeps.SetChecked(Config.GetBoolean('takeSleeps'));
+
+  if Config.Has('sleepAtTime') then
+    GUI.edit_SleepAtTime.SetText(Config.GetString('sleepAtTime'));
+
+  if Config.Has('sleepForHours') then
+    GUI.edit_SleepForHours.SetText(ToStr(Config.GetInt('sleepForHours')));
+
+  if Config.Has('shutdownAfter') then
+    GUI.edit_ShutdownAfter.SetText(ToStr(Config.GetInt('shutdownAfter')));
+
+  WriteDebug('Config loaded');
+end;
+
+// =============================================================================
+// GUI Implementation
+// =============================================================================
+{$IFDEF SCRIPT_GUI}
+
+(**
+ * TGUI.GetMaxSupplySlots
+ *
+ * Returns the maximum number of inventory slots available for supplies
+ * (potions + food). Crafting Guild bank requires keeping a digsite pendant
+ * in inventory, reducing available slots from 28 to 27.
+ *
+ * @return  27 for Crafting Guild bank, 28 for Fossil Island bank
+ *)
+function TGUI.GetMaxSupplySlots(): Int32;
+begin
+  if Self.combo_BankLocation.GetItemIndex() = Ord(EBankLocation.BANK_CRAFTING_GUILD) then
+    Result := 27
+  else
+    Result := 28;
+end;
+
+(**
+ * TGUI.OnPotionQuantityChange
+ *
+ * Event handler triggered when the potion quantity dropdown changes. Adjusts
+ * the available food quantity options so that potions + food never exceed the
+ * available inventory slots. When birdhouse runs are enabled, food is capped at 2.
+ *
+ * @param Sender  The control that triggered the event
+ *)
+procedure TGUI.OnPotionQuantityChange(Sender: TObject);
+var
+  potionQty, maxFood, maxSlots, i, bestIdx: Int32;
+  prevFoodValue: String;
+  baseOptions: TStringArray;
+  filteredOptions: TStringArray;
+  prevFoodIdx: Int32;
+begin
+  Sender := Sender;
+  maxSlots := Self.GetMaxSupplySlots();
+  potionQty := Self.combo_PotionQuantity.GetText().ExtractInteger();
+  maxFood := maxSlots - potionQty;
+
+  if Self.cb_EnableBirdhouse.IsChecked() and (maxFood > 2) then
+    maxFood := 2;
+
+  // Save previous food selection value
+  prevFoodIdx := Self.combo_FoodQuantity.GetItemIndex();
+  if prevFoodIdx >= 0 then
+    prevFoodValue := Self.combo_FoodQuantity.GetText()
+  else
+    prevFoodValue := '0';
+
+  // Filter base options to those <= maxFood
+  baseOptions := ['0', '2', '4', '8', '12', '16', '20', '24', ToStr(maxSlots)];
+  filteredOptions := ['0'];
+  for i := 1 to High(baseOptions) do
+  begin
+    if baseOptions[i].ExtractInteger() <= maxFood then
+      filteredOptions += baseOptions[i];
+  end;
+
+  // Repopulate the food quantity dropdown
+  Self.combo_FoodQuantity.Clear();
+  Self.combo_FoodQuantity.AddItemArray(filteredOptions);
+
+  // Try to preserve previous selection; if it exceeds maxFood, pick highest available
+  bestIdx := 0;
+  for i := 0 to High(filteredOptions) do
+  begin
+    if filteredOptions[i] = prevFoodValue then
+    begin
+      bestIdx := i;
+      Break;
+    end;
+    // Track highest available as fallback
+    if filteredOptions[i].ExtractInteger() <= maxFood then
+      bestIdx := i;
+  end;
+  Self.combo_FoodQuantity.SetItemIndex(bestIdx);
+end;
+
+(**
+ * TGUI.OnBirdhouseChange
+ *
+ * Event handler triggered when the birdhouse checkbox changes. Adjusts the
+ * available potion quantity options to limit inventory usage when birdhouse
+ * runs are enabled, then cascades to update food quantity options.
+ *
+ * @param Sender  The control that triggered the event
+ *)
+procedure TGUI.OnBirdhouseChange(Sender: TObject);
+var
+  isBirdhouse: Boolean;
+  maxSlots, prevPotionIdx: Int32;
+  prevPotionValue: String;
+begin
+  Sender := Sender;
+  isBirdhouse := Self.cb_EnableBirdhouse.IsChecked();
+  maxSlots := Self.GetMaxSupplySlots();
+
+  // Save previous potion selection value
+  prevPotionIdx := Self.combo_PotionQuantity.GetItemIndex();
+  if prevPotionIdx >= 0 then
+    prevPotionValue := Self.combo_PotionQuantity.GetText()
+  else
+    prevPotionValue := '0';
+
+  // Potion Quantity
+  Self.combo_PotionQuantity.Clear();
+  if isBirdhouse then
+  begin
+    Self.combo_PotionQuantity.AddItemArray(['0', '2', '4']);
+    if prevPotionIdx > 2 then
+      Self.combo_PotionQuantity.SetItemIndex(2)
+    else if prevPotionIdx >= 0 then
+      Self.combo_PotionQuantity.SetItemIndex(prevPotionIdx)
+    else
+      Self.combo_PotionQuantity.SetItemIndex(0);
+  end
+  else
+  begin
+    Self.combo_PotionQuantity.AddItemArray(['0', '2', '4', '8', '12', '16', '20', '24', ToStr(maxSlots)]);
+    // Try to restore previous value; fallback to highest available
+    if prevPotionIdx >= 0 then
+    begin
+      if prevPotionIdx <= Self.combo_PotionQuantity.ComboBox.getItems().getCount() - 1 then
+        Self.combo_PotionQuantity.SetItemIndex(prevPotionIdx)
+      else
+        Self.combo_PotionQuantity.SetItemIndex(Self.combo_PotionQuantity.ComboBox.getItems().getCount() - 1);
+    end
+    else
+      Self.combo_PotionQuantity.SetItemIndex(0);
+  end;
+
+  // Cascade to update food quantity based on new potion selection
+  Self.OnPotionQuantityChange(nil);
+end;
+
+(**
+ * TGUI.OnBankLocationChange
+ *
+ * Event handler triggered when the bank location dropdown changes. Cascades
+ * to recalculate supply slot limits since Crafting Guild requires a digsite
+ * pendant (reducing available slots from 28 to 27).
+ *
+ * @param Sender  The control that triggered the event
+ *)
+procedure TGUI.OnBankLocationChange(Sender: TObject);
+begin
+  Sender := Sender;
+  Self.OnBirdhouseChange(nil);
+end;
+
+(**
+ * TGUI.OnRecordCrashesChange
+ *
+ * Handles toggling of the "Record crashes" checkbox, enabling/disabling
+ * the video time input and persisting the setting.
+ *
+ * @param Sender  The control that triggered the event
+ *)
+procedure TGUI.OnRecordCrashesChange(Sender: TObject);
+var
+  checked: Boolean;
+begin
+  checked := TCheckBox(Sender).IsChecked();
+  Self.edit_VideoTime.SetEnabled(checked);
+  WLSettings.GetObject('video').Put('enabled', checked);
+  WLSettings.SaveConfig();
+end;
+
+(**
+ * TGUI.OnVideoTimeChange
+ *
+ * Handles changes to the video time input field and persists the value.
+ *
+ * @param Sender  The control that triggered the event
+ *)
+procedure TGUI.OnVideoTimeChange(Sender: TObject);
+begin
+  WLSettings.GetObject('video').Put('time', StrToInt(TEdit(Sender).getText()));
+  WLSettings.SaveConfig();
+end;
+
+(**
+ * TGUI._BHSeedChanged
+ *
+ * Callback for seed text edit changes.
+ *
+ * @param Sender  The control that triggered the event
+ *)
+procedure TGUI._BHSeedChanged(Sender: TObject);
+var
+  seed: TEdit;
+begin
+  seed := Sender;
+  BirdHouseRunner.Seed := seed.getText();
+end;
+
+(**
+ * TGUI._BHLogTypeChanged
+ *
+ * Callback for log type dropdown changes.
+ *
+ * @param Sender  The control that triggered the event
+ *)
+procedure TGUI._BHLogTypeChanged(Sender: TObject);
+var
+  combobox: TComboBox;
+begin
+  combobox := Sender;
+  BirdHouseRunner.LogType := ERSLogType(comboBox.getItemIndex());
+end;
+
+(**
+ * TGUI._BHCheckBoxChanged
+ *
+ * Callback for birdhouse configuration checkboxes.
+ *
+ * @param Sender  The control that triggered the event
+ *)
+procedure TGUI._BHCheckBoxChanged(Sender: TObject);
+var
+  checkBox: TCheckBox;
+  isChecked: Boolean;
+begin
+  checkBox := Sender;
+  isChecked := checkBox.IsChecked();
+  case checkBox.getName() of
+    'bh_extraclockworkcb_checkbox': BirdHouseRunner.NeedClockworks := isChecked;
+    'bh_bestlogcb_checkbox': BirdHouseRunner.AlwaysUseBestLog := isChecked;
+  end;
+end;
+
+(**
+ * TGUI._BHRadioChanged
+ *
+ * Callback for birdhouse timing radio buttons.
+ *
+ * @param Sender  The control that triggered the event
+ *)
+procedure TGUI._BHRadioChanged(Sender: TObject);
+var
+  radio: TRadioButton;
+begin
+  radio := Sender;
+  case radio.getName() of
+    'bh_nowradio': BirdHouseRunner.TaskInterval := 0;
+    'bh_laterradio': BirdHouseRunner.TaskInterval := 50 * ONE_MINUTE;
+  end;
+end;
+
+(**
+ * TGUI.StartScript
+ *
+ * Reads all GUI control values into global variables, configures remote input,
+ * saves the configuration, and starts the script.
+ *
+ * @param Sender  The control that triggered the event
+ *)
+procedure TGUI.StartScript(Sender: TObject); override;
+var
+  ShutdownMinutes: Int32;
+begin
+  // Bank location
+  BankLocation := EBankLocation(Self.combo_BankLocation.GetItemIndex());
+
+  // Potion
+  Potion := Self.combo_Potion.GetText();
+  PotionAmount := Self.combo_PotionQuantity.GetText().ExtractInteger();
+
+  if (PotionAmount = 0) then
+    UsePotions := False
+  else
+    UsePotions := True;
+
+  // Food
+  Food := Self.combo_Food.GetText();
+  FoodAmount := Self.combo_FoodQuantity.GetText().ExtractInteger();
+
+  if (FoodAmount = 0) then
+  begin
+    UseFood := False;
+    Food := '';
+  end
+  else
+    UseFood := True;
+
+  // Other settings
+  UseSpecs := Self.cb_UseSpec.IsChecked();
+  PickupFossils := Self.cb_PickupFossils.IsChecked();
+  PickupClues := Self.cb_PickupClues.IsChecked();
+  DoBHRuns := Self.cb_EnableBirdhouse.IsChecked();
+
+  // Automation settings
+  TakeBreaks := Self.cb_TakeBreaks.IsChecked();
+  BreakAfter := Self.edit_BreakAfter.GetText().ExtractInteger();
+  BreakFor := Self.edit_BreakFor.GetText().ExtractInteger();
+  TakeSleeps := Self.cb_TakeSleeps.IsChecked();
+  SleepAtTime := Self.edit_SleepAtTime.GetText();
+  SleepForHours := Self.edit_SleepForHours.GetText().ExtractInteger();
+  ShutdownMinutes := Self.edit_ShutdownAfter.GetText().ExtractInteger();
+
+  if ShutdownMinutes > 0 then
+    ShutdownTime := ShutdownMinutes * 60000
+  else
+    ShutdownTime := 0;
+
+  // Block real input by default
+  WLSettings.RemoteInput.BlockInput := True;
+  RSClient.RemoteInput.DisableRealInput();
+
+  SaveConfig();
+  inherited;
+end;
+
+(**
+ * SetChildsBoldFont
+ *
+ * Recursively applies bold black font styling to a control and all its children.
+ *
+ * @param ctrl  The control to style
+ *)
+procedure SetChildsBoldFont(ctrl: TControl);
+var
+  i: Int32;
+  child: TControl;
+begin
+  for i := 0 to ctrl.getComponentCount() - 1 do
+  begin
+    child := ctrl.GetComponent(i);
+    SetChildsBoldFont(child);
+  end;
+
+  ctrl.GetFont().SetColor(clBlack);
+  ctrl.GetFont().SetStyle([fsBold]);
+end;
+
+(**
+ * TGUI.Run
+ *
+ * Builds and displays the script GUI with all tabs, controls, and settings.
+ * Loads saved configuration and shows the form for user interaction.
+ *)
+procedure TGUI.Run(); override;
+var
+  Tab, AccountTab: TTabSheet;
+  AccountPanel: TPanel;
+  Font: TFont;
+  Img: TPicture;
+  BGImg: TImage;
+  col1, col2, currentTop, spacing, controlWidth: Int32;
+  amSelectorPanel, amUserPanel, amPassPanel, amPinPanel, amWorldsPanel: TPanel;
+  amAddBtn, amSaveBtn, amDeleteBtn: TButton;
+begin
+  Self.Setup(SCRIPT_NAME, [880, 530]);
+  Self.Start.SetOnClick(@Self.StartScript);
+
+  Font.Init();
+  Font.setName('Verdana');
+  Font.SetQuality(fqCleartype);
+  Self.Form.setFont(Font);
+  Self.PageControl.SetFont(Font);
+  Font.Free();
+
+  // Download background image if not exists
+  if not FileExists(AppPath + 'Resources\OrkaAmmoniteCrabsBG.jpeg') then
+    DownloadToFile('https://i.imgur.com/S62lcIc.jpeg', AppPath + 'Resources\OrkaAmmoniteCrabsBG.jpeg');
+
+  // Setup background image on PageControl
+  if FileExists(AppPath + 'Resources\OrkaAmmoniteCrabsBG.jpeg') then
+  begin
+    Img.Init();
+    Img.LoadFromFile(AppPath + 'Resources\OrkaAmmoniteCrabsBG.jpeg');
+    with BGImg do
+    begin
+      Init(Self.PageControl);
+      SetParent(Self.PageControl);
+      SetPicture(Img);
+      SetAlign(alClient);
+      SetStretch(True);
+    end;
+  end;
+
+  // =========================================================================
+  // Tab 1: Script Settings
+  // =========================================================================
+  Self.AddTab('Script Settings');
+  Tab := Self.Tabs[High(Self.Tabs)];
+
+  col1 := TControl.AdjustToDPI(390);
+  col2 := TControl.AdjustToDPI(620);
+  controlWidth := TControl.AdjustToDPI(200);
+  spacing := TControl.AdjustToDPI(10);
+  currentTop := TControl.AdjustToDPI(30);
+
+  // --- Column 1: Combat Settings ---
+  with Self.combo_BankLocation do
+  begin
+    Create(Tab);
+    SetCaption('Bank Location:');
+    SetLeft(col1);
+    SetTop(currentTop);
+    SetWidth(TControl.AdjustToDPI(210));
+    SetStyle(csDropDownList);
+    AddItemArray(['Fossil Island', 'Crafting Guild (Cape)']);
+    SetItemIndex(0);
+    Combobox.SetOnChange(@Self.OnBankLocationChange);
+    SetFontColor($1A2A31);
+    Caption.GetFont().SetColor(clBlack);
+    Caption.GetFont().SetStyle([fsBold]);
+    SetHint('Choose where to bank. Crafting Guild requires a Crafting cape equipped or in inventory.');
+  end;
+
+  currentTop := Self.combo_BankLocation.GetTop() + Self.combo_BankLocation.GetHeight() + spacing;
+
+  with Self.combo_Potion do
+  begin
+    Create(Tab);
+    SetCaption('Potion:');
+    SetLeft(col1);
+    SetTop(currentTop);
+    SetWidth(TControl.AdjustToDPI(155));
+    SetStyle(csDropDownList);
+    AddItemArray(['Attack potion', 'Combat potion', 'Ranging potion',
+                  'Strength potion', 'Super attack', 'Super combat potion',
+                  'Super strength']);
+    SetItemIndex(1); // Default to Combat potion
+    SetFontColor($1A2A31);
+    Caption.GetFont().SetColor(clBlack);
+    Caption.GetFont().SetStyle([fsBold]);
+    SetHint('Select the combat potion to use. Set quantity to 0 to disable.');
+  end;
+
+  with Self.combo_PotionQuantity do
+  begin
+    Create(Tab);
+    SetCaption('Qty:');
+    SetLeft(col1 + TControl.AdjustToDPI(165));
+    SetTop(currentTop);
+    SetWidth(TControl.AdjustToDPI(45));
+    SetStyle(csDropDownList);
+    AddItemArray(['0', '2', '4', '8', '12', '16', '20', '24', '28']);
+    SetItemIndex(0); // Default 0
+    Combobox.SetOnChange(@Self.OnPotionQuantityChange);
+    SetFontColor($1A2A31);
+    Caption.GetFont().SetColor(clBlack);
+    Caption.GetFont().SetStyle([fsBold]);
+    SetHint('Number of 4-dose potions to withdraw from bank each trip.');
+  end;
+
+  currentTop := Self.combo_Potion.GetTop() + Self.combo_Potion.GetHeight() + spacing;
+
+  with Self.combo_Food do
+  begin
+    Create(Tab);
+    SetCaption('Food:');
+    SetLeft(col1);
+    SetTop(currentTop);
+    SetWidth(TControl.AdjustToDPI(155));
+    SetStyle(csDropDownList);
+    AddItemArray(['Bass', 'Cooked karambwan', 'Lobster', 'Mackerel',
+                  'Monkfish', 'Salmon', 'Shark', 'Swordfish', 'Trout', 'Tuna']);
+    SetItemIndex(2); // Default to Lobster
+    SetFontColor($1A2A31);
+    Caption.GetFont().SetColor(clBlack);
+    Caption.GetFont().SetStyle([fsBold]);
+    SetHint('Select the food type to use for healing. Set quantity to 0 to disable.');
+  end;
+
+  with Self.combo_FoodQuantity do
+  begin
+    Create(Tab);
+    SetCaption('Qty:');
+    SetLeft(col1 + TControl.AdjustToDPI(165));
+    SetTop(currentTop);
+    SetWidth(TControl.AdjustToDPI(45));
+    SetStyle(csDropDownList);
+    AddItemArray(['0', '2', '4', '8', '12', '16', '20', '24', '28']);
+    SetItemIndex(0); // Default 0
+    SetFontColor($1A2A31);
+    Caption.GetFont().SetColor(clBlack);
+    Caption.GetFont().SetStyle([fsBold]);
+    SetHint('Number of food items to withdraw from bank each trip.');
+  end;
+
+  // --- Column 2: Checkboxes ---
+  currentTop := TControl.AdjustToDPI(45);
+
+  with Self.cb_UseSpec do
+  begin
+    Create(Tab);
+    SetCaption('Use weapon special attack');
+    SetLeft(col2);
+    SetTop(currentTop);
+    SetWidth(TControl.AdjustToDPI(300));
+    SetChecked(False);
+    SetFontColor($1A2A31);
+    Caption.GetFont().SetColor(clBlack);
+    Caption.GetFont().SetStyle([fsBold]);
+    SetHint('Automatically use weapon special attack when available. Cost is auto-detected on first use.');
+  end;
+
+  currentTop := Self.cb_UseSpec.GetTop() + Self.cb_UseSpec.GetHeight() + spacing;
+
+  with Self.cb_PickupFossils do
+  begin
+    Create(Tab);
+    SetCaption('Pick up unidentified fossils');
+    SetLeft(col2);
+    SetTop(currentTop);
+    SetWidth(TControl.AdjustToDPI(300));
+    SetChecked(True);
+    SetFontColor($1A2A31);
+    Caption.GetFont().SetColor(clBlack);
+    Caption.GetFont().SetStyle([fsBold]);
+    SetHint('Pick up unidentified fossils dropped by Ammonite Crabs.');
+  end;
+
+  currentTop := Self.cb_PickupFossils.GetTop() + Self.cb_PickupFossils.GetHeight() + spacing;
+
+  with Self.cb_PickupClues do
+  begin
+    Create(Tab);
+    SetCaption('Pick up clue scrolls');
+    SetLeft(col2);
+    SetTop(currentTop);
+    SetWidth(TControl.AdjustToDPI(300));
+    SetChecked(True);
+    SetFontColor($1A2A31);
+    Caption.GetFont().SetColor(clBlack);
+    Caption.GetFont().SetStyle([fsBold]);
+    SetHint('Pick up clue scrolls dropped by Ammonite Crabs. Disables automatically if clue limit is reached.');
+  end;
+
+  currentTop := Self.cb_PickupClues.GetTop() + Self.cb_PickupClues.GetHeight() + spacing;
+
+  with Self.cb_EnableBirdhouse do
+  begin
+    Create(Tab);
+    SetCaption('Enable birdhouse runs');
+    SetLeft(col2);
+    SetTop(currentTop);
+    SetWidth(TControl.AdjustToDPI(300));
+    SetChecked(False);
+    SetFontColor($1A2A31);
+    Caption.GetFont().SetColor(clBlack);
+    Caption.GetFont().SetStyle([fsBold]);
+    CheckBox.SetOnChange(@Self.OnBirdhouseChange);
+    SetHint('Run birdhouse runs periodically for passive Hunter XP. Configure in the Birdhouse Settings tab.');
+  end;
+
+  // --- Start Button (bottom-right) ---
+  Self.Start.setVisible(False);
+  with Self.Start do
+  begin
+    SetAlign(alNone);
+    SetBounds(
+      Self.Form.GetWidth() - TControl.AdjustToDPI(220),
+      Self.Form.GetHeight() - TControl.AdjustToDPI(80),
+      TControl.AdjustToDPI(190),
+      TControl.AdjustToDPI(60)
+    );
+    SetCaption('Start');
+    GetFont().SetName('Verdana');
+    GetFont().SetSize(15);
+    //GetFont().SetStyle([fsBold]);
+    setVisible(True);
+  end;
+
+  // =========================================================================
+  // Tab 2: Breaks and Sleep
+  // =========================================================================
+  Self.AddTab('Breaks and Sleeps');
+  Tab := Self.Tabs[High(Self.Tabs)];
+
+  col1 := TControl.AdjustToDPI(410);
+  col2 := TControl.AdjustToDPI(630);
+
+  // --- Column 1: Breaks ---
+  currentTop := TControl.AdjustToDPI(30);
+
+  with Self.cb_TakeBreaks do
+  begin
+    Create(Tab);
+    SetCaption('Take breaks');
+    SetLeft(col1);
+    SetTop(currentTop);
+    SetWidth(TControl.AdjustToDPI(200));
+    SetChecked(True);
+    SetFontColor($1A2A31);
+    Caption.GetFont().SetColor(clBlack);
+    Caption.GetFont().SetStyle([fsBold]);
+  end;
+
+  currentTop := Self.cb_TakeBreaks.GetTop() + Self.cb_TakeBreaks.GetHeight() + spacing;
+
+  with Self.edit_BreakAfter do
+  begin
+    Create(Tab);
+    SetCaption('Break after (minutes):');
+    SetLeft(col1);
+    SetTop(currentTop);
+    SetWidth(TControl.AdjustToDPI(180));
+    SetHeight(TControl.AdjustToDPI(36));
+    SetText('120');
+    SetFontColor($1A2A31);
+    Caption.GetFont().SetColor(clBlack);
+    Caption.GetFont().SetStyle([fsBold]);
+  end;
+
+  currentTop := Self.edit_BreakAfter.GetTop() + Self.edit_BreakAfter.GetHeight() + spacing;
+
+  with Self.edit_BreakFor do
+  begin
+    Create(Tab);
+    SetCaption('Break for (minutes):');
+    SetLeft(col1);
+    SetTop(currentTop);
+    SetWidth(TControl.AdjustToDPI(180));
+    SetHeight(TControl.AdjustToDPI(36));
+    SetText('20');
+    SetFontColor($1A2A31);
+    Caption.GetFont().SetColor(clBlack);
+    Caption.GetFont().SetStyle([fsBold]);
+  end;
+
+  // --- Column 2: Sleep & Shutdown ---
+  currentTop := TControl.AdjustToDPI(30);
+
+  with Self.cb_TakeSleeps do
+  begin
+    Create(Tab);
+    SetCaption('Take sleeps');
+    SetLeft(col2);
+    SetTop(currentTop);
+    SetWidth(TControl.AdjustToDPI(200));
+    SetChecked(False);
+    SetFontColor($1A2A31);
+    Caption.GetFont().SetColor(clBlack);
+    Caption.GetFont().SetStyle([fsBold]);
+  end;
+
+  currentTop := Self.cb_TakeSleeps.GetTop() + Self.cb_TakeSleeps.GetHeight() + spacing;
+
+  with Self.edit_SleepAtTime do
+  begin
+    Create(Tab);
+    SetCaption('Sleep at (HH:MM:SS):');
+    SetLeft(col2);
+    SetTop(currentTop);
+    SetWidth(TControl.AdjustToDPI(180));
+    SetHeight(TControl.AdjustToDPI(36));
+    SetText('23:00:00');
+    SetHint('Time to start sleeping in 24-hour format');
+    SetFontColor($1A2A31);
+    Caption.GetFont().SetColor(clBlack);
+    Caption.GetFont().SetStyle([fsBold]);
+  end;
+
+  currentTop := Self.edit_SleepAtTime.GetTop() + Self.edit_SleepAtTime.GetHeight() + spacing;
+
+  with Self.edit_SleepForHours do
+  begin
+    Create(Tab);
+    SetCaption('Sleep for (hours):');
+    SetLeft(col2);
+    SetTop(currentTop);
+    SetWidth(TControl.AdjustToDPI(180));
+    SetHeight(TControl.AdjustToDPI(36));
+    SetText('8');
+    SetFontColor($1A2A31);
+    Caption.GetFont().SetColor(clBlack);
+    Caption.GetFont().SetStyle([fsBold]);
+  end;
+
+  currentTop := Self.edit_SleepForHours.GetTop() + Self.edit_SleepForHours.GetHeight() + spacing;
+
+  with Self.edit_ShutdownAfter do
+  begin
+    Create(Tab);
+    SetCaption('Shutdown after (minutes):');
+    SetLeft(col2);
+    SetTop(currentTop);
+    SetWidth(TControl.AdjustToDPI(180));
+    SetHeight(TControl.AdjustToDPI(36));
+    SetText('600');
+    SetHint('0 = disabled. Script will run until manually stopped.');
+    SetFontColor($1A2A31);
+    Caption.GetFont().SetColor(clBlack);
+    Caption.GetFont().SetStyle([fsBold]);
+  end;
+
+  currentTop := Self.edit_ShutdownAfter.GetTop() + Self.edit_ShutdownAfter.GetHeight() + spacing + TControl.AdjustToDPI(10);
+
+  with Self.cb_RecordCrashes do
+  begin
+    Create(Tab);
+    SetCaption('Record crashes');
+    SetLeft(col2);
+    SetTop(currentTop);
+    SetWidth(TControl.AdjustToDPI(300));
+    SetChecked(WLSettings.GetObject('video').getBoolean('enabled'));
+    SetHint('Record script crashes with Simba. Videos are saved in Data/WaspLib/videos/. This is resource intensive - use only for debugging.');
+    SetFontColor($1A2A31);
+    Caption.GetFont().SetColor(clBlack);
+    Caption.GetFont().SetStyle([fsBold]);
+    CheckBox.setOnChange(@Self.OnRecordCrashesChange);
+  end;
+
+  currentTop := Self.cb_RecordCrashes.GetTop() + Self.cb_RecordCrashes.GetHeight() + spacing;
+
+  with Self.edit_VideoTime do
+  begin
+    Create(Tab);
+    SetCaption('Video time (seconds):');
+    SetLeft(col2);
+    SetTop(currentTop);
+    SetWidth(TControl.AdjustToDPI(180));
+    SetHeight(TControl.AdjustToDPI(36));
+    SetMaxLength(2);
+    SetEnabled(WLSettings.GetObject('video').getBoolean('enabled'));
+    SetText(ToStr(WLSettings.GetObject('video').getInt('time')));
+    SetFontColor($1A2A31);
+    Caption.GetFont().SetColor(clBlack);
+    Caption.GetFont().SetStyle([fsBold]);
+    Edit.setOnKeyPress(@Edit.NumberField);
+    Edit.SetOnChange(@Self.OnVideoTimeChange);
+  end;
+
+  // =========================================================================
+  // Tab 3: Account Manager
+  // =========================================================================
+  Self.AddTab('Account Manager');
+  AccountTab := Self.Tabs[High(Self.Tabs)];
+  AccountPanel := Self.CreateAccountManager(AccountTab);
+
+  // Apply bold styling to Account Manager labels (including nested children)
+  SetChildsBoldFont(AccountPanel);
+
+  // Move entire Account Manager panel down 10px
+  AccountPanel.SetTop(TControl.AdjustToDPI(10));
+
+  // Adjust Account Manager field positions and sizes - move to right side over sky
+  amSelectorPanel := Self.Form.GetChild('am_selector_panel');
+  if amSelectorPanel <> nil then
+  begin
+    amSelectorPanel.SetLeft(TControl.AdjustToDPI(370));
+    amSelectorPanel.SetWidth(TControl.AdjustToDPI(200));
+  end;
+
+  amUserPanel := Self.Form.GetChild('am_user_panel');
+  if amUserPanel <> nil then
+  begin
+    amUserPanel.SetLeft(TControl.AdjustToDPI(370));
+    amUserPanel.SetWidth(TControl.AdjustToDPI(200));
+    amUserPanel.SetHeight(TControl.AdjustToDPI(36));
+  end;
+
+  amPassPanel := Self.Form.GetChild('am_pass_panel');
+  if amPassPanel <> nil then
+  begin
+    amPassPanel.SetLeft(TControl.AdjustToDPI(370));
+    amPassPanel.SetWidth(TControl.AdjustToDPI(120));
+    amPassPanel.SetHeight(TControl.AdjustToDPI(36));
+  end;
+
+  amPinPanel := Self.Form.GetChild('am_pin_panel');
+  if amPinPanel <> nil then
+  begin
+    amPinPanel.SetLeft(TControl.AdjustToDPI(500));
+    amPinPanel.SetWidth(TControl.AdjustToDPI(70));
+    amPinPanel.SetHeight(TControl.AdjustToDPI(36));
+  end;
+
+  amWorldsPanel := Self.Form.GetChild('am_worlds_panel');
+  if amWorldsPanel <> nil then
+  begin
+    amWorldsPanel.SetLeft(TControl.AdjustToDPI(590));
+    amWorldsPanel.SetWidth(TControl.AdjustToDPI(260));
+    amWorldsPanel.SetHeight(TControl.AdjustToDPI(120));
+  end;
+
+  // Reposition the buttons below password/bank pin row
+  amAddBtn := Self.Form.GetChild('am_add_button');
+  if amAddBtn <> nil then
+  begin
+    amAddBtn.SetLeft(TControl.AdjustToDPI(370));
+    amAddBtn.SetTop(TControl.AdjustToDPI(135));
+    amAddBtn.SetWidth(TControl.AdjustToDPI(100));
+  end;
+
+  amSaveBtn := Self.Form.GetChild('am_save_button');
+  if amSaveBtn <> nil then
+  begin
+    amSaveBtn.SetLeft(TControl.AdjustToDPI(480));
+    amSaveBtn.SetTop(TControl.AdjustToDPI(135));
+    amSaveBtn.SetWidth(TControl.AdjustToDPI(115));
+  end;
+
+  amDeleteBtn := Self.Form.GetChild('am_delete_button');
+  if amDeleteBtn <> nil then
+  begin
+    amDeleteBtn.SetLeft(TControl.AdjustToDPI(605));
+    amDeleteBtn.SetTop(TControl.AdjustToDPI(135));
+    amDeleteBtn.SetWidth(TControl.AdjustToDPI(105));
+  end;
+
+  // =========================================================================
+  // Tab 4: Birdhouse Settings
+  // =========================================================================
+  // Load birdhouse config before creating the tab (sets BHIncludeGUI* variables)
+  if not Config.IsSetup then
+    Config.Setup('orka-ammonite-crabs');
+
+  if Config.Has('bh_useBestLog') then
+    BHIncludeGUIUseBestLog := Config.GetBoolean('bh_useBestLog')
+  else
+    BHIncludeGUIUseBestLog := True;  // Default: enabled
+
+  if Config.Has('bh_craftWhileNav') then
+    BHIncludeGUICraftWhileNav := Config.GetBoolean('bh_craftWhileNav')
+  else
+    BHIncludeGUICraftWhileNav := True;  // Default: enabled
+
+  if Config.Has('bh_logType') then
+    BHIncludeGUILogType := ERSLogType(Config.GetInt('bh_logType'));
+
+  if Config.Has('bh_seed') then
+    BHIncludeGUISeed := Config.GetString('bh_seed');
+
+  Self.AddTab('Birdhouse Settings');
+  Tab := Self.Tabs[High(Self.Tabs)];
+
+  col1 := TControl.AdjustToDPI(375);
+  col2 := TControl.AdjustToDPI(610);
+
+  // --- Column 1: Run Timing ---
+  currentTop := TControl.AdjustToDPI(30);
+
+  with Self.BHIntervalLabel do
+  begin
+    Create(Tab);
+    SetCaption('When should the next run start?');
+    SetLeft(col1);
+    SetTop(currentTop);
+    SetFontColor(clBlack);
+    GetFont.SetStyle([fsBold]);
+  end;
+
+  currentTop := Self.BHIntervalLabel.GetTop() + Self.BHIntervalLabel.GetHeight() + TControl.AdjustToDPI(4);
+
+  with Self.BHNowRadio do
+  begin
+    Create(Tab);
+    SetName('bh_nowradio');
+    SetLeft(col1 + TControl.AdjustToDPI(18));
+    SetTop(currentTop);
+    SetWidth(TControl.AdjustToDPI(18));
+    SetCaption('');
+    SetOnClick(@Self._BHRadioChanged);
+    SetHint('Start a birdhouse run as soon as the script begins.');
+  end;
+
+  with Self.BHNowLabel do
+  begin
+    Create(Tab);
+    SetCaption('Do a run now');
+    SetLeft(Self.BHNowRadio.GetLeft() + Self.BHNowRadio.GetWidth());
+    SetTop(currentTop);
+    SetFontColor(clBlack);
+    GetFont.SetStyle([fsBold]);
+  end;
+
+  currentTop := Self.BHNowRadio.GetTop() + Self.BHNowRadio.GetHeight() + TControl.AdjustToDPI(4);
+
+  with Self.BHLaterRadio do
+  begin
+    Create(Tab);
+    SetName('bh_laterradio');
+    SetLeft(col1 + TControl.AdjustToDPI(18));
+    SetTop(currentTop);
+    SetWidth(TControl.AdjustToDPI(18));
+    SetCaption('');
+    SetOnClick(@Self._BHRadioChanged);
+    SetHint('Wait 50-60 minutes before the first birdhouse run.');
+  end;
+
+  with Self.BHLaterLabel do
+  begin
+    Create(Tab);
+    SetCaption('Do a run later (50-60 min)');
+    SetLeft(Self.BHLaterRadio.GetLeft() + Self.BHLaterRadio.GetWidth());
+    SetTop(currentTop);
+    SetFontColor(clBlack);
+    GetFont.SetStyle([fsBold]);
+  end;
+
+  // --- Column 2: Log, Seed, and Options ---
+  currentTop := TControl.AdjustToDPI(29);
+
+  with Self.BHLogLabel do
+  begin
+    Create(Tab);
+    SetCaption('Log type to use:');
+    SetLeft(col2);
+    SetTop(currentTop);
+    SetFontColor(clBlack);
+    GetFont.SetStyle([fsBold]);
+  end;
+
+  with Self.BHLogSelector do
+  begin
+    Create(Tab);
+    SetLeft(col2);
+    SetTop(Self.BHLogLabel.GetTop() + Self.BHLogLabel.GetHeight() + TControl.AdjustToDPI(4));
+    SetWidth(TControl.AdjustToDPI(200));
+    SetStyle(csDropDownList);
+    AddItem('Regular', nil);
+    AddItem('Oak', nil);
+    AddItem('Willow', nil);
+    AddItem('Teak', nil);
+    AddItem('Maple', nil);
+    AddItem('Mahogany', nil);
+    AddItem('Yew', nil);
+    AddItem('Magic tree', nil);
+    AddItem('Redwood', nil);
+    BirdHouseRunner.LogType := BHIncludeGUILogType;
+    SetItemIndex(Ord(BirdHouseRunner.LogType));
+    SetOnChange(@Self._BHLogTypeChanged);
+    SetHint('Higher tier logs give better birdhouses and more Hunter XP.');
+  end;
+
+  currentTop := Self.BHLogSelector.GetTop() + Self.BHLogSelector.GetHeight() + spacing;
+
+  with Self.BHSeedLabel do
+  begin
+    Create(Tab);
+    SetCaption('Seed (e.g. potato):');
+    SetLeft(col2);
+    SetTop(currentTop);
+    SetFontColor(clBlack);
+    GetFont.SetStyle([fsBold]);
+  end;
+
+  with Self.BHSeedEdit do
+  begin
+    Create(Tab);
+    SetLeft(col2);
+    SetTop(Self.BHSeedLabel.GetTop() + Self.BHSeedLabel.GetHeight() + TControl.AdjustToDPI(4));
+    SetWidth(TControl.AdjustToDPI(200));
+    SetName('bh_seed');
+    BirdHouseRunner.Seed := ToStr(BHIncludeGUISeed).Replace('Barely', 'Barley', [rfIgnoreCase]).Before(' ');
+    SetText(ToStr(BirdHouseRunner.Seed));
+    SetOnChange(@Self._BHSeedChanged);
+    GetFont.SetColor(clBlack);
+    SetHint('The seed to bait birdhouses with. Use cheap seeds like Potato or Barley.');
+  end;
+
+  currentTop := Self.BHSeedEdit.GetTop() + Self.BHSeedEdit.GetHeight() + spacing;
+
+  with Self.BHBestLogCheckbox do
+  begin
+    Create(Tab);
+    SetLeft(col2);
+    SetTop(currentTop);
+    SetName('bh_bestlogcb');
+    SetCaption('Always use best log');
+    SetWidth(TControl.AdjustToDPI(300));
+    SetFontColor(clBlack);
+    Caption.GetFont().SetStyle([fsBold]);
+    BirdHouseRunner.AlwaysUseBestLog := BHIncludeGUIUseBestLog;
+    SetChecked(BirdHouseRunner.AlwaysUseBestLog);
+    CheckBox.setOnChange(@Self._BHCheckBoxChanged);
+    SetHint('Automatically upgrade to the best log for your Hunter level each run.');
+  end;
+
+  currentTop := Self.BHBestLogCheckbox.GetTop() + Self.BHBestLogCheckbox.GetHeight() + spacing;
+
+  with Self.BHCraftCheckbox do
+  begin
+    Create(Tab);
+    SetLeft(col2);
+    SetTop(currentTop);
+    SetName('bh_extraclockworkcb');
+    SetCaption('Craft birdhouses while navigating');
+    SetWidth(TControl.AdjustToDPI(300));
+    SetFontColor(clBlack);
+    Caption.GetFont().SetStyle([fsBold]);
+    BirdHouseRunner.NeedClockworks := BHIncludeGUICraftWhileNav;
+    SetChecked(BirdHouseRunner.NeedClockworks);
+    CheckBox.setOnChange(@Self._BHCheckBoxChanged);
+    SetHint('Craft birdhouses while walking between spots. Requires a clockwork in bank.');
+  end;
+
+  with Self.BHCraftDescLabel do
+  begin
+    Create(Tab);
+    SetLeft(col2 + TControl.AdjustToDPI(18));
+    SetTop(Self.BHCraftCheckbox.GetTop() + Self.BHCraftCheckbox.GetHeight() + 1);
+    SetCaption('(Requires a clockwork in bank)');
+    GetFont().SetColor(clGray);
+    GetFont().SetSize(8);
+  end;
+
+  BirdHouseRunner.TaskInterval := BHIncludeGUIRunIntervalMinutes;
+
+  if BHIncludeGUIRunIntervalMinutes > 0 then
+  begin
+    Self.BHLaterRadio.setState(TCheckBoxState.cbChecked);
+    Self.BHNowRadio.setState(TCheckBoxState.cbUnchecked);
+    BirdHouseRunner.TaskInterval := 50 * ONE_MINUTE;
+  end
+  else
+  begin
+    Self.BHLaterRadio.setState(TCheckBoxState.cbUnchecked);
+    Self.BHNowRadio.setState(TCheckBoxState.cbChecked);
+    BirdHouseRunner.TaskInterval := 0;
+  end;
+
+  // Load saved config
+  LoadConfig();
+
+  Self.OnBankLocationChange(nil);
+
+  // Set font color for all children (applies to tabs created by library methods)
+  Self.PageControl.SetChildsFontColor($1A2A31);
+
+  inherited;
+end;
+{$ENDIF}
+
+// =============================================================================
+// Initialization
+// =============================================================================
+
+(**
+ * Init
+ *
+ * Initializes the script by displaying branding, logging in, validating the
+ * player is on Fossil Island, setting up XP tracking, zoom, auto-retaliate,
+ * antiban, birdhouse runner, and all timers. Walks to the combat tile.
+ *)
+procedure Init();
+var
+  pos: TPoint;
+begin
+  WriteDebug('Initializing script...');
+
+  // ===== ASCII art logo =====
+  Writeln('');
+  Writeln(' _____                                           _____ ');
+  Writeln('( ___ )                                         ( ___ )');
+  Writeln(' |   |~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~|   | ');
+  Writeln(' |   |    _______  ______    ___   _  _______    |   | ');
+  Writeln(' |   |   |       ||    _ |  |   | | ||   _   |   |   | ');
+  Writeln(' |   |   |   _   ||   | ||  |   |_| ||  |_|  |   |   | ');
+  Writeln(' |   |   |  | |  ||   |_||_ |      _||       |   |   | ');
+  Writeln(' |   |   |  |_|  ||    __  ||     |_ |       |   |   | ');
+  Writeln(' |   |   |       ||   |  | ||    _  ||   _   |   |   | ');
+  Writeln(' |   |   |_______||___|  |_||___| |_||__| |__|   |   | ');
+  Writeln(' |   |                                           |   | ');
+  Writeln(' |___|~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~|___| ');
+  Writeln('(_____)                                         (_____)');
+
+  // ===== Credits block =====
+  Writeln('');
+  Writeln('  ___                                             ___  ');
+  Writeln(' |   |****************  CREDITS  ****************|   | ');
+  Writeln(' |   |                                           |   | ');
+  Writeln(' |   |    3Garrett3  |  Torwent  |  Student      |   | ');
+  Writeln(' |   |    BigAussie  |  Kriptic  |  Fik          |   | ');
+  Writeln(' |   |    unit       |  Caping   |  Sebastiaan   |   | ');
+  Writeln(' |   |    skunkworks |  XJ       |               |   | ');
+  Writeln(' |   |                                           |   | ');
+  Writeln(' |___|~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~|___| ');
+  Writeln('');
+
+  // ===== Script configuration block =====
+  Writeln('  ___                                             ___  ');
+  Writeln(' |   |**********  Orka Ammonite Crabs  ***********|   | ');
+  Writeln(' |   |                                           |   | ');
+  if BankLocation = EBankLocation.BANK_CRAFTING_GUILD then
+    Writeln(' |   |    ' + PadR('Bank: Crafting Guild (Crafting Cape)', 39) + '|   | ')
+  else
+    Writeln(' |   |    ' + PadR('Bank: Fossil Island', 39) + '|   | ');
+  if UseFood then
+    Writeln(' |   |    ' + PadR('Food: ' + String(Food) + ' x' + ToStr(FoodAmount), 39) + '|   | ')
+  else
+    Writeln(' |   |    ' + PadR('Food: Disabled', 39) + '|   | ');
+  if UsePotions then
+    Writeln(' |   |    ' + PadR('Potion: ' + String(Potion) + ' x' + ToStr(PotionAmount), 39) + '|   | ')
+  else
+    Writeln(' |   |    ' + PadR('Potion: Disabled', 39) + '|   | ');
+  Writeln(' |   |    ' + PadR('Pickup Fossils: ' + ToStr(PickupFossils), 39) + '|   | ');
+  Writeln(' |   |    ' + PadR('Pickup Clues: ' + ToStr(PickupClues), 39) + '|   | ');
+  Writeln(' |   |    ' + PadR('Birdhouse Runs: ' + ToStr(DoBHRuns), 39) + '|   | ');
+  Writeln(' |   |    ' + PadR('Use Specs: ' + ToStr(UseSpecs), 39) + '|   | ');
+  Writeln(' |   |                                           |   | ');
+  Writeln(' |___|~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~|___| ');
+  Writeln('');
+
+  // Login if not logged in
+  if not RSClient.IsLoggedIn() then
+  begin
+    WriteDebug('Init | Logging in...');
+    Login.LoginPlayer();
+  end;
+
+  if not WaitUntil(RSClient.IsLoggedIn(), 250, 12000) then
+    TerminateScript('Failed to log in');
+
+  // Get current position
+  pos := Map.Position();
+  WriteDebug('Init | Current position: ' + ToStr(pos));
+
+  // Handle startup location based on bank configuration
+  if BankLocation = EBankLocation.BANK_CRAFTING_GUILD then
+  begin
+    // FIRST: Validate Crafting Cape exists (required for this bank option)
+    if not (Inventory.ContainsAny(['Crafting cape', 'Crafting cape(t)']) or
+            Equipment.ContainsAny(['Crafting cape', 'Crafting cape(t)'])) then
+      TerminateScript('ERROR: Crafting Guild bank selected but no Crafting cape found in inventory or equipment.');
+
+    // Check current location
+    if FOSSIL_ISLAND_BOUNDS.Contains(pos) then
+      WriteDebug('Init | Starting from Fossil Island')
+    else if CRAFTING_GUILD_BOX.Contains(pos) then
+      WriteDebug('Init | Starting from Crafting Guild')
+    else
+    begin
+      // Not on Fossil Island or Crafting Guild - teleport to Crafting Guild
+      WriteDebug('Init | Not on Fossil Island or Crafting Guild, teleporting to Crafting Guild...');
+      if not TeleportToCraftingGuild() then
+        TerminateScript('ERROR: Failed to teleport to Crafting Guild. Please start the script on Fossil Island or Crafting Guild.');
+      WriteDebug('Init | Successfully teleported to Crafting Guild');
+    end;
+  end
+  else
+  begin
+    // Fossil Island bank - must start on Fossil Island
+    if not FOSSIL_ISLAND_BOUNDS.Contains(pos) then
+      TerminateScript('ERROR: Player is not on Fossil Island. Please start the script on Fossil Island. Current position: ' + ToStr(pos));
+  end;
+
+  // Read starting XP
+  StartXP := XPBar.Read();
+  if StartXP < 1024 then
+    TerminateScript('Failed to read XP bar. Make sure XP tracking is enabled.');
+
+  WriteDebug('Init | Starting XP: ' + ToStr(StartXP));
+
+  // Set zoom level
+  if not InRange(Options.GetZoomLevel(), 8, 14) then
+  begin
+    WriteDebug('Init | Setting zoom level...');
+    Options.SetZoomLevel(Random(8, 14));
+  end;
+
+  // Check and enable auto-retaliate
+  WriteDebug('Init | Checking auto-retaliate...');
+  if not Combat.GetAutoRetaliate() then
+  begin
+    WriteDebug('Init | Enabling auto-retaliate');
+    Combat.SetAutoRetaliate(True);
+  end;
+
+  // Set mouse speed
+  Mouse.Speed := SRL.NormalRange(MOUSE_SPEED_MIN, MOUSE_SPEED_MAX);
+
+  // Initialize state tracking
+  CanReceiveClues := True;
+  CheckDropsEnabled := PickupFossils or PickupClues;
+  WeaponSpecCost := 0;
+  SmallFossilsCollected := 0;
+  MediumFossilsCollected := 0;
+  LargeFossilsCollected := 0;
+  RareFossilsCollected := 0;
+  CluesCollected := 0;
+  FoodDepleted := False;
+  PotionDepleted := False;
+
+  // Initialize break tracking
+  TotalBreakTime := 0;
+  LastBreakStartTime := 0;
+  LastBreakEndTime := 0;
+
+  // Initialize BH run tracking
+  LastBHRunEndTime := 0;
+
+  // Initialize combat XP type (also sets CombatXPType global)
+  CombatXPType := ECombatXPType.XP_UNKNOWN;
+
+  // Setup antiban (this will call GetTrainedSkills which sets CombatXPType)
+  SetupAntiban();
+
+  // Cache hunter level for birdhouse log selection (avoids bank close/reopen)
+  CachedHunterLevel := Stats.GetLevel(ERSSkill.HUNTER);
+  WriteDebug('Init | Cached hunter level: ' + ToStr(CachedHunterLevel));
+
+  // Always initialize BirdHouseRunner (needed for TeleportToFossilIsland even if BH runs disabled)
+  WriteDebug('Init | Initializing BirdHouseRunner...');
+  BirdHouseRunner.Init();
+
+  // Check if best log differs from saved config and update if needed
+  if DoBHRuns and BirdHouseRunner.AlwaysUseBestLog then
+  begin
+    BirdHouseRunner.SuggestedLogType := BirdHouseRunner.GetLogForHunterLevel(CachedHunterLevel);
+    if BirdHouseRunner.LogType <> BirdHouseRunner.SuggestedLogType then
+    begin
+      WriteDebug('Init | Log type updated from ' + ToStr(BirdHouseRunner.LogType) + ' to ' + ToStr(BirdHouseRunner.SuggestedLogType));
+      BirdHouseRunner.LogType := BirdHouseRunner.SuggestedLogType;
+      Config.Put('bh_logType', Ord(BirdHouseRunner.LogType));
+    end;
+  end;
+
+  // Initialize activity timer (not using TBaseScript, so must init manually)
+  WL.Activity.Init(5 * ONE_MINUTE);
+
+  // Start all timers
+  DropCheckTimer.Start();
+  NextDropCheckInterval := SRL.SkewedRand(DROP_CHECK_MODE, DROP_CHECK_MIN, DROP_CHECK_MAX);
+  AggroTimer.Start();
+  ReportTimer.Start();
+  SpecTimer.Start();
+
+  WriteDebug('Init | Initialization complete');
+  if UseFood then WriteDebug('Init | Food: ' + Food);
+  if UsePotions then WriteDebug('Init | Potion: ' + Potion);
+
+  // Check if "Do a run now" was selected for birdhouse
+  if DoBHRuns and (BirdHouseRunner.TaskInterval = 0) then
+  begin
+    WriteDebug('Init | "Do a run now" selected - executing immediate birdhouse run');
+    if BankLocation = EBankLocation.BANK_CRAFTING_GUILD then
+      BirdHouseRunner.DoBirdHouseRun()
+    else
+      DoManualBirdHouseRun();
+    AggroTimer.Reset();
+  end;
+
+  // Smart startup: decide whether to bank or walk directly to combat
+  if IsInCombatArea() then
+  begin
+    // Near combat area: walk to tile if we have any supplies left
+    if (not UseFood or Inventory.ContainsItem(Food)) and
+       (not UsePotions or HasPotions()) then
+    begin
+      WriteDebug('Init | Near combat area with supplies - walking to combat tile');
+      WalkToCombatTile();
+    end
+    else
+      WriteDebug('Init | Near combat area but need supplies - deferring to main loop for banking');
+  end
+  else
+  begin
+    // Far from combat area: only walk if inventory already matches desired loadout
+    if HasDesiredLoadout() then
+    begin
+      WriteDebug('Init | Far from combat area but have full loadout - walking to combat tile');
+      WalkToCombatTile();
+    end
+    else
+      WriteDebug('Init | Far from combat area with incomplete loadout - deferring to main loop for banking');
+  end;
+
+  // Restart activity timer so the full 260s countdown starts fresh after init
+  WL.Activity.Restart();
+end;
+
+// =============================================================================
+// Entry Point
+// =============================================================================
+begin
+  {$IFDEF SCRIPT_GUI}
+  GUI.Run();
+  {$ENDIF}
+
+  // Setup map and objects (dynamic based on bank location)
+  SetupMapAndWalker();
+  SetupObjects();
+
+  // Initialize script
+  Init();
+
+  // Main loop
+  repeat
+    Loop();
+  until False;
+end.
+
