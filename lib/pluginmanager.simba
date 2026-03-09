@@ -1,0 +1,487 @@
+{$DEFINE RUNELITE_PLUGIN_MANAGER_INCLUDED}
+
+{$IFNDEF SRL_UTILS}
+  {$I SRL-T/utils.simba}
+{$ENDIF}
+
+const
+  RUNELITE_LOG_PREFIX = '[RuneLite Plugin] ';
+
+  GPU = 'gpuplugin';
+
+type
+  ERuneLitePluginState = (
+    ENABLED,
+    DISABLED,
+    NOT_FOUND
+  );
+
+type
+  TRuneLitePlugin = record
+    CachedPropertiesPath: String;
+    PathResolved: Boolean;
+  end;
+
+// =============================================================================
+// Internal helpers
+// =============================================================================
+
+(**
+  Strips UTF-8 BOM bytes from the beginning of a string if present.
+  @param content - The string to clean
+  @return The string without BOM prefix
+*)
+function RuneLiteCleanBOM(content: String): String;
+begin
+  Result := content;
+  if (Length(Result) >= 3) and (Result[1] = #$EF) and (Result[2] = #$BB) and (Result[3] = #$BF) then
+    Result := Copy(Result, 4, Length(Result) - 3);
+end;
+
+(**
+  Builds the properties key prefix for a plugin.
+  @param plugin - The plugin identifier (e.g., 'gpuplugin')
+  @return The key prefix (e.g., 'runelite.gpuplugin=')
+*)
+function RuneLiteBuildPluginKey(plugin: String): String;
+begin
+  Result := 'runelite.' + plugin + '=';
+end;
+
+(**
+  Modifies a properties file content string to set a plugin's enabled state.
+  Handles both replacing an existing line and appending a new one.
+  @param content - The file content (modified in-place)
+  @param plugin - The plugin identifier
+  @param enabled - True to enable, False to disable
+  @return True if content was changed
+*)
+function RuneLiteSetPluginStateInContent(var content: String; plugin: String; enabled: Boolean): Boolean;
+var
+  key, value, newLine: String;
+  lines: TStringArray;
+  i: Int32;
+begin
+  if enabled then value := 'true' else value := 'false';
+
+  key := RuneLiteBuildPluginKey(plugin);
+  newLine := 'runelite.' + plugin + '=' + value;
+  lines := content.Split(LineEnding);
+
+  for i := 0 to High(lines) do
+  begin
+    if lines[i].Trim().StartsWith(key) then
+    begin
+      if lines[i].Trim() = newLine then
+      begin
+        WriteLn(RUNELITE_LOG_PREFIX + 'Already set: ' + newLine);
+        Exit;
+      end;
+
+      WriteLn(RUNELITE_LOG_PREFIX + 'Changing: ' + lines[i].Trim() + ' -> ' + newLine);
+      content := content.Replace(lines[i], newLine);
+      Result := True;
+      Exit;
+    end;
+  end;
+
+  // Key not found — append new line
+  WriteLn(RUNELITE_LOG_PREFIX + 'Appending: ' + newLine);
+  if not content.EndsWith(LineEnding) then
+    content := content + LineEnding;
+  content := content + newLine + LineEnding;
+  Result := True;
+end;
+
+// =============================================================================
+// TRuneLitePlugin methods
+// =============================================================================
+
+(**
+  Resets the cached properties path, forcing re-resolution on next access.
+*)
+procedure TRuneLitePlugin.InvalidateCache();
+begin
+  Self.CachedPropertiesPath := '';
+  Self.PathResolved := False;
+end;
+
+(**
+  Resolves and caches the active RuneLite profile's .properties file path.
+  Parses profiles.json to find the active profile, then locates the matching
+  .properties file in the profiles2 directory.
+  @return Full path to the .properties file, or empty string if not found
+*)
+function TRuneLitePlugin.GetPropertiesPath(): String;
+var
+  profilesDir, jsonPath, content: String;
+  json, profile: TJSONObject;
+  profiles: TJSONArray;
+  profileName, profileId: String;
+  foundFiles: TStringArray;
+  fileName: String;
+  i: Int32;
+begin
+  if Self.PathResolved then
+  begin
+    Result := Self.CachedPropertiesPath;
+    Exit;
+  end;
+
+  profilesDir := GetEnvironmentVariable('USERPROFILE') + '\.runelite\profiles2';
+
+  if not DirectoryExists(profilesDir) then
+  begin
+    WriteLn(RUNELITE_LOG_PREFIX + 'Profiles directory not found: ' + profilesDir);
+    Self.PathResolved := True;
+    Exit;
+  end;
+
+  jsonPath := profilesDir + '\profiles.json';
+
+  if not FileExists(jsonPath) then
+  begin
+    WriteLn(RUNELITE_LOG_PREFIX + 'profiles.json not found at: ' + jsonPath);
+    Self.PathResolved := True;
+    Exit;
+  end;
+
+  content := ReadFileContents(jsonPath);
+  if content = '' then
+  begin
+    WriteLn(RUNELITE_LOG_PREFIX + 'profiles.json is empty');
+    Self.PathResolved := True;
+    Exit;
+  end;
+
+  content := RuneLiteCleanBOM(content).Trim();
+
+  json.Init(content);
+  try
+    if not json.has('profiles') then
+    begin
+      WriteLn(RUNELITE_LOG_PREFIX + 'No "profiles" key in profiles.json');
+      Self.PathResolved := True;
+      Exit;
+    end;
+
+    profiles := json.getJSONArray('profiles');
+    WriteLn(RUNELITE_LOG_PREFIX + 'Found ' + ToString(profiles.length()) + ' profile(s)');
+
+    for i := 0 to profiles.High() do
+    begin
+      profile := profiles.getJSONObject(i);
+
+      if profile.has('active') and profile.getBoolean('active') then
+      begin
+        if profile.has('name') then
+          profileName := profile.getString('name');
+
+        if profile.has('id') then
+          profileId := ToString(Trunc(profile.getDouble('id')));
+
+        WriteLn(RUNELITE_LOG_PREFIX + 'Active profile: "' + profileName + '" (ID: ' + profileId + ')');
+        Break;
+      end;
+    end;
+  finally
+    json.Free();
+  end;
+
+  if (profileName = '') or (profileId = '') then
+  begin
+    WriteLn(RUNELITE_LOG_PREFIX + 'No active profile found');
+    Self.PathResolved := True;
+    Exit;
+  end;
+
+  // Find the .properties file
+  foundFiles := FindFiles(profilesDir, False);
+
+  // Try exact match first: name-id.properties
+  for fileName in foundFiles do
+  begin
+    if ExtractFileName(fileName) = (profileName + '-' + profileId + '.properties') then
+    begin
+      Result := profilesDir + '\' + ExtractFileName(fileName);
+      WriteLn(RUNELITE_LOG_PREFIX + 'Properties file (exact): ' + Result);
+      Self.CachedPropertiesPath := Result;
+      Self.PathResolved := True;
+      Exit;
+    end;
+  end;
+
+  // Fallback: match by profile name prefix
+  for fileName in foundFiles do
+  begin
+    if ExtractFileName(fileName).StartsWith(profileName) and ExtractFileName(fileName).EndsWith('.properties') then
+    begin
+      Result := profilesDir + '\' + ExtractFileName(fileName);
+      WriteLn(RUNELITE_LOG_PREFIX + 'Properties file (fallback): ' + Result);
+      Self.CachedPropertiesPath := Result;
+      Self.PathResolved := True;
+      Exit;
+    end;
+  end;
+
+  WriteLn(RUNELITE_LOG_PREFIX + 'No properties file found for profile "' + profileName + '"');
+  Self.PathResolved := True;
+end;
+
+(**
+  Returns the three-state status of a plugin in the properties file.
+  @param plugin - The plugin identifier (e.g., GPU)
+  @return ERuneLitePluginState.ENABLED, .DISABLED, or .NOT_FOUND
+*)
+function TRuneLitePlugin.GetState(plugin: String): ERuneLitePluginState;
+var
+  path, content, key: String;
+  lines: TStringArray;
+  line: String;
+begin
+  Result := ERuneLitePluginState.NOT_FOUND;
+
+  path := Self.GetPropertiesPath();
+  if path = '' then Exit;
+
+  content := ReadFileContents(path);
+  if content = '' then Exit;
+
+  key := RuneLiteBuildPluginKey(plugin);
+  lines := content.Split(LineEnding);
+
+  for line in lines do
+  begin
+    if line.Trim().StartsWith(key) then
+    begin
+      if line.Trim().After('=').Trim().ToLower() = 'true' then
+        Result := ERuneLitePluginState.ENABLED
+      else
+        Result := ERuneLitePluginState.DISABLED;
+      Exit;
+    end;
+  end;
+end;
+
+(**
+  Checks whether all specified plugins are disabled (or not present).
+  Reads the file once and scans all plugins in a single pass.
+  @param plugins - Array of plugin identifiers to check
+  @return True if every plugin is either disabled or not found
+*)
+function TRuneLitePlugin.IsDisabled(plugins: TStringArray): Boolean;
+var
+  path, content, key: String;
+  lines: TStringArray;
+  line, plugin: String;
+begin
+  Result := True;
+
+  path := Self.GetPropertiesPath();
+  if path = '' then Exit;
+
+  content := ReadFileContents(path);
+  if content = '' then Exit;
+
+  lines := content.Split(LineEnding);
+
+  for plugin in plugins do
+  begin
+    key := RuneLiteBuildPluginKey(plugin);
+    for line in lines do
+    begin
+      if line.Trim().StartsWith(key) then
+      begin
+        if line.Trim().After('=').Trim().ToLower() = 'true' then
+        begin
+          Result := False;
+          Exit;
+        end;
+        Break;
+      end;
+    end;
+  end;
+end;
+
+(**
+  Checks whether all specified plugins are explicitly enabled.
+  Reads the file once and scans all plugins in a single pass.
+  @param plugins - Array of plugin identifiers to check
+  @return True if every plugin is explicitly set to enabled
+*)
+function TRuneLitePlugin.IsEnabled(plugins: TStringArray): Boolean;
+var
+  path, content, key: String;
+  lines: TStringArray;
+  line, plugin: String;
+  found: Boolean;
+begin
+  Result := True;
+
+  path := Self.GetPropertiesPath();
+  if path = '' then
+  begin
+    Result := False;
+    Exit;
+  end;
+
+  content := ReadFileContents(path);
+  if content = '' then
+  begin
+    Result := False;
+    Exit;
+  end;
+
+  lines := content.Split(LineEnding);
+
+  for plugin in plugins do
+  begin
+    key := RuneLiteBuildPluginKey(plugin);
+    found := False;
+
+    for line in lines do
+    begin
+      if line.Trim().StartsWith(key) then
+      begin
+        found := True;
+        if line.Trim().After('=').Trim().ToLower() <> 'true' then
+        begin
+          Result := False;
+          Exit;
+        end;
+        Break;
+      end;
+    end;
+
+    if not found then
+    begin
+      Result := False;
+      Exit;
+    end;
+  end;
+end;
+
+(**
+  Checks if the RuneLite client is currently running.
+  @return True if RuneLite.exe is found in the process list
+*)
+function TRuneLitePlugin.IsClientRunning(): Boolean;
+var
+  exitCode: Int32;
+  output: String;
+begin
+  exitCode := RunCommand('cmd', ['/c', 'tasklist /fi "imagename eq RuneLite.exe" /nh'], output);
+  Result := (exitCode = 0) and (Pos('RuneLite.exe', output) > 0);
+end;
+
+(**
+  Forcefully kills the RuneLite client process.
+*)
+procedure TRuneLitePlugin.KillClient();
+var
+  exitCode: Int32;
+  output: String;
+begin
+  exitCode := RunCommand('cmd', ['/c', 'taskkill /f /im RuneLite.exe'], output);
+  if exitCode = 0 then
+    WriteLn(RUNELITE_LOG_PREFIX + 'RuneLite process killed.')
+  else
+    WriteLn(RUNELITE_LOG_PREFIX + 'No RuneLite process found running.');
+end;
+
+(**
+  Core write operation: enforces the enabled/disabled state of multiple plugins.
+  Kills the client if changes were made.
+  @param plugins - Array of plugin identifiers to modify
+  @param enabled - True to enable, False to disable
+  @param backup - Whether to back up the file before modifying (default False)
+  @return True if changes were made (and client was killed)
+  @example
+    Plugin.EnforceStates([GPU], False);        // disable GPU plugin
+    Plugin.EnforceStates([GPU], True, True);   // enable with backup
+*)
+function TRuneLitePlugin.EnforceStates(plugins: TStringArray; enabled: Boolean; backup: Boolean = False): Boolean;
+var
+  path, content, plugin: String;
+  changed: Boolean;
+begin
+  path := Self.GetPropertiesPath();
+  if path = '' then
+  begin
+    WriteLn(RUNELITE_LOG_PREFIX + 'Cannot enforce: no properties file found');
+    Exit;
+  end;
+
+  content := ReadFileContents(path);
+  if content = '' then
+  begin
+    WriteLn(RUNELITE_LOG_PREFIX + 'Properties file is empty');
+    Exit;
+  end;
+
+  for plugin in plugins do
+    if RuneLiteSetPluginStateInContent(content, plugin, enabled) then
+      changed := True;
+
+  if not changed then
+  begin
+    WriteLn(RUNELITE_LOG_PREFIX + 'No changes needed.');
+    Exit;
+  end;
+
+  if backup then
+  begin
+    if BackupFile(path) then
+      WriteLn(RUNELITE_LOG_PREFIX + 'Backup created: ' + path + '.bak')
+    else
+      WriteLn(RUNELITE_LOG_PREFIX + 'Warning: backup failed, proceeding anyway');
+  end;
+
+  if WriteFileContents(path, content, False) then
+  begin
+    WriteLn(RUNELITE_LOG_PREFIX + 'Properties file updated.');
+    Self.KillClient();
+    WriteLn(RUNELITE_LOG_PREFIX + 'Relaunch RuneLite to apply changes.');
+    Result := True;
+  end
+  else
+  begin
+    WriteLn(RUNELITE_LOG_PREFIX + 'Failed to write properties file!');
+    if backup then
+    begin
+      if RestoreFile(path) then
+        WriteLn(RUNELITE_LOG_PREFIX + 'Restored from backup.')
+      else
+        WriteLn(RUNELITE_LOG_PREFIX + 'Restore from backup also failed!');
+    end;
+  end;
+end;
+
+(**
+  Enforces all specified plugins to be disabled.
+  @param plugins - Array of plugin identifiers to disable
+  @return True if changes were made
+*)
+function TRuneLitePlugin.Disable(plugins: TStringArray): Boolean;
+begin
+  Result := Self.EnforceStates(plugins, False);
+end;
+
+(**
+  Enforces all specified plugins to be enabled.
+  @param plugins - Array of plugin identifiers to enable
+  @return True if changes were made
+*)
+function TRuneLitePlugin.Enable(plugins: TStringArray): Boolean;
+begin
+  Result := Self.EnforceStates(plugins, True);
+end;
+
+// =============================================================================
+// Global singleton
+// =============================================================================
+
+var
+  Plugin: TRuneLitePlugin;
+
+{$ENDIF}
