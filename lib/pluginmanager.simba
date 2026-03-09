@@ -1,3 +1,4 @@
+{$IFNDEF RUNELITE_PLUGIN_MANAGER_INCLUDED}
 {$DEFINE RUNELITE_PLUGIN_MANAGER_INCLUDED}
 
 {$IFNDEF SRL_UTILS}
@@ -459,21 +460,35 @@ end;
 
 (**
   Enforces all specified plugins to be disabled.
+  Returns True if all plugins are disabled (already were or successfully changed).
   @param plugins - Array of plugin identifiers to disable
-  @return True if changes were made
+  @return True if desired state achieved, False on error
 *)
 function TRuneLitePlugin.Disable(plugins: TStringArray): Boolean;
 begin
+  if Self.IsDisabled(plugins) then
+  begin
+    WriteLn(RUNELITE_LOG_PREFIX + 'All plugins already disabled.');
+    Result := True;
+    Exit;
+  end;
   Result := Self.EnforceStates(plugins, False);
 end;
 
 (**
   Enforces all specified plugins to be enabled.
+  Returns True if all plugins are enabled (already were or successfully changed).
   @param plugins - Array of plugin identifiers to enable
-  @return True if changes were made
+  @return True if desired state achieved, False on error
 *)
 function TRuneLitePlugin.Enable(plugins: TStringArray): Boolean;
 begin
+  if Self.IsEnabled(plugins) then
+  begin
+    WriteLn(RUNELITE_LOG_PREFIX + 'All plugins already enabled.');
+    Result := True;
+    Exit;
+  end;
   Result := Self.EnforceStates(plugins, True);
 end;
 
