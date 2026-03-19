@@ -17,7 +17,7 @@
  *
  * ============================================================================
  *)
-{$DEFINE SCRIPT_REVISION := '6'}
+{$DEFINE SCRIPT_REVISION := '7'}
 {$IFNDEF SCRIPT_CHAIN}
   {$DEFINE SCRIPT_GUI}
   program OrkaReanimation;
@@ -167,9 +167,13 @@ type
     // Potion availability cache
     CombatPotionUnavailable: Boolean;   // True when combat potion withdrawal fails
     AntifirePotionUnavailable: Boolean; // True when both antifire variants fail
+    CachedAntifireName: String;         // Caches which antifire variant was found
 
     // Run verification
     VerifiedSpells: Boolean;
+
+    // Game settings check
+    CheckGameSettings: Boolean;
 
   end;
 
@@ -413,33 +417,36 @@ begin
     end;
   end;
 
-  Minimap.EnableSpec(0); // Handles "already enabled" check internally
-  Wait(200, 300);
+  StartLevel := Minimap.GetSpecLevel();
 
-  // Learning Logic: Deduce spec cost by observing bar drop
-  if (Self.WeaponSpecCost = 0) then
+  if Minimap.EnableSpec(0) then
+  begin
+    Wait(200, 300);
+
+    // Learning Logic: Deduce spec cost by observing bar drop
+    if (Self.WeaponSpecCost = 0) then
     begin
-       // Check immediately
-       EndLevel := Minimap.GetSpecLevel();
+      // Check immediately
+      EndLevel := Minimap.GetSpecLevel();
 
-       if (StartLevel > EndLevel) then
-       begin
-         // Case A: Immediate drop (e.g. Gmaul, or lag handled)
-         Self.WeaponSpecCost := StartLevel - EndLevel;
-       end
-       else
-       begin
-         // Case B: Delayed drop (most weapons like DDS queue the spec).
-         // We wait briefly (up to 1.5s) to catch the drop before regen interferes.
-         if WaitUntil(Minimap.GetSpecLevel() < StartLevel, 100, 10000) then
-         begin
-            EndLevel := Minimap.GetSpecLevel();
-            Self.WeaponSpecCost := StartLevel - EndLevel;
-            WriteDebug('AttemptSpec | Learned Spec Cost: ' + ToStr(Self.WeaponSpecCost) + '%');
-         end
-         else
-            WriteDebug('AttemptSpec | Failed to learn cost (no drop detected)');
-       end;
+      if (StartLevel > EndLevel) then
+      begin
+        // Case A: Immediate drop (e.g. Gmaul, or lag handled)
+        Self.WeaponSpecCost := StartLevel - EndLevel;
+      end
+      else
+      begin
+        // Case B: Delayed drop (most weapons like DDS queue the spec).
+        // We wait briefly (up to 1.5s) to catch the drop before regen interferes.
+        if WaitUntil(Minimap.GetSpecLevel() < StartLevel, 100, 10000) then
+        begin
+          EndLevel := Minimap.GetSpecLevel();
+          Self.WeaponSpecCost := StartLevel - EndLevel;
+          WriteDebug('AttemptSpec | Learned Spec Cost: ' + ToStr(Self.WeaponSpecCost) + '%');
+        end
+        else
+          WriteDebug('AttemptSpec | Failed to learn cost (no drop detected)');
+      end;
     end
     else
     begin
@@ -450,6 +457,7 @@ begin
       else
         WriteDebug('AttemptSpec | Spec Used');
     end;
+  end;
 end;
 
 (**
@@ -1054,6 +1062,9 @@ begin
     Exit(False);
   end;
 
+  if Magic.FiltersIsOpen() then
+    Magic.CloseFilters();
+
   // Set high tolerance for Arceuus spells to avoid false positives with similar icons
   SpellFinder.SimTolerance := 0.96;
 
@@ -1477,6 +1488,80 @@ begin
 end;
 
 (**
+ * WithdrawAntifirePotion
+ *
+ * Searches the bank once for "antifire" and tries to withdraw extended first,
+ * falling back to regular. Caches unavailability so we don't search again.
+ *
+ * @return The name of the withdrawn potion, or empty string if none found
+ *)
+function TReanimationBot.WithdrawAntifirePotion(): String;
+var
+  extItem, regItem: TRSBankItem;
+begin
+  if Self.AntifirePotionUnavailable then Exit('');
+  if not Bank.IsOpen() then Exit('');
+
+  // Fast path: use previously found variant directly (no search needed)
+  if Self.CachedAntifireName <> '' then
+  begin
+    WriteDebug('BankPotion | Using cached antifire: ' + Self.CachedAntifireName);
+    if Self.WithdrawOneDosePotion(Self.CachedAntifireName) then
+      Exit(Self.CachedAntifireName);
+
+    // Cached variant ran out — clear cache and do full search
+    WriteDebug('BankPotion | Cached antifire unavailable, falling back to full search');
+    Self.CachedAntifireName := '';
+  end;
+
+  WriteDebug('BankPotion | Searching bank for antifire potions...');
+  if not Bank.Search('antifire') then
+  begin
+    WriteLn('WARNING: Bank search for antifire failed!');
+    Self.AntifirePotionUnavailable := True;
+    Exit('');
+  end;
+
+  Wait(800, 1200);
+
+  // Prefer extended antifire
+  extItem := TRSBankItem.Setup('Extended antifire(1)', 1);
+  if Bank.WithdrawItem(extItem, False) then
+  begin
+    Wait(400, 600);
+    if WaitUntil(Inventory.ContainsItem('Extended antifire(1)'), 150, 2500) then
+    begin
+      WriteDebug('BankPotion | Withdrew Extended antifire(1)');
+      Self.CachedAntifireName := 'Extended antifire(1)';
+      Bank.ClearSearch();
+      Exit('Extended antifire(1)');
+    end;
+  end;
+
+  // Fallback to regular antifire
+  regItem := TRSBankItem.Setup('Antifire potion(1)', 1);
+  if Bank.WithdrawItem(regItem, False) then
+  begin
+    Wait(400, 600);
+    if WaitUntil(Inventory.ContainsItem('Antifire potion(1)'), 150, 2500) then
+    begin
+      WriteDebug('BankPotion | Withdrew Antifire potion(1)');
+      Self.CachedAntifireName := 'Antifire potion(1)';
+      Bank.ClearSearch();
+      Exit('Antifire potion(1)');
+    end;
+  end;
+
+  // Neither found
+  Bank.ClearSearch();
+  WriteLn('WARNING: No Antifire potions found in bank!');
+  WriteLn('WARNING: Shield will be used, but you will not have full immunity against Dragon fire breath!');
+  Self.AntifirePotionUnavailable := True;
+  WriteDebug('BankPotion | Antifire potions cached as unavailable, will not attempt again');
+  Result := '';
+end;
+
+(**
  * PerformBankPotionRoutine
  *
  * Handles the logic for drinking potions at the bank (boosts/antifire).
@@ -1490,6 +1575,7 @@ var
   potionsVariant: TVariantArray;
   i: Int32;
   potionName: String;
+  antifireName: String;
 begin
   Result := True;
 
@@ -1505,13 +1591,12 @@ begin
       potionsToDrink += GetPotionItemName(Self.BankPotion);
   end;
 
-  // Dragon heads require antifire (Extended preferred)
+  // Dragon heads require antifire — handle separately with single "antifire" search
   if Self.HeadType = EHeadType.HEAD_DRAGON then
   begin
-    if Self.AntifirePotionUnavailable then
-      WriteDebug('BankPotion | Skipping antifire potion (previously unavailable)')
-    else
-      potionsToDrink += 'Extended antifire(1)';
+    antifireName := Self.WithdrawAntifirePotion();
+    if antifireName <> '' then
+      potionsToDrink += antifireName;
   end;
 
   if Length(potionsToDrink) = 0 then
@@ -1522,32 +1607,17 @@ begin
   if not Bank.IsOpen() then
     Exit(False);
 
-  // Withdraw all required potions
+  // Withdraw all required potions (skip those already in inventory, e.g., antifire)
   for i := 0 to High(potionsToDrink) do
   begin
     potionName := potionsToDrink[i];
+    if Inventory.ContainsItem(potionName) then
+      Continue;
     if not Self.WithdrawOneDosePotion(potionName) then
     begin
       WriteDebug('BankPotion | Failed to withdraw ' + potionName);
 
-      // For dragon heads, try regular antifire if extended fails
-      if (Self.HeadType = EHeadType.HEAD_DRAGON) and (potionName = 'Extended antifire(1)') then
-      begin
-        WriteDebug('BankPotion | Extended antifire not found, trying regular Antifire...');
-        if Self.WithdrawOneDosePotion('Antifire potion(1)') then
-        begin
-          potionsToDrink[i] := 'Antifire potion(1)';
-          WriteDebug('BankPotion | Withdrew regular Antifire potion(1)');
-        end
-        else
-        begin
-          WriteLn('WARNING: No Antifire potions found in bank!');
-          WriteLn('WARNING: Shield will be used, but you will not have full immunity against Dragon fire breath!');
-          Self.AntifirePotionUnavailable := True;
-          WriteDebug('BankPotion | Antifire potions cached as unavailable, will not attempt again');
-        end;
-      end
-      else if Self.UseBankPotion and (potionName = GetPotionItemName(Self.BankPotion)) then
+      if Self.UseBankPotion and (potionName = GetPotionItemName(Self.BankPotion)) then
       begin
         Self.CombatPotionUnavailable := True;
         WriteDebug('BankPotion | Combat potion cached as unavailable, will not attempt again');
@@ -2542,6 +2612,8 @@ end;
 procedure TReanimationBot.Init(maxActions: UInt32; maxTime: UInt64); override;
 begin
   inherited;
+  if Self.CheckGameSettings then
+    SettingsHandler.CheckGameSettings();
 
   // Disable native WaspLib reports in favor of Orka custom report
   WLSettings.Put('reports', False);
@@ -2998,6 +3070,7 @@ type
     PotionCheckbox: TLabeledCheckBox;
     PotionSelector: TComboBox;
     BHRunsCheckbox: TLabeledCheckBox;
+    CheckSettingsCheckbox: TLabeledCheckBox;
     BHLogLabel: TLabel;
     BHLogSelector: TComboBox;
     BHSeedLabel: TLabel;
@@ -3030,6 +3103,7 @@ begin
   Config.Put('useBankPotion', ReanimationConfig.PotionCheckbox.IsChecked());
   Config.Put('bankPotionType', ReanimationConfig.PotionSelector.GetItemIndex());
   Config.Put('doBHRuns', ReanimationConfig.BHRunsCheckbox.IsChecked());
+  Config.Put('checkGameSettings', False);
 
   // Save birdhouse settings
   Config.Put('bhLogType', Ord(BirdHouseRunner.LogType));
@@ -3132,6 +3206,7 @@ procedure TReanimationConfig.StartScript(sender: TObject); override;
 var
   potionIndex: Int32;
 begin
+  Bot.CheckGameSettings := Self.CheckSettingsCheckbox.IsChecked();
   Bot.HeadType := EHeadType(Self.HeadSelector.GetItemIndex());
   Bot.DoBHRuns := Self.BHRunsCheckbox.IsChecked();
   Bot.UseSpecs := Self.UseSpecsCheckbox.IsChecked();
@@ -3431,6 +3506,7 @@ var
   BGImg: TImage;
   baseLeft, baseTop, controlWidth, spacing, indent, labelGap, currentTop, startTop: Int32;
   accountPanel, limitPanel, riPanel, vPanel: TPanel;
+  actionLimitPanel, timeLimitPanel, vEnabledPanel, vTimePanel: TControl;
   offset, currentY: Int32;
   i: Int32;
   child: TControl;
@@ -3642,47 +3718,89 @@ begin
   riPanel := Self.Form.GetChild('ri_panel');
   vPanel := Self.Form.GetChild('v_panel');
 
+  // Hide riPanel entirely (HUD checkboxes not needed)
+  if riPanel <> nil then
+    riPanel.SetVisible(False);
+
   offset := TControl.AdjustToDPI(160);
   currentY := offset;
 
-  // Stack panels sequentially below the background title
+  // Reposition limitPanel and stack its children vertically
   if limitPanel <> nil then
   begin
     limitPanel.SetAlign(alNone);
     limitPanel.SetTop(currentY);
     limitPanel.SetWidth(Self.Size.X);
+
+    // Stack action limit and time limit vertically with consistent width
+    actionLimitPanel := Self.Form.GetChild('wl_action_limit_panel');
+    if actionLimitPanel <> nil then
+    begin
+      actionLimitPanel.SetLeft(TControl.AdjustToDPI(60));
+      actionLimitPanel.SetWidth(TControl.AdjustToDPI(240));
+      actionLimitPanel.SetTop(TControl.AdjustToDPI(20));
+    end;
+
+    timeLimitPanel := Self.Form.GetChild('wl_time_limit_panel');
+    if timeLimitPanel <> nil then
+    begin
+      timeLimitPanel.SetLeft(TControl.AdjustToDPI(60));
+      timeLimitPanel.SetWidth(TControl.AdjustToDPI(240));
+      if actionLimitPanel <> nil then
+        timeLimitPanel.SetTop(actionLimitPanel.GetTop() + actionLimitPanel.GetHeight() + TControl.AdjustToDPI(10))
+      else
+        timeLimitPanel.SetTop(TControl.AdjustToDPI(70));
+    end;
+
+    // Create CheckSettingsCheckbox inside limitPanel (below time limit)
+    with Self.CheckSettingsCheckbox do
+    begin
+      Create(limitPanel);
+      SetLeft(TControl.AdjustToDPI(60));
+      SetName('check_game_settings');
+      SetCaption('Check Game Settings');
+      SetWidth(TControl.AdjustToDPI(240));
+      SetFontColor($FFFFFF);
+      Caption.GetFont().SetStyle([fsBold]);
+      if timeLimitPanel <> nil then
+        SetTop(timeLimitPanel.GetTop() + timeLimitPanel.GetHeight() + TControl.AdjustToDPI(10))
+      else
+        SetTop(TControl.AdjustToDPI(120));
+      if Config.Has('checkGameSettings') then
+        SetChecked(Config.GetBoolean('checkGameSettings'))
+      else
+        SetChecked(True);
+    end;
+
+    // Expand limitPanel height to fit stacked controls
+    limitPanel.SetHeight(Self.CheckSettingsCheckbox.GetTop() + Self.CheckSettingsCheckbox.GetHeight() + TControl.AdjustToDPI(10));
     currentY := currentY + limitPanel.GetHeight();
   end;
 
-  if riPanel <> nil then
-  begin
-    riPanel.SetAlign(alNone);
-    riPanel.SetTop(currentY);
-    riPanel.SetWidth(Self.Size.X);
-    currentY := currentY + riPanel.GetHeight();
-  end;
-
+  // Reposition vPanel below limitPanel, left-aligned
   if vPanel <> nil then
   begin
     vPanel.SetAlign(alNone);
     vPanel.SetTop(currentY);
-    vPanel.SetLeft(Floor(Self.Size.X / 2));
-    vPanel.SetWidth(Floor(Self.Size.X / 2));
+    vPanel.SetLeft(0);
+    vPanel.SetWidth(Self.Size.X);
+
+    vEnabledPanel := Self.Form.GetChild('v_enabled_panel');
+    if vEnabledPanel <> nil then
+    begin
+      vEnabledPanel.SetLeft(TControl.AdjustToDPI(60));
+      vEnabledPanel.SetWidth(TControl.AdjustToDPI(240));
+    end;
+
+    vTimePanel := Self.Form.GetChild('v_time_panel');
+    if vTimePanel <> nil then
+    begin
+      vTimePanel.SetLeft(TControl.AdjustToDPI(60));
+      vTimePanel.SetWidth(TControl.AdjustToDPI(240));
+    end;
   end;
 
   SetChildsBoldFont(wlTab);
-
-  // Fix label clipping: bold font is wider than the auto-sized panel widths
-  child := Self.Form.GetChild('block_real_input_group_panel');
-  if child <> nil then
-  begin
-    child.GetParent().SetWidth(TControl.AdjustToDPI(200));
-    child.GetParent().GetParent().SetWidth(TControl.AdjustToDPI(220));
-  end;
-
-  child := Self.Form.GetChild('v_enabled_panel');
-  if child <> nil then
-    child.SetWidth(child.GetWidth() + TControl.AdjustToDPI(30));
 
   // Birdhouse Settings Tab (from birdhouserunner.simba)
   Self.CreateBirdhouseRunSettings();
@@ -3702,5 +3820,6 @@ begin
   {$IFDEF SCRIPT_GUI}
   ReanimationConfig.Run();
   {$ENDIF}
+  SettingsHandler.CheckGPUPlugin();
   Bot.Run(WLSettings.MaxActions, WLSettings.MaxTime);
 end.
