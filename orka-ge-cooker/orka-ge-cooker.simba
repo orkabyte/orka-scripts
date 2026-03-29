@@ -1,6 +1,6 @@
 (**
  * ============================================================================
- * Orka GE Cooking - Credits & Appreciation
+ * Orka GE Cooker - Credits & Appreciation
  * ============================================================================
  *
  * This script wouldn't exist without the incredible work of the WaspScripts community.
@@ -9,8 +9,8 @@
  * maintain and continuously improve WaspLib, SRL-T, and the entire ecosystem.
  *
  * Credits:
- * Torwent  |  3Garrett3  |  Student  |  BigAussie  |  Kriptic
- * Fik  |  skunkworks  |  XJ  |  unit
+ * Torwent  |  3Garrett3  |  Student  |  BigAussie  |  Flight  |  Kriptic
+ * Fik  |  skunkworks  |  XJ  |  unit  | Sebastiaan  |  n0ll  |  Baconadors
  *
  * A huge thank you to everyone in the WaspScripts community who provides
  * feedback, reports bugs, tests scripts, and helps newcomers learn.
@@ -18,14 +18,81 @@
  * ============================================================================
  *)
 
-{$DEFINE SCRIPT_REVISION := '4'}
-program OrkaGECooking;
+{$DEFINE SCRIPT_REVISION := '5'}
+program OrkaGECooker;
 {$DEFINE SCRIPT_GUI}
 {$I SRL-T/osr.simba}
 {$I WaspLib/osr.simba}
 
+(** Checks the active RuneLite profile for GPU plugin and auto-disables it. *)
+procedure DisableGPUPlugin();
+var
+  profilesDir, content, profileName, profileId: String;
+  json, profile: TJSONObject;
+  profiles: TJSONArray;
+  foundFiles: TStringArray;
+  fileName, propsPath, propsContent, output: String;
+  i: Int32;
+begin
+  profilesDir := GetEnvironmentVariable('USERPROFILE') + '\.runelite\profiles2';
+  if not FileExists(profilesDir + '\profiles.json') then Exit;
+
+  content := ReadFileContents(profilesDir + '\profiles.json');
+  if content = '' then Exit;
+
+  json.Init(content.Trim());
+  try
+    profiles := json.getJSONArray('profiles');
+    for i := 0 to profiles.High() do
+    begin
+      profile := profiles.getJSONObject(i);
+      if profile.has('active') and profile.getBoolean('active') then
+      begin
+        profileName := profile.getString('name');
+        profileId := ToString(Trunc(profile.getDouble('id')));
+        Break;
+      end;
+    end;
+  finally
+    json.Free();
+  end;
+
+  if (profileName = '') or (profileId = '') then Exit;
+
+  foundFiles := FindFiles(profilesDir, False);
+
+  for fileName in foundFiles do
+    if ExtractFileName(fileName) = (profileName + '-' + profileId + '.properties') then
+    begin
+      propsPath := fileName;
+      Break;
+    end;
+
+  if propsPath = '' then
+    for fileName in foundFiles do
+      if ExtractFileName(fileName).StartsWith(profileName) and ExtractFileName(fileName).EndsWith('.properties') then
+      begin
+        propsPath := fileName;
+        Break;
+      end;
+
+  if propsPath = '' then Exit;
+
+  propsContent := ReadFileContents(propsPath);
+  if Pos('runelite.gpuplugin=true', propsContent) = 0 then Exit;
+
+  propsContent := Replace(propsContent, 'runelite.gpuplugin=true', 'runelite.gpuplugin=false', [rfReplaceAll]);
+  if WriteFileContents(propsPath, propsContent, False) then
+  begin
+    WriteLn('GPU Plugin was enabled in profile "' + profileName + '" - disabled automatically.');
+    RunCommand('cmd', ['/c', 'taskkill /f /im RuneLite.exe'], output);
+    WriteLn('RuneLite closed. Please restart RuneLite and the script.');
+    TerminateScript();
+  end;
+end;
+
 const
-  SCRIPT_NAME = 'Orka GE Cooking';
+  SCRIPT_NAME = 'Orka GE Cooker';
   VERBOSE_LOGGING = True;
 
   // GE Coordinates
@@ -88,6 +155,9 @@ type
     CachedLog: String;
 
     ReportTimer: TStopwatch;
+
+    // Settings check
+    CheckGameSettings: Boolean;
   end;
 
 var
@@ -109,7 +179,7 @@ var
 procedure WriteDebug(msg: String);
 begin
   if VERBOSE_LOGGING then
-    WriteLn(SRL.TimeStamp(), ':[GE Cooking]: ', msg);
+    WriteLn(SRL.TimeStamp(), ':[GE Cooker]: ', msg);
 end;
 
 (**
@@ -362,6 +432,9 @@ var
 begin
   inherited;
 
+  if Self.CheckGameSettings then
+    SettingsHandler.CheckGameSettings();
+
   ItemFinder.Similarity := 0.99999;
 
   Self.StartXP := XPBar.Read();
@@ -433,14 +506,16 @@ begin
   Writeln(' |   |****************  CREDITS  ****************|   | ');
   Writeln(' |   |                                           |   | ');
   Writeln(' |   |    3Garrett3  |  Torwent  |  Student      |   | ');
-  Writeln(' |   |    BigAussie  |  Kriptic  |  Fik          |   | ');
-  Writeln(' |   |    skunkworks |  XJ       |  unit         |   | ');
+  Writeln(' |   |    BigAussie  |  Flight   |  Kriptic      |   | ');
+  Writeln(' |   |    skunkworks |  Fik      |  XJ           |   | ');
+  Writeln(' |   |    Sebastiaan |  unit     |  n0ll         |   | ');
+  Writeln(' |   |    Baconadors                             |   | ');
   Writeln(' |   |                                           |   | ');
   Writeln(' |___|~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~|___| ');
   Writeln('');
 
   Writeln('  ___                                             ___  ');
-  Writeln(' |   |************  Orka GE Cooking  ************|   | ');
+  Writeln(' |   |*************  Orka GE Cooker  ************|   |');
   Writeln(' |   |                                           |   | ');
   Writeln(' |   |    ' + PadR('Food Type: ' + Self.SelectedFood, 39) + '|   | ');
   if Self.IsLeftSide then
@@ -1649,6 +1724,7 @@ type
     // lab_Title, lab_Info, lab_Settings: TLabel;
     FoodLabel: TLabel;
     FoodSelector: TComboBox;
+    CheckSettingsCheckbox: TLabeledCheckBox;
   end;
 
 var
@@ -1662,9 +1738,10 @@ var
 procedure SaveConfig();
 begin
   if not Config.IsSetup then
-    Config.Setup('orka-ge-cooking');
+    Config.Setup('orka-ge-cooker');
 
   Config.Put('foodIndex', CookerConfig.FoodSelector.GetItemIndex());
+  Config.Put('checkGameSettings', False);
 end;
 
 (**
@@ -1675,7 +1752,7 @@ end;
 procedure LoadConfig();
 begin
   if not Config.IsSetup then
-    Config.Setup('orka-ge-cooking');
+    Config.Setup('orka-ge-cooker');
 
   if Config.Has('foodIndex') then
     CookerConfig.FoodSelector.SetItemIndex(Config.GetInt('foodIndex'));
@@ -1692,6 +1769,8 @@ procedure TCookerConfig.StartScript(sender: TObject); override;
 var
   FoodName: String;
 begin
+  CookerBot.CheckGameSettings := Self.CheckSettingsCheckbox.IsChecked();
+
   FoodName := Self.FoodSelector.GetText();
   CookerBot.SelectedFood := FoodName;
 
@@ -1735,8 +1814,10 @@ var
   Img: TPicture;
   BGImg: TImage;
   item: String;
+  limitPanel, vChild: TPanel;
+  vLeft: Int32;
 begin
-  Self.Setup('Orka GE Cooking');
+  Self.Setup('Orka GE Cooker');
   Self.Start.setOnClick(@Self.StartScript);
 
   with Self.Start do
@@ -1758,13 +1839,13 @@ begin
   Self.AddTab('Script Settings');
   tab := Self.Tabs[High(Self.Tabs)];
 
-  if not FileExists(AppPath + 'Resources\OrkaGECookingBG.png') then
-    DownloadToFile('https://raw.githubusercontent.com/orkabyte/orka-scripts/refs/heads/main/orka-ge-cooking/orka-ge-cooking-bg.png', AppPath + 'Resources\OrkaGECookingBG.png');
+  if not FileExists(AppPath + 'Resources\orka-ge-cooker-bg.png') then
+    DownloadToFile('https://raw.githubusercontent.com/orkabyte/orka-scripts/refs/heads/main/orka-ge-cooker/orka-ge-cooker-bg.png', AppPath + 'Resources\orka-ge-cooker-bg.png');
 
-  if FileExists(AppPath + 'Resources\OrkaGECookingBG.png') then
+  if FileExists(AppPath + 'Resources\orka-ge-cooker-bg.png') then
   begin
     Img.Init();
-    Img.LoadFromFile(AppPath + 'Resources\OrkaGECookingBG.png');
+    Img.LoadFromFile(AppPath + 'Resources\orka-ge-cooker-bg.png');
     with BGImg do
     begin
       Create(tab);
@@ -1812,6 +1893,35 @@ begin
   Self.CreateAntibanManager();
   Self.CreateWaspLibSettings();
 
+  limitPanel := Self.Form.GetChild('v_panel');
+  if limitPanel <> nil then
+  begin
+    vLeft := Floor(Floor(Self.Size.X/4) * 0.1);
+
+    vChild := Self.Form.GetChild('v_enabled_panel');
+    if vChild <> nil then
+      vChild.SetLeft(vLeft);
+
+    vChild := Self.Form.GetChild('v_time_panel');
+    if vChild <> nil then
+      vChild.SetLeft(vLeft);
+
+    with Self.CheckSettingsCheckbox do
+    begin
+      Create(limitPanel);
+      SetLeft(vLeft);
+      SetName('check_game_settings');
+      SetCaption('Check Game Settings');
+      SetWidth(TControl.AdjustToDPI(240));
+      SetTop(limitPanel.GetHeight() + TControl.AdjustToDPI(30));
+      if Config.Has('checkGameSettings') then
+        SetChecked(Config.GetBoolean('checkGameSettings'))
+      else
+        SetChecked(True);
+    end;
+    limitPanel.SetHeight(Self.CheckSettingsCheckbox.GetTop() + Self.CheckSettingsCheckbox.GetHeight() + TControl.AdjustToDPI(5));
+  end;
+
   inherited;
 end;
 {$ENDIF}
@@ -1821,5 +1931,6 @@ begin
   {$IFDEF SCRIPT_GUI}
   CookerConfig.Run();
   {$ENDIF}
+  DisableGPUPlugin();
   CookerBot.Run(WLSettings.MaxActions, WLSettings.MaxTime);
 end.

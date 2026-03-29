@@ -1,4 +1,4 @@
-# Orka GE Cooking
+# Orka GE Cooker
 
 Train cooking 1-99 at the Grand Exchange! Can be profitable depending on food prices.
 
