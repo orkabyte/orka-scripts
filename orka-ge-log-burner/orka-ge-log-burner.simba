@@ -1,6 +1,6 @@
 (**
  * ============================================================================
- * Orka Campfire - Credits & Appreciation
+ * Orka GE Log Burner - Credits & Appreciation
  * ============================================================================
  *
  * This script wouldn't exist without the incredible work of the WaspScripts community.
@@ -9,8 +9,8 @@
  * maintain and continuously improve WaspLib, SRL-T, and the entire ecosystem.
  *
  * Credits:
- * Torwent  |  3Garrett3  |  Student  |  BigAussie  |  Kriptic
- * Fik  |  skunkworks  |  XJ  |  unit
+ * Torwent  |  3Garrett3  |  Student  |  BigAussie  |  Flight  |  Kriptic
+ * Fik  |  skunkworks  |  XJ  |  unit  | Sebastiaan  |  n0ll  |  Baconadors
  *
  * A huge thank you to everyone in the WaspScripts community who provides
  * feedback, reports bugs, tests scripts, and helps newcomers learn.
@@ -18,14 +18,82 @@
  * ============================================================================
  *)
 
-{$DEFINE SCRIPT_REVISION := '7'}
-program OrkaCampfire;
+{$DEFINE SCRIPT_REVISION := '8'}
+program OrkaGELogBurner;
 {$DEFINE SCRIPT_GUI}
 {$I SRL-T/osr.simba}
 {$I WaspLib/osr.simba}
+{$I WaspLib/optional/handlers/discord.simba}
+
+(** Checks the active RuneLite profile for GPU plugin and auto-disables it. *)
+procedure DisableGPUPlugin();
+var
+  profilesDir, content, profileName, profileId: String;
+  json, profile: TJSONObject;
+  profiles: TJSONArray;
+  foundFiles: TStringArray;
+  fileName, propsPath, propsContent, output: String;
+  i: Int32;
+begin
+  profilesDir := GetEnvironmentVariable('USERPROFILE') + '\.runelite\profiles2';
+  if not FileExists(profilesDir + '\profiles.json') then Exit;
+
+  content := ReadFileContents(profilesDir + '\profiles.json');
+  if content = '' then Exit;
+
+  json.Init(content.Trim());
+  try
+    profiles := json.getJSONArray('profiles');
+    for i := 0 to profiles.High() do
+    begin
+      profile := profiles.getJSONObject(i);
+      if profile.has('active') and profile.getBoolean('active') then
+      begin
+        profileName := profile.getString('name');
+        profileId := ToString(Trunc(profile.getDouble('id')));
+        Break;
+      end;
+    end;
+  finally
+    json.Free();
+  end;
+
+  if (profileName = '') or (profileId = '') then Exit;
+
+  foundFiles := FindFiles(profilesDir, False);
+
+  for fileName in foundFiles do
+    if ExtractFileName(fileName) = (profileName + '-' + profileId + '.properties') then
+    begin
+      propsPath := fileName;
+      Break;
+    end;
+
+  if propsPath = '' then
+    for fileName in foundFiles do
+      if ExtractFileName(fileName).StartsWith(profileName) and ExtractFileName(fileName).EndsWith('.properties') then
+      begin
+        propsPath := fileName;
+        Break;
+      end;
+
+  if propsPath = '' then Exit;
+
+  propsContent := ReadFileContents(propsPath);
+  if Pos('runelite.gpuplugin=true', propsContent) = 0 then Exit;
+
+  propsContent := Replace(propsContent, 'runelite.gpuplugin=true', 'runelite.gpuplugin=false', [rfReplaceAll]);
+  if WriteFileContents(propsPath, propsContent, False) then
+  begin
+    WriteLn('GPU Plugin was enabled in profile "' + profileName + '" - disabled automatically.');
+    RunCommand('cmd', ['/c', 'taskkill /f /im RuneLite.exe'], output);
+    WriteLn('RuneLite closed. Please restart RuneLite and the script.');
+    TerminateScript();
+  end;
+end;
 
 const
-  SCRIPT_NAME = 'Orka Campfire';
+  SCRIPT_NAME = 'Orka GE Log Burner';
   VERBOSE_LOGGING = True;
 
   // GE Location Constants
@@ -39,7 +107,7 @@ const
   RIGHT_BANK_TILE: TPoint = [8570, 36474];
 
 type
-  EForesterState = (
+  EGELogBurnerState = (
     HANDLE_LOGIN,
     OPEN_BANK,
     HANDLE_BANK,
@@ -51,8 +119,8 @@ type
     END_SCRIPT
   );
 
-  TForesterCampfire = record(TBaseWalkerScript)
-    State: EForesterState;
+  TGELogBurner = record(TBaseWalkerScript)
+    State: EGELogBurnerState;
     LogType: TRSItem;
     Tinderbox: TRSItem;
 
@@ -76,11 +144,19 @@ type
 
     // Report timer
     ReportTimer: TStopwatch;
+
+    // Settings check
+    CheckGameSettings: Boolean;
+
+    // Discord
+    UseDiscord: Boolean;
+    DiscordReportTimer: TCountDown;
   end;
 
 var
-  ForesterBot: TForesterCampfire;
+  LogBurnerBot: TGELogBurner;
   Config: TConfigJSON;
+  Discord: TDiscordClient;
 
 // -----------------------------------------------------------------------------
 // Helper Functions
@@ -97,7 +173,7 @@ var
 procedure WriteDebug(msg: String);
 begin
   if VERBOSE_LOGGING then
-    WriteLn(SRL.TimeStamp(), ':[Campfire]: ', msg);
+    WriteLn(SRL.TimeStamp(), ':[GELogBurner]: ', msg);
 end;
 
 (**
@@ -127,7 +203,7 @@ begin
 end;
 
 (**
- * Campfire_MSToWorld
+ * GELogBurner_MSToWorld
  *
  * Converts a MainScreen point to a World Map coordinate (TPoint).
  * Used to get the exact tile of a found object.
@@ -135,7 +211,7 @@ end;
  * @param MSPt  Point on the Main Screen
  * @return      World Map coordinate
  *)
-function Campfire_MSToWorld(MSPt: TPoint): TPoint;
+function GELogBurner_MSToWorld(MSPt: TPoint): TPoint;
 var
   Me, MMPt: TPoint;
   Angle: Double;
@@ -206,7 +282,7 @@ end;
  *
  * Prints the script progress report to the debug console.
  *)
-procedure TForesterCampfire.Report();
+procedure TGELogBurner.Report();
 var
   RunTime: Int64;
   XPPerHour, LogsPerHour: Int32;
@@ -233,6 +309,7 @@ begin
   title := SCRIPT_NAME;
   title := '|' + PadR(PadL(title, (bannerWidth - 2 + Length(title)) div 2, ' '), bannerWidth - 2, ' ') + '|';
 
+  WriteLn('');
   WriteLn(separator);
   WriteLn(title);
   WriteLn(separator);
@@ -286,6 +363,84 @@ begin
   title := '|' + PadR(PadL(title, (bannerWidth - 2 + Length(title)) div 2, ' '), bannerWidth - 2, ' ') + '|';
   WriteLn(title);
   WriteLn(separator);
+  WriteLn('');
+end;
+
+(**
+ * SendDiscordReport
+ *
+ * Sends a progress report embed to Discord.
+ *
+ * @param title  The embed title (e.g. 'Hourly Report', 'Script Stopped')
+ *)
+procedure TGELogBurner.SendDiscordReport(reportTitle: String; embedColor: Int32);
+var
+  RunTime: Int64;
+  XPPerHour, LogsPerHour, EmbedIdx: Int32;
+begin
+  if not Self.UseDiscord then Exit;
+
+  Self.GainedXP := XPBar.Read() - Self.StartXP;
+  RunTime := GetTimeRunning();
+  if RunTime > 0 then
+  begin
+    XPPerHour := Round(Self.GainedXP / (RunTime / 3600000));
+    LogsPerHour := Round(Self.LogsBurned / (RunTime / 3600000));
+  end;
+
+  EmbedIdx := Discord.Webhook.AddEmbed();
+  with Discord.Webhook.Embeds[EmbedIdx] do
+  begin
+    Title := reportTitle;
+    Description :=
+      'Runtime: ' + SRL.MsToTime(RunTime, Time_Short) + LineEnding +
+      'Logs Burned: ' + ToString(Self.LogsBurned) + LineEnding +
+      'Logs/Hr: ' + ToString(LogsPerHour) + LineEnding +
+      'XP Gained: ' + ToString(Self.GainedXP) + LineEnding +
+      'XP/Hr: ' + ToString(XPPerHour);
+    Color := embedColor;
+    Footer := SCRIPT_NAME;
+  end;
+
+  Discord.SendScreenshot(True);
+end;
+
+procedure _OnTerminateDiscord();
+var
+  RunTime: Int64;
+  XPPerHour, LogsPerHour: Int64;
+  EmbedIdx: Int32;
+begin
+  if not LogBurnerBot.UseDiscord then Exit;
+
+  // Defuse config cleanup to prevent access violation during termination
+  Config.IsSetup := False;
+  Discord.Config.IsSetup := False;
+
+  RunTime := GetTimeRunning();
+  if RunTime > 0 then
+  begin
+    XPPerHour := Round(LogBurnerBot.GainedXP / (RunTime / 3600000));
+    LogsPerHour := Round(LogBurnerBot.LogsBurned / (RunTime / 3600000));
+  end;
+
+  Discord.Webhook.Content := ':white_check_mark: **Session Complete**';
+  EmbedIdx := Discord.Webhook.AddEmbed();
+  with Discord.Webhook.Embeds[EmbedIdx] do
+  begin
+    Title := 'Session Summary';
+    Description :=
+      'Runtime: ' + SRL.MsToTime(RunTime, Time_Short) + LineEnding +
+      'Logs Burned: ' + ToString(LogBurnerBot.LogsBurned) + LineEnding +
+      'Logs/Hr: ' + ToString(LogsPerHour) + LineEnding +
+      'XP Gained: ' + ToString(LogBurnerBot.GainedXP) + LineEnding +
+      'XP/Hr: ' + ToString(XPPerHour);
+    Color := $00AA00;
+    Footer := SCRIPT_NAME;
+  end;
+
+  Discord.SendScreenshot(True);
+  Discord.Free();
 end;
 
 // -----------------------------------------------------------------------------
@@ -302,7 +457,7 @@ end;
 procedure OnBreakStart(Task: PBreakTask);
 begin
   Task; // Suppress unused parameter warning
-  ForesterBot.LastBreakStartTime := GetTimeRunning();
+  LogBurnerBot.LastBreakStartTime := GetTimeRunning();
 end;
 
 (**
@@ -317,13 +472,13 @@ var
   BreakDuration: Int64;
 begin
   Task; // Suppress unused parameter warning
-  ForesterBot.LastBreakEndTime := GetTimeRunning();
-  BreakDuration := ForesterBot.LastBreakEndTime - ForesterBot.LastBreakStartTime;
-  ForesterBot.TotalBreakTime := ForesterBot.TotalBreakTime + BreakDuration;
+  LogBurnerBot.LastBreakEndTime := GetTimeRunning();
+  BreakDuration := LogBurnerBot.LastBreakEndTime - LogBurnerBot.LastBreakStartTime;
+  LogBurnerBot.TotalBreakTime := LogBurnerBot.TotalBreakTime + BreakDuration;
 end;
 
 // -----------------------------------------------------------------------------
-// TForesterCampfire Implementation
+// TGELogBurner Implementation
 // -----------------------------------------------------------------------------
 
 (**
@@ -351,13 +506,17 @@ end;
  * @param maxActions  Maximum actions before stopping
  * @param maxTime     Maximum time before stopping
  *)
-procedure TForesterCampfire.Init(maxActions: UInt32; maxTime: UInt64); override;
+procedure TGELogBurner.Init(maxActions: UInt32; maxTime: UInt64); override;
 var
   MyPos: TPoint;
   DistLeft, DistRight: Int32;
 begin
   inherited;
 
+  if Self.CheckGameSettings then
+    SettingsHandler.CheckGameSettings();
+
+  WaitUntil(XPBar.Read() > 0, 500, 10000);
   Self.StartXP := XPBar.Read();
   Self.GainedXP := 0;
   Self.LogsBurned := 0;
@@ -417,14 +576,16 @@ begin
   Writeln(' |   |****************  CREDITS  ****************|   | ');
   Writeln(' |   |                                           |   | ');
   Writeln(' |   |    3Garrett3  |  Torwent  |  Student      |   | ');
-  Writeln(' |   |    BigAussie  |  Kriptic  |  Fik          |   | ');
-  Writeln(' |   |    skunkworks |  XJ       |  unit         |   | ');
+  Writeln(' |   |    BigAussie  |  Flight   |  Kriptic      |   | ');
+  Writeln(' |   |    skunkworks |  Fik      |  XJ           |   | ');
+  Writeln(' |   |    Sebastiaan |  unit     |  n0ll         |   | ');
+  Writeln(' |   |    Baconadors                             |   | ');
   Writeln(' |   |                                           |   | ');
   Writeln(' |___|~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~|___| ');
   Writeln('');
 
   Writeln('  ___                                             ___  ');
-  Writeln(' |   |*************  Orka Campfire  *************|   | ');
+  Writeln(' |   |***********  Orka GE Log Burner  **********|   |');
   Writeln(' |   |                                           |   | ');
   Writeln(' |   |    ' + PadR('Log Type:  ' + ToStr(Self.LogType), 39) + '|   | ');
   if Self.IsLeftSide then
@@ -434,6 +595,13 @@ begin
   Writeln(' |   |                                           |   | ');
   Writeln(' |___|~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~|___| ');
   Writeln('');
+
+  if Self.UseDiscord then
+  begin
+    Self.DiscordReportTimer.Setup(3600000);
+    Self.DiscordReportTimer.Restart();
+    AddOnTerminate(@_OnTerminateDiscord);
+  end;
 end;
 
 (**
@@ -441,7 +609,7 @@ end;
  *
  * Rotates camera to a favorable angle for finding the bank booth.
  *)
-procedure TForesterCampfire.AdjustCameraForBanking();
+procedure TGELogBurner.AdjustCameraForBanking();
 var
   currentAngle: Double;
   minAngle, maxAngle: Double;
@@ -480,7 +648,7 @@ end;
  *
  * @return True if bank was clicked
  *)
-function TForesterCampfire.FindBank(): Boolean;
+function TGELogBurner.FindBank(): Boolean;
 var
   BankObj: TRSObjectV2;
 begin
@@ -511,7 +679,7 @@ end;
  *
  * @return True if successful
  *)
-function TForesterCampfire.HandleBanking(): Boolean;
+function TGELogBurner.HandleBanking(): Boolean;
 var
   NeedTinderbox: Boolean;
   TinderboxItem, LogItem: TRSBankItem;
@@ -525,29 +693,17 @@ begin
   if not Bank.IsOpen() then
     Exit(False);
 
-  // 1. Manage Inventory Space
+  // 1. Deposit everything except what we need
   NeedTinderbox := not Self.HasFire;
 
-  // Deposit tinderbox if we have fire
-  if Self.HasFire and Inventory.ContainsItem(Self.Tinderbox) then
-  begin
-    WriteDebug('HandleBanking | Fire exists, depositing tinderbox');
-    Bank.DepositItem(Self.Tinderbox, True);
-    Wait(600, 900);
-  end;
+  if NeedTinderbox then
+    Bank.DepositRandomItems([Self.Tinderbox, Self.LogType])
+  else
+    Bank.DepositRandomItems([Self.LogType]);
+  Wait(600, 900);
 
-  if Inventory.IsFull() then
-  begin
-    WriteDebug('HandleBanking | Inventory full, depositing items');
-    Bank.DepositAll();
-    Wait(600, 1200);
-
-    if not Bank.IsOpen() then
-    begin
-      WriteDebug('HandleBanking | Bank closed after deposit');
-      Exit(False);
-    end;
-  end;
+  if not Bank.IsOpen() then
+    Exit(False);
 
   // 2. Withdraw Tinderbox if needed
   if NeedTinderbox and not Inventory.ContainsItem(Self.Tinderbox) then
@@ -641,7 +797,7 @@ end;
  *
  * @return True if fire was found
  *)
-function TForesterCampfire.ScanForFire(): Boolean;
+function TGELogBurner.ScanForFire(): Boolean;
 var
   SearchArea: TPointArray;
   Campfire: TRSObjectV2;
@@ -682,7 +838,7 @@ begin
         Mouse.Move(ATPA[i].Mean());
         if WaitUntil(MainScreen.IsUpText(['Forester', 'Campfire']), 50, 300) then
         begin
-          Self.CurrentFireTile := Campfire_MSToWorld(ATPA[i].Mean());
+          Self.CurrentFireTile := GELogBurner_MSToWorld(ATPA[i].Mean());
           WriteDebug('ScanForFire | Found existing fire at ' + ToStr(Self.CurrentFireTile));
           Self.HasFire := True;
           Exit(True);
@@ -704,7 +860,7 @@ end;
  *
  * @return True if successful
  *)
-function TForesterCampfire.CreateFire(): Boolean;
+function TGELogBurner.CreateFire(): Boolean;
 var
   Tile, startPos: TPoint;
 begin
@@ -812,7 +968,7 @@ end;
  *
  * @return True if interaction was successful
  *)
-function TForesterCampfire.InteractWithFire(): Boolean;
+function TGELogBurner.InteractWithFire(): Boolean;
 var
   Campfire: TRSObjectV2;
   ATPA: T2DPointArray;
@@ -889,7 +1045,7 @@ end;
  *
  * @return True if burning completed normally
  *)
-function TForesterCampfire.WaitBurning(): Boolean;
+function TGELogBurner.WaitBurning(): Boolean;
 var
   Timeout: TCountDown;
   LastXP, CurrentXP: Int32;
@@ -958,18 +1114,18 @@ end;
  *
  * Determines the current state of the bot.
  *
- * @return The next EForesterState to execute
+ * @return The next EGELogBurnerState to execute
  *)
-function TForesterCampfire.GetState(): EForesterState;
+function TGELogBurner.GetState(): EGELogBurnerState;
 begin
   if not RSClient.IsLoggedIn() then
-    Exit(EForesterState.HANDLE_LOGIN);
+    Exit(EGELogBurnerState.HANDLE_LOGIN);
 
   if WL.Activity.IsFinished() then
-    Exit(EForesterState.END_SCRIPT);
+    Exit(EGELogBurnerState.END_SCRIPT);
 
   if Chat.LeveledUp() then
-    Exit(EForesterState.LEVEL_UP);
+    Exit(EGELogBurnerState.LEVEL_UP);
 
   // Bank handling
   if Bank.IsOpen() then
@@ -977,33 +1133,33 @@ begin
     if Inventory.ContainsItem(Self.LogType) then
     begin
       if not Self.HasFire and not Inventory.ContainsItem(Self.Tinderbox) then
-        Exit(EForesterState.HANDLE_BANK);
+        Exit(EGELogBurnerState.HANDLE_BANK);
 
-      Exit(EForesterState.CLOSE_BANK);
+      Exit(EGELogBurnerState.CLOSE_BANK);
     end;
 
-    Exit(EForesterState.HANDLE_BANK);
+    Exit(EGELogBurnerState.HANDLE_BANK);
   end;
 
   // No logs - need to bank
   if not Inventory.ContainsItem(Self.LogType) then
   begin
     if not Self.HasFire and not Self.HasScannedForFire then
-      Exit(EForesterState.FIND_EXISTING_FIRE);
+      Exit(EGELogBurnerState.FIND_EXISTING_FIRE);
 
-    Exit(EForesterState.OPEN_BANK);
+    Exit(EGELogBurnerState.OPEN_BANK);
   end;
 
   // Have logs but no fire
   if not Self.HasFire then
   begin
     if Self.HasScannedForFire and not Inventory.ContainsItem(Self.Tinderbox) then
-      Exit(EForesterState.OPEN_BANK);
+      Exit(EGELogBurnerState.OPEN_BANK);
 
-    Exit(EForesterState.FIND_EXISTING_FIRE);
+    Exit(EGELogBurnerState.FIND_EXISTING_FIRE);
   end;
 
-  Exit(EForesterState.BURN_LOGS);
+  Exit(EGELogBurnerState.BURN_LOGS);
 end;
 
 // -----------------------------------------------------------------------------
@@ -1018,7 +1174,7 @@ end;
  * @param maxActions  Maximum actions
  * @param maxTime     Maximum runtime
  *)
-procedure TForesterCampfire.Run(maxActions: UInt32; maxTime: UInt64);
+procedure TGELogBurner.Run(maxActions: UInt32; maxTime: UInt64);
 begin
   Self.Init(maxActions, maxTime);
 
@@ -1032,8 +1188,14 @@ begin
       Self.ReportTimer.Reset();
     end;
 
+    if Self.UseDiscord and Self.DiscordReportTimer.IsFinished() then
+    begin
+      Self.SendDiscordReport('Hourly Report', $0000FF);
+      Self.DiscordReportTimer.Restart();
+    end;
+
     case Self.State of
-      EForesterState.HANDLE_LOGIN:
+      EGELogBurnerState.HANDLE_LOGIN:
       begin
         WriteDebug('HANDLE_LOGIN | Attempting login');
         if Login.LoginPlayer() then
@@ -1045,7 +1207,7 @@ begin
           Wait(3000, 5000);
       end;
 
-      EForesterState.OPEN_BANK:
+      EGELogBurnerState.OPEN_BANK:
       begin
         if Bank.IsOpen() then
         begin
@@ -1061,7 +1223,7 @@ begin
           Wait(1000, 2000);
       end;
 
-      EForesterState.HANDLE_BANK:
+      EGELogBurnerState.HANDLE_BANK:
       begin
         if not Self.HandleBanking() then
         begin
@@ -1071,13 +1233,13 @@ begin
         end;
       end;
 
-      EForesterState.CLOSE_BANK:
+      EGELogBurnerState.CLOSE_BANK:
       begin
         Bank.Close();
         Wait(400, 600);
       end;
 
-      EForesterState.FIND_EXISTING_FIRE:
+      EGELogBurnerState.FIND_EXISTING_FIRE:
       begin
         if not Self.HasScannedForFire then
         begin
@@ -1097,7 +1259,7 @@ begin
         end;
       end;
 
-      EForesterState.BURN_LOGS:
+      EGELogBurnerState.BURN_LOGS:
       begin
         if Self.IsBurning then
           Self.WaitBurning()
@@ -1113,7 +1275,7 @@ begin
         end;
       end;
 
-      EForesterState.LEVEL_UP:
+      EGELogBurnerState.LEVEL_UP:
       begin
         WriteLn('LEVEL_UP | Firemaking level up!');
         if RSInterface.IsOpen() then
@@ -1121,11 +1283,13 @@ begin
           RSInterface.Close();
           Wait(500, 800);
         end;
+        if Self.UseDiscord then
+          Self.SendDiscordReport('Level Up!', $FFA500);
         Chat.HandleLevelUp();
         Wait(1000, 3000);
       end;
 
-      EForesterState.END_SCRIPT:
+      EGELogBurnerState.END_SCRIPT:
       begin
         Self.Report();
         Break;
@@ -1145,7 +1309,7 @@ end;
  *
  * @return Array of report strings
  *)
-function TForesterCampfire.BuildTextReport(): TStringArray; override;
+function TGELogBurner.BuildTextReport(): TStringArray; override;
 var
   elapsedTime: UInt64;
 begin
@@ -1170,13 +1334,17 @@ end;
 {$IFNDEF SCRIPT_CHAIN}
 {$IFDEF SCRIPT_GUI}
 type
-  TForesterConfig = record(TScriptForm)
+  TGELogBurnerConfig = record(TScriptForm)
     LogLabel: TLabel;
     LogSelector: TComboBox;
+    CheckSettingsCheckbox: TLabeledCheckBox;
+    DiscordWebhookEdit: TLabeledEdit;
+    DiscordEnabledCheckbox: TLabeledCheckBox;
+    DiscordTestButton: TButton;
   end;
 
 var
-  ForesterConfig: TForesterConfig;
+  LogBurnerConfig: TGELogBurnerConfig;
 
 (**
  * SaveConfig
@@ -1186,9 +1354,12 @@ var
 procedure SaveConfig();
 begin
   if not Config.IsSetup then
-    Config.Setup('orka-campfire');
+    Config.Setup('orka-ge-log-burner');
 
-  Config.Put('logType', ForesterConfig.LogSelector.GetItemIndex());
+  Config.Put('logType', LogBurnerConfig.LogSelector.GetItemIndex());
+  Config.Put('checkGameSettings', False);
+  Config.Put('discordEnabled', LogBurnerConfig.DiscordEnabledCheckbox.IsChecked());
+  Config.Put('discordWebhook', LogBurnerConfig.DiscordWebhookEdit.GetText());
 end;
 
 (**
@@ -1199,10 +1370,11 @@ end;
 procedure LoadConfig();
 begin
   if not Config.IsSetup then
-    Config.Setup('orka-campfire');
+    Config.Setup('orka-ge-log-burner');
 
   if Config.Has('logType') then
-    ForesterConfig.LogSelector.SetItemIndex(Config.GetInt('logType'));
+    LogBurnerConfig.LogSelector.SetItemIndex(Config.GetInt('logType'));
+
 end;
 
 (**
@@ -1212,20 +1384,58 @@ end;
  *
  * @param sender  The object that triggered the event
  *)
-procedure TForesterConfig.StartScript(sender: TObject); override;
+procedure TGELogBurnerConfig.StartScript(sender: TObject); override;
 begin
+  LogBurnerBot.CheckGameSettings := Self.CheckSettingsCheckbox.IsChecked();
+
   case Self.LogSelector.GetItemIndex() of
-    0: ForesterBot.LogType := 'Logs';
-    1: ForesterBot.LogType := 'Oak logs';
-    2: ForesterBot.LogType := 'Willow logs';
-    3: ForesterBot.LogType := 'Maple logs';
-    4: ForesterBot.LogType := 'Yew logs';
-    5: ForesterBot.LogType := 'Magic logs';
-    6: ForesterBot.LogType := 'Redwood logs';
+    0: LogBurnerBot.LogType := 'Logs';
+    1: LogBurnerBot.LogType := 'Oak logs';
+    2: LogBurnerBot.LogType := 'Willow logs';
+    3: LogBurnerBot.LogType := 'Maple logs';
+    4: LogBurnerBot.LogType := 'Yew logs';
+    5: LogBurnerBot.LogType := 'Magic logs';
+    6: LogBurnerBot.LogType := 'Redwood logs';
+  end;
+
+  LogBurnerBot.UseDiscord := Self.DiscordEnabledCheckbox.IsChecked();
+  if LogBurnerBot.UseDiscord then
+  begin
+    Discord.Setup();
+    Discord.SetWebhook(Self.DiscordWebhookEdit.GetText());
+    Discord.SetUsername(SCRIPT_NAME);
+    Discord.SetAvatar('https://raw.githubusercontent.com/orkabyte/orka-scripts/refs/heads/main/orka-ge-log-burner/orka-ge-log-burner-disc-notification.png');
   end;
 
   SaveConfig();
   inherited;
+end;
+
+procedure TGELogBurnerConfig.OpenWebhookHelp(sender: TObject);
+begin
+  sender; // suppress unused warning
+  OpenWebPage('https://support.discord.com/hc/en-us/articles/228383668-Intro-to-Webhooks');
+end;
+
+procedure TGELogBurnerConfig.TestDiscordWebhook(sender: TObject);
+var
+  testClient: TDiscordClient;
+begin
+  sender; // suppress unused warning
+  testClient.Setup();
+  if testClient.SetWebhook(Self.DiscordWebhookEdit.GetText()) then
+  begin
+    testClient.SetUsername(SCRIPT_NAME);
+    testClient.SetAvatar('https://raw.githubusercontent.com/orkabyte/orka-scripts/refs/heads/main/orka-ge-log-burner/orka-ge-log-burner-disc-notification.png');
+    testClient.Webhook.Content := 'Webhook test successful!';
+    if testClient.Send() then
+      Self.DiscordTestButton.SetCaption('Success!')
+    else
+      Self.DiscordTestButton.SetCaption('Send Failed');
+  end
+  else
+    Self.DiscordTestButton.SetCaption('Invalid URL');
+  testClient.Free();
 end;
 
 (**
@@ -1233,15 +1443,19 @@ end;
  *
  * Sets up and displays the GUI.
  *)
-procedure TForesterConfig.Run(); override;
+procedure TGELogBurnerConfig.Run(); override;
 var
-  tab, accountTab: TTabSheet;
+  tab, accountTab, discordTab: TTabSheet;
   Font: TFont;
   Img: TPicture;
   BGImg: TImage;
   item: String;
+  limitPanel, vChild: TPanel;
+  vLeft: Int32;
+  helpBtn: TButton;
+  savedSize: TPoint;
 begin
-  Self.Setup('Orka Campfire');
+  Self.Setup('Orka GE Log Burner', [960, 540]);
   Self.Start.setOnClick(@Self.StartScript);
 
   with Self.Start do
@@ -1263,13 +1477,13 @@ begin
   Self.AddTab('Script Settings');
   tab := Self.Tabs[High(Self.Tabs)];
 
-  if not FileExists(AppPath + 'Resources\OrkaCampfireBG.png') then
-    DownloadToFile('https://raw.githubusercontent.com/orkabyte/orka-scripts/refs/heads/main/orka-campfire/orka-campfire-bg.png', AppPath + 'Resources\OrkaCampfireBG.png');
+  if not FileExists(AppPath + 'Resources\OrkaGELogBurnerBG.png') then
+    DownloadToFile('https://raw.githubusercontent.com/orkabyte/orka-scripts/refs/heads/main/orka-ge-log-burner/orka-ge-log-burner-bg.png', AppPath + 'Resources\OrkaGELogBurnerBG.png');
 
-  if FileExists(AppPath + 'Resources\OrkaCampfireBG.png') then
+  if FileExists(AppPath + 'Resources\OrkaGELogBurnerBG.png') then
   begin
     Img.Init();
-    Img.LoadFromFile(AppPath + 'Resources\OrkaCampfireBG.png');
+    Img.LoadFromFile(AppPath + 'Resources\OrkaGELogBurnerBG.png');
     with BGImg do
     begin
       Create(tab);
@@ -1307,12 +1521,93 @@ begin
 
   Self.AddTab('Account Manager');
   accountTab := Self.Tabs[High(Self.Tabs)];
+  savedSize := Self.Size;
+  Self.Size := [TControl.AdjustToDPI(750), TControl.AdjustToDPI(500)];
   Self.CreateAccountManager(accountTab);
+  Self.Size := savedSize;
 
   LoadConfig();
 
   Self.CreateAntibanManager();
   Self.CreateWaspLibSettings();
+
+  limitPanel := Self.Form.GetChild('v_panel');
+  if limitPanel <> nil then
+  begin
+    vLeft := Floor(Floor(Self.Size.X/4) * 0.1);
+
+    vChild := Self.Form.GetChild('v_enabled_panel');
+    if vChild <> nil then
+      vChild.SetLeft(vLeft);
+
+    vChild := Self.Form.GetChild('v_time_panel');
+    if vChild <> nil then
+      vChild.SetLeft(vLeft);
+
+    with Self.CheckSettingsCheckbox do
+    begin
+      Create(limitPanel);
+      SetLeft(vLeft);
+      SetName('check_game_settings');
+      SetCaption('Check Game Settings');
+      SetWidth(TControl.AdjustToDPI(240));
+      SetTop(limitPanel.GetHeight() + TControl.AdjustToDPI(10));
+      if Config.Has('checkGameSettings') then
+        SetChecked(Config.GetBoolean('checkGameSettings'))
+      else
+        SetChecked(True);
+    end;
+    limitPanel.SetHeight(Self.CheckSettingsCheckbox.GetTop() + Self.CheckSettingsCheckbox.GetHeight() + TControl.AdjustToDPI(5));
+  end;
+
+  Self.AddTab('Discord');
+  discordTab := Self.Tabs[High(Self.Tabs)];
+
+  with Self.DiscordEnabledCheckbox do
+  begin
+    Create(discordTab);
+    SetLeft(TControl.AdjustToDPI(20));
+    SetTop(TControl.AdjustToDPI(20));
+    SetName('discord_enabled');
+    SetCaption('Enable Discord Notifications');
+    SetWidth(TControl.AdjustToDPI(250));
+  end;
+
+  with Self.DiscordWebhookEdit do
+  begin
+    Create(discordTab);
+    SetLeft(TControl.AdjustToDPI(20));
+    SetTop(Self.DiscordEnabledCheckbox.GetBottom() + TControl.AdjustToDPI(15));
+    SetName('discord_webhook');
+    SetCaption('Webhook URL:');
+    SetWidth(Self.Form.GetWidth() - TControl.AdjustToDPI(60));
+  end;
+
+  with Self.DiscordTestButton do
+  begin
+    Init(discordTab);
+    SetParent(discordTab);
+    SetLeft(TControl.AdjustToDPI(20));
+    SetTop(Self.DiscordWebhookEdit.GetBottom() + TControl.AdjustToDPI(15));
+    SetWidth(TControl.AdjustToDPI(140));
+    SetHeight(TControl.AdjustToDPI(30));
+    SetCaption('Test Webhook');
+    SetOnClick(@Self.TestDiscordWebhook);
+  end;
+
+  helpBtn.Init(discordTab);
+  helpBtn.SetParent(discordTab);
+  helpBtn.SetLeft(Self.DiscordTestButton.GetRight() + TControl.AdjustToDPI(10));
+  helpBtn.SetTop(Self.DiscordTestButton.GetTop());
+  helpBtn.SetWidth(TControl.AdjustToDPI(140));
+  helpBtn.SetHeight(TControl.AdjustToDPI(30));
+  helpBtn.SetCaption('How to Set Up');
+  helpBtn.SetOnClick(@Self.OpenWebhookHelp);
+
+  if Config.Has('discordEnabled') then
+    Self.DiscordEnabledCheckbox.SetChecked(Config.GetBoolean('discordEnabled'));
+  if Config.Has('discordWebhook') then
+    Self.DiscordWebhookEdit.SetText(Config.GetString('discordWebhook'));
 
   inherited;
 end;
@@ -1321,7 +1616,8 @@ end;
 
 begin
   {$IFDEF SCRIPT_GUI}
-  ForesterConfig.Run();
+  LogBurnerConfig.Run();
   {$ENDIF}
-  ForesterBot.Run(WLSettings.MaxActions, WLSettings.MaxTime);
+  DisableGPUPlugin();
+  LogBurnerBot.Run(WLSettings.MaxActions, WLSettings.MaxTime);
 end.
