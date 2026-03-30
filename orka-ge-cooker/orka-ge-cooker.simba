@@ -18,11 +18,12 @@
  * ============================================================================
  *)
 
-{$DEFINE SCRIPT_REVISION := '5'}
+{$DEFINE SCRIPT_REVISION := '6'}
 program OrkaGECooker;
 {$DEFINE SCRIPT_GUI}
 {$I SRL-T/osr.simba}
 {$I WaspLib/osr.simba}
+{$I WaspLib/optional/handlers/discord.simba}
 
 (** Checks the active RuneLite profile for GPU plugin and auto-disables it. *)
 procedure DisableGPUPlugin();
@@ -158,11 +159,16 @@ type
 
     // Settings check
     CheckGameSettings: Boolean;
+
+    // Discord
+    UseDiscord: Boolean;
+    DiscordReportTimer: TCountDown;
   end;
 
 var
   CookerBot: TGECooker;
   Config: TConfigJSON;
+  Discord: TDiscordClient;
 
 // -----------------------------------------------------------------------------
 // Helper Functions
@@ -318,6 +324,7 @@ begin
   title := SCRIPT_NAME;
   title := '|' + PadR(PadL(title, (bannerWidth - 2 + Length(title)) div 2, ' '), bannerWidth - 2, ' ') + '|';
 
+  WriteLn('');
   WriteLn(separator);
   WriteLn(title);
   WriteLn(separator);
@@ -361,6 +368,56 @@ begin
   WriteLn('| ' + PadR(leftCol, 22, ' ') + ' | ' + PadR(rightCol, 30, ' ') + ' |');
 
   WriteLn(separator);
+  WriteLn('');
+end;
+
+(**
+ * SendDiscordReport
+ *
+ * Sends a progress report embed to Discord.
+ *
+ * @param title  The embed title (e.g. 'Hourly Report', 'Script Stopped')
+ *)
+procedure TGECooker.SendDiscordReport(reportTitle: String; embedColor: Int32);
+var
+  RunTime: Int64;
+  XPPerHour, FoodPerHour, EmbedIdx: Int32;
+begin
+  if not Self.UseDiscord then Exit;
+
+  Self.GainedXP := XPBar.Read() - Self.StartXP;
+  RunTime := GetTimeRunning();
+  if RunTime > 0 then
+  begin
+    XPPerHour := Round(Self.GainedXP / (RunTime / 3600000));
+    FoodPerHour := Round(Self.FoodCooked / (RunTime / 3600000));
+  end;
+
+  EmbedIdx := Discord.Webhook.AddEmbed();
+  with Discord.Webhook.Embeds[EmbedIdx] do
+  begin
+    Title := reportTitle;
+    Description :=
+      'Runtime: ' + SRL.MsToTime(RunTime, Time_Short) + LineEnding +
+      'Food Cooked: ' + ToString(Self.FoodCooked) + LineEnding +
+      'Food/Hr: ' + ToString(FoodPerHour) + LineEnding +
+      'XP Gained: ' + ToString(Self.GainedXP) + LineEnding +
+      'XP/Hr: ' + ToString(XPPerHour);
+    Color := embedColor;
+    Footer := SCRIPT_NAME;
+  end;
+
+  Discord.SendScreenshot(True);
+end;
+
+procedure _OnTerminateDiscord();
+begin
+  if CookerBot.UseDiscord then
+  begin
+    Discord.Webhook.Content := ':white_check_mark: **Session Complete**';
+    CookerBot.SendDiscordReport('Session Summary', $00AA00);
+    Discord.Free();
+  end;
 end;
 
 // -----------------------------------------------------------------------------
@@ -525,6 +582,13 @@ begin
   Writeln(' |   |                                           |   | ');
   Writeln(' |___|~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~|___| ');
   Writeln('');
+
+  if Self.UseDiscord then
+  begin
+    Self.DiscordReportTimer.Setup(3600000);
+    Self.DiscordReportTimer.Restart();
+    AddOnTerminate(@_OnTerminateDiscord);
+  end;
 end;
 
 (**
@@ -1585,6 +1649,12 @@ begin
       Self.ReportTimer.Reset();
     end;
 
+    if Self.UseDiscord and Self.DiscordReportTimer.IsFinished() then
+    begin
+      Self.SendDiscordReport('Hourly Report', $0000FF);
+      Self.DiscordReportTimer.Restart();
+    end;
+
     case Self.State of
       EGECookerState.HANDLE_LOGIN:
       begin
@@ -1671,6 +1741,8 @@ begin
           RSInterface.Close();
           Wait(500, 800);
         end;
+        if Self.UseDiscord then
+          Self.SendDiscordReport('Level Up!', $FFA500);
         Chat.HandleLevelUp();
         Wait(1000, 3000);
       end;
@@ -1725,6 +1797,9 @@ type
     FoodLabel: TLabel;
     FoodSelector: TComboBox;
     CheckSettingsCheckbox: TLabeledCheckBox;
+    DiscordWebhookEdit: TLabeledEdit;
+    DiscordEnabledCheckbox: TLabeledCheckBox;
+    DiscordTestButton: TButton;
   end;
 
 var
@@ -1742,6 +1817,8 @@ begin
 
   Config.Put('foodIndex', CookerConfig.FoodSelector.GetItemIndex());
   Config.Put('checkGameSettings', False);
+  Config.Put('discordEnabled', CookerConfig.DiscordEnabledCheckbox.IsChecked());
+  Config.Put('discordWebhook', CookerConfig.DiscordWebhookEdit.GetText());
 end;
 
 (**
@@ -1756,6 +1833,7 @@ begin
 
   if Config.Has('foodIndex') then
     CookerConfig.FoodSelector.SetItemIndex(Config.GetInt('foodIndex'));
+
 end;
 
 (**
@@ -1798,6 +1876,15 @@ begin
     else CookerBot.RawFood := 'Raw ' + LowerCase(FoodName);
   end;
 
+  CookerBot.UseDiscord := Self.DiscordEnabledCheckbox.IsChecked();
+  if CookerBot.UseDiscord then
+  begin
+    Discord.Setup();
+    Discord.SetWebhook(Self.DiscordWebhookEdit.GetText());
+    Discord.SetUsername(SCRIPT_NAME);
+    Discord.SetAvatar('https://raw.githubusercontent.com/orkabyte/orka-scripts/refs/heads/main/orka-ge-cooker/orga-ge-cooker-disc-notification.png');
+  end;
+
   SaveConfig();
   inherited;
 end;
@@ -1807,15 +1894,42 @@ end;
  *
  * Builds and displays the script configuration GUI.
  *)
+procedure TCookerConfig.OpenWebhookHelp(sender: TObject);
+begin
+  sender; // suppress unused warning
+  OpenWebPage('https://support.discord.com/hc/en-us/articles/228383668-Intro-to-Webhooks');
+end;
+
+procedure TCookerConfig.TestDiscordWebhook(sender: TObject);
+var
+  testClient: TDiscordClient;
+begin
+  testClient.Setup();
+  if testClient.SetWebhook(Self.DiscordWebhookEdit.GetText()) then
+  begin
+    testClient.SetUsername(SCRIPT_NAME);
+    testClient.SetAvatar('https://raw.githubusercontent.com/orkabyte/orka-scripts/refs/heads/main/orka-ge-cooker/orga-ge-cooker-disc-notification.png');
+    testClient.Webhook.Content := 'Webhook test successful!';
+    if testClient.Send() then
+      Self.DiscordTestButton.SetCaption('Success!')
+    else
+      Self.DiscordTestButton.SetCaption('Send Failed');
+  end
+  else
+    Self.DiscordTestButton.SetCaption('Invalid URL');
+  testClient.Free();
+end;
+
 procedure TCookerConfig.Run(); override;
 var
-  tab, accountTab: TTabSheet;
+  tab, accountTab, discordTab: TTabSheet;
   Font: TFont;
   Img: TPicture;
   BGImg: TImage;
   item: String;
   limitPanel, vChild: TPanel;
   vLeft: Int32;
+  helpBtn: TButton;
 begin
   Self.Setup('Orka GE Cooker');
   Self.Start.setOnClick(@Self.StartScript);
@@ -1921,6 +2035,55 @@ begin
     end;
     limitPanel.SetHeight(Self.CheckSettingsCheckbox.GetTop() + Self.CheckSettingsCheckbox.GetHeight() + TControl.AdjustToDPI(5));
   end;
+
+  Self.AddTab('Discord');
+  discordTab := Self.Tabs[High(Self.Tabs)];
+
+  with Self.DiscordEnabledCheckbox do
+  begin
+    Create(discordTab);
+    SetLeft(TControl.AdjustToDPI(20));
+    SetTop(TControl.AdjustToDPI(20));
+    SetName('discord_enabled');
+    SetCaption('Enable Discord Notifications');
+    SetWidth(TControl.AdjustToDPI(250));
+  end;
+
+  with Self.DiscordWebhookEdit do
+  begin
+    Create(discordTab);
+    SetLeft(TControl.AdjustToDPI(20));
+    SetTop(Self.DiscordEnabledCheckbox.GetBottom() + TControl.AdjustToDPI(15));
+    SetName('discord_webhook');
+    SetCaption('Webhook URL:');
+    SetWidth(Self.Form.GetWidth() - TControl.AdjustToDPI(60));
+  end;
+
+  with Self.DiscordTestButton do
+  begin
+    Init(discordTab);
+    SetParent(discordTab);
+    SetLeft(TControl.AdjustToDPI(20));
+    SetTop(Self.DiscordWebhookEdit.GetBottom() + TControl.AdjustToDPI(15));
+    SetWidth(TControl.AdjustToDPI(140));
+    SetHeight(TControl.AdjustToDPI(30));
+    SetCaption('Test Webhook');
+    SetOnClick(@Self.TestDiscordWebhook);
+  end;
+
+  helpBtn.Init(discordTab);
+  helpBtn.SetParent(discordTab);
+  helpBtn.SetLeft(Self.DiscordTestButton.GetRight() + TControl.AdjustToDPI(10));
+  helpBtn.SetTop(Self.DiscordTestButton.GetTop());
+  helpBtn.SetWidth(TControl.AdjustToDPI(140));
+  helpBtn.SetHeight(TControl.AdjustToDPI(30));
+  helpBtn.SetCaption('How to Set Up');
+  helpBtn.SetOnClick(@Self.OpenWebhookHelp);
+
+  if Config.Has('discordEnabled') then
+    Self.DiscordEnabledCheckbox.SetChecked(Config.GetBoolean('discordEnabled'));
+  if Config.Has('discordWebhook') then
+    Self.DiscordWebhookEdit.SetText(Config.GetString('discordWebhook'));
 
   inherited;
 end;
