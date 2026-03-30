@@ -1,4 +1,4 @@
-# Orka Campfire
+# Orka GE Log Burner
 
 Train Firemaking 1-99 at the Grand Exchange!
 Burns logs on Forester's Campfires at the Grand Exchange for fast Firemaking XP.
