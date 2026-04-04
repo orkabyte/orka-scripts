@@ -18,7 +18,7 @@
  * ============================================================================
  *)
 
-{$DEFINE SCRIPT_REVISION := '8'}
+{$DEFINE SCRIPT_REVISION := '9'}
 program OrkaGELogBurner;
 {$DEFINE SCRIPT_GUI}
 {$I SRL-T/osr.simba}
@@ -150,6 +150,7 @@ type
 
     // Discord
     UseDiscord: Boolean;
+    AnonymousScreenshots: Boolean;
     DiscordReportTimer: TCountDown;
   end;
 
@@ -388,21 +389,25 @@ begin
     LogsPerHour := Round(Self.LogsBurned / (RunTime / 3600000));
   end;
 
-  EmbedIdx := Discord.Webhook.AddEmbed();
-  with Discord.Webhook.Embeds[EmbedIdx] do
-  begin
-    Title := reportTitle;
-    Description :=
-      'Runtime: ' + SRL.MsToTime(RunTime, Time_Short) + LineEnding +
-      'Logs Burned: ' + ToString(Self.LogsBurned) + LineEnding +
-      'Logs/Hr: ' + ToString(LogsPerHour) + LineEnding +
-      'XP Gained: ' + ToString(Self.GainedXP) + LineEnding +
-      'XP/Hr: ' + ToString(XPPerHour);
-    Color := embedColor;
-    Footer := SCRIPT_NAME;
-  end;
+  try
+    EmbedIdx := Discord.Webhook.AddEmbed();
+    with Discord.Webhook.Embeds[EmbedIdx] do
+    begin
+      Title := reportTitle;
+      Description :=
+        'Runtime: ' + SRL.MsToTime(RunTime, Time_Short) + LineEnding +
+        'Logs Burned: ' + ToString(Self.LogsBurned) + LineEnding +
+        'Logs/Hr: ' + ToString(LogsPerHour) + LineEnding +
+        'XP Gained: ' + ToString(Self.GainedXP) + LineEnding +
+        'XP/Hr: ' + ToString(XPPerHour);
+      Color := embedColor;
+      Footer := SCRIPT_NAME;
+    end;
 
-  Discord.SendScreenshot(True);
+    Discord.SendScreenshot(Self.AnonymousScreenshots);
+  except
+    WriteLn('[Discord] Error sending report: ' + GetExceptionMessage);
+  end;
 end;
 
 procedure _OnTerminateDiscord();
@@ -424,22 +429,27 @@ begin
     LogsPerHour := Round(LogBurnerBot.LogsBurned / (RunTime / 3600000));
   end;
 
-  Discord.Webhook.Content := ':white_check_mark: **Session Complete**';
-  EmbedIdx := Discord.Webhook.AddEmbed();
-  with Discord.Webhook.Embeds[EmbedIdx] do
-  begin
-    Title := 'Session Summary';
-    Description :=
-      'Runtime: ' + SRL.MsToTime(RunTime, Time_Short) + LineEnding +
-      'Logs Burned: ' + ToString(LogBurnerBot.LogsBurned) + LineEnding +
-      'Logs/Hr: ' + ToString(LogsPerHour) + LineEnding +
-      'XP Gained: ' + ToString(LogBurnerBot.GainedXP) + LineEnding +
-      'XP/Hr: ' + ToString(XPPerHour);
-    Color := $00AA00;
-    Footer := SCRIPT_NAME;
+  try
+    Discord.Webhook.Content := ':white_check_mark: **Session Complete**';
+    EmbedIdx := Discord.Webhook.AddEmbed();
+    with Discord.Webhook.Embeds[EmbedIdx] do
+    begin
+      Title := 'Session Summary';
+      Description :=
+        'Runtime: ' + SRL.MsToTime(RunTime, Time_Short) + LineEnding +
+        'Logs Burned: ' + ToString(LogBurnerBot.LogsBurned) + LineEnding +
+        'Logs/Hr: ' + ToString(LogsPerHour) + LineEnding +
+        'XP Gained: ' + ToString(LogBurnerBot.GainedXP) + LineEnding +
+        'XP/Hr: ' + ToString(XPPerHour);
+      Color := $00AA00;
+      Footer := SCRIPT_NAME;
+    end;
+
+    Discord.SendScreenshot(LogBurnerBot.AnonymousScreenshots);
+  except
+    WriteLn('[Discord] Error sending session summary: ' + GetExceptionMessage);
   end;
 
-  Discord.SendScreenshot(True);
   Discord.Free();
 end;
 
@@ -534,6 +544,8 @@ begin
 
   // Setup Map Chunks around GE
   Map.SetupChunk(Chunk([48, 55, 50, 53], 0));
+  Objects.Setup(Map.Objects(), @Map.Walker);
+  NPCs.Setup(Map.NPCs(), @Map.Walker);
 
   // Determine Side based on distance to bank tiles
   MyPos := Map.Position();
@@ -639,37 +651,6 @@ begin
   WriteDebug('AdjustCameraForBanking | Rotating to ' + ToStr(Round(targetAngle)));
   Minimap.SetCompassAngle(targetAngle);
   Wait(300, 600);
-end;
-
-(**
- * FindBank
- *
- * Locates and clicks on the bank booth.
- *
- * @return True if bank was clicked
- *)
-function TGELogBurner.FindBank(): Boolean;
-var
-  BankObj: TRSObjectV2;
-begin
-  WriteDebug('FindBank | Searching for bank near ' + ToStr(Self.BankTile));
-
-  BankObj.SetupEx([1, 1, 6], [Self.BankTile]);
-  BankObj.SetupUpText(['Bank', 'booth']);
-
-  if Self.IsLeftSide then
-    BankObj.Finder.Colors += [CTS2(7112598, 1, 0.01, 0.01)]
-  else
-    BankObj.Finder.Colors += [CTS2(3490121, 1, 0.01, 0.01)];
-
-  BankObj.Walker := @Map.Walker;
-
-  Result := BankObj.WalkClick();
-
-  if Result then
-    WriteDebug('FindBank | Successfully clicked bank')
-  else
-    WriteDebug('FindBank | Failed to click bank');
 end;
 
 (**
@@ -1209,18 +1190,11 @@ begin
 
       EGELogBurnerState.OPEN_BANK:
       begin
-        if Bank.IsOpen() then
+        if not Bank.IsOpen() then
         begin
-          WriteDebug('OPEN_BANK | Bank already open');
-          Wait(500, 1000);
-          Exit;
+          Self.AdjustCameraForBanking();
+          Banks.WalkOpen();
         end;
-
-        Self.AdjustCameraForBanking();
-        if Self.FindBank() then
-          WaitUntil(Bank.IsOpen(), 200, 5000)
-        else
-          Wait(1000, 2000);
       end;
 
       EGELogBurnerState.HANDLE_BANK:
@@ -1340,6 +1314,7 @@ type
     CheckSettingsCheckbox: TLabeledCheckBox;
     DiscordWebhookEdit: TLabeledEdit;
     DiscordEnabledCheckbox: TLabeledCheckBox;
+    DiscordAnonymousCheckbox: TLabeledCheckBox;
     DiscordTestButton: TButton;
   end;
 
@@ -1359,6 +1334,7 @@ begin
   Config.Put('logType', LogBurnerConfig.LogSelector.GetItemIndex());
   Config.Put('checkGameSettings', False);
   Config.Put('discordEnabled', LogBurnerConfig.DiscordEnabledCheckbox.IsChecked());
+  Config.Put('discordAnonymous', LogBurnerConfig.DiscordAnonymousCheckbox.IsChecked());
   Config.Put('discordWebhook', LogBurnerConfig.DiscordWebhookEdit.GetText());
 end;
 
@@ -1399,6 +1375,7 @@ begin
   end;
 
   LogBurnerBot.UseDiscord := Self.DiscordEnabledCheckbox.IsChecked();
+  LogBurnerBot.AnonymousScreenshots := Self.DiscordAnonymousCheckbox.IsChecked();
   if LogBurnerBot.UseDiscord then
   begin
     Discord.Setup();
@@ -1571,6 +1548,21 @@ begin
     SetName('discord_enabled');
     SetCaption('Enable Discord Notifications');
     SetWidth(TControl.AdjustToDPI(250));
+    SetHint('Sends hourly reports, level-ups, and session summaries to a Discord channel via webhook.' + LineEnding + 'To create one: Server Settings > Integrations > Webhooks > New Webhook > Copy URL.');
+    SetShowHint(True);
+  end;
+
+  with Self.DiscordAnonymousCheckbox do
+  begin
+    Create(discordTab);
+    SetLeft(Self.DiscordEnabledCheckbox.GetRight() + TControl.AdjustToDPI(10));
+    SetTop(Self.DiscordEnabledCheckbox.GetTop());
+    SetName('discord_anonymous');
+    SetCaption('Anonymous');
+    SetWidth(TControl.AdjustToDPI(120));
+    SetChecked(True);
+    SetHint('Hides your display name and XP bar in screenshots.' + LineEnding + 'Uncheck to include them. Screenshots are only sent to your webhook, never shared elsewhere.');
+    SetShowHint(True);
   end;
 
   with Self.DiscordWebhookEdit do
@@ -1606,6 +1598,8 @@ begin
 
   if Config.Has('discordEnabled') then
     Self.DiscordEnabledCheckbox.SetChecked(Config.GetBoolean('discordEnabled'));
+  if Config.Has('discordAnonymous') then
+    Self.DiscordAnonymousCheckbox.SetChecked(Config.GetBoolean('discordAnonymous'));
   if Config.Has('discordWebhook') then
     Self.DiscordWebhookEdit.SetText(Config.GetString('discordWebhook'));
 
