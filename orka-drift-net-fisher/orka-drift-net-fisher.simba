@@ -1,0 +1,4510 @@
+(**
+ * ============================================================================
+ * Orka Drift Net Fisher - Credits & Appreciation
+ * ============================================================================
+ *
+ * This script wouldn't exist without the incredible work of the WaspScripts community.
+ *
+ * Special thanks to the admins, moderators, scripters, and testers who
+ * maintain and continuously improve WaspLib, SRL-T, and the entire ecosystem.
+ *
+ * Credits:
+ * Torwent  |  3Garrett3  |  Student  |  BigAussie  |  Flight  |  Kriptic
+ * Fik  |  skunkworks  |  XJ  |  unit  | Sebastiaan  |  n0ll  |  Baconadors
+ *
+ * A huge thank you to everyone in the WaspScripts community who provides
+ * feedback, reports bugs, tests scripts, and helps newcomers learn.
+ *
+ * ============================================================================
+ *)
+{$DEFINE SCRIPT_REVISION := '1'}
+{$DEFINE SCRIPT_GUI}
+program OrkaDriftNetFisher;
+{$I SRL-T/osr.simba}
+{$I WaspLib/osr.simba}
+{$I WaspLib/optional/interfaces/mainscreen/driftnet.simba}
+{$I WaspLib/optional/interfaces/mainscreen/annettesnets.simba}
+{$I WaspLib/optional/handlers/discord.simba}
+
+// =============================================================================
+// CONSTANTS
+// =============================================================================
+const
+  // --- Script identity ---
+  SCRIPT_NAME = 'Orka Drift Net Fisher';
+  VERBOSE_LOGGING = True;
+  DEBUG_SHOALS = False;
+  USE_WEAPON_SPEC = True;
+  HANDLE_LEVEL_UP_CHAT = True;
+  MOUSE_SPEED_MIN = 22;
+  MOUSE_SPEED_MAX = 28;
+
+  // --- Camera ---
+  ZOOM_MIN = 25;
+  ZOOM_MAX = 40;
+
+  // --- Timing ---
+  REPORT_FREQUENCY = 5 * 60000;
+  ACTIVITY_TIMEOUT = 5 * ONE_MINUTE;
+  REPORT_BANNER_WIDTH = 42;
+
+  // --- Chase system ---
+  FISH_CLUSTER_DIST = 4;
+  MIN_CLUSTER_SIZE = 2;
+  MAX_MATCH_DIST = 20;
+  NO_TARGET_SWITCH_MS = 1000;
+  MATCH_STALE_MS = 3000;
+  SHOAL_GRACE_MS = 1500;
+  ADJACENT_DIST = 8;
+  CHASE_RETRIES = 4;
+
+  // --- Chase chat confirmation ---
+  CHAT_POLL_INTERVAL = 150;
+  CHAT_TIMEOUT_ADJACENT = 1000;
+  CHAT_TIMEOUT_DISTANT = 3000;
+  CHAT_MSG_PROD = 'prod at the shoal';
+  CHAT_MSG_CAUGHT = 'caught some fish';
+  CHAT_MSG_STRANGELY = 'look at you strangely';
+  CHAT_MSG_NET_FULL = 'drift nets are full';
+  CHAT_LINE_COUNT = 8;
+
+  // --- Debug overlay colors ---
+  COLOR_GREEN = $00FF00;
+  COLOR_YELLOW = $00FFFF;
+  COLOR_RED = $0000FF;
+
+  // --- Resupply ---
+  NETS_WITHDRAW_MIN = 10;
+  NETS_WITHDRAW_MAX = 15;
+  MAX_RESUPPLY_RETRIES = 2;
+  CLOSE_X_CHANCE = 80;
+
+  // --- Fishing area tiles ---
+  NORTH_FISHING_AREA_TILES: TPointArray = [
+    [23936,9226],[23940,9226],[23944,9226],[23948,9226],
+    [23932,9230],[23936,9230],[23940,9230],[23944,9230],[23948,9230],[23952,9230],
+    [23932,9234],[23936,9234],[23940,9234],[23944,9234],[23948,9234],[23952,9234],[23956,9234],
+    [23932,9238],[23936,9238],[23940,9238],[23944,9238],[23948,9238],[23952,9238],[23956,9238],
+    [23944,9242],[23948,9242],[23952,9242],[23956,9242]
+  ];
+  SOUTH_FISHING_AREA_TILES: TPointArray = [
+    [23912,9254],[23916,9254],[23920,9254],
+    [23912,9258],[23916,9258],[23920,9258],[23924,9258],
+    [23916,9262],[23920,9262],[23924,9262],[23928,9262],
+    [23916,9266],[23920,9266],[23924,9266],[23928,9266],
+    [23916,9270],[23920,9270],[23924,9270],[23928,9270],
+    [23916,9274],[23920,9274],[23924,9274],[23928,9274],
+    [23916,9278],[23920,9278],[23924,9278],[23928,9278]
+  ];
+
+  // --- Area centers and anchors ---
+  NORTH_ANCHORS: TPointArray = [[23943, 9246], [23961, 9246]];
+  SOUTH_ANCHORS: TPointArray = [[23932, 9261], [23932, 9279]];
+  NORTH_CENTER: TPoint = [23944, 9234];
+  SOUTH_CENTER: TPoint = [23924, 9266];
+  MIDDLE_CENTER: TPoint = [23916, 9238];
+
+  // --- Zone detection boxes ---
+  SURFACE_BOX: TBox = [10924, 34802, 11008, 34862];
+  UNDERWATER_ENTRANCE_BOX: TBox = [23864, 9250, 23908, 9318];
+  UNDERWATER_CORRIDOR_BOX: TBox = [23868, 9222, 23904, 9246];
+  UNDERWATER_FISHING_AREA_BOX: TBox = [23908, 9218, 23968, 9282];
+
+  // --- Weapon names ---
+  WEAPON_NAMES: TStringArray = [
+    'Dragon harpoon', 'Merfolk trident',
+    'Trident of the seas', 'Trident of the swamp'
+  ];
+
+// =============================================================================
+// TYPE DEFINITIONS
+// =============================================================================
+type
+  EState = (
+    HANDLE_LOGIN,
+    HANDLE_LEVEL_UP,
+    HANDLE_DRIFT_NET_CATCH,
+    CLOSE_INTERFACE,
+    NAVIGATE_TO_FISHING,
+    CHECK_AREA_NET,
+    HANDLE_FULL_NET,
+    RESUPPLY_NETS,
+    RESUPPLY_NUMULITES,
+    CHASING
+  );
+
+  EArea = (AREA_NORTH, AREA_SOUTH);
+  EChaseState = (CHASE_IDLE, CHASE_WAIT_CHAT);
+  EChaseChatResult = (CHAT_NONE, CHAT_PROD, CHAT_CAUGHT, CHAT_STRANGELY, CHAT_NET_FULL);
+  ENetStatus = (NET_FULL, NET_ACTIVE, NET_MISSING);
+
+  TShoal = record
+    ID: Int32;
+    WalkerCoord: TPoint;
+    ScreenCenter: TPoint;
+    Bounds: TBox;
+    LastSeen: UInt64;
+  end;
+
+  TDriftNetFishingObjects = record
+    SurfaceBankChest: TRSObjectV2;
+    SurfaceRowboat: TRSObjectV2;
+    UnderwaterTunnel: TRSObjectV2;
+    UnderwaterAnchorRope: TRSObjectV2;
+    UnderwaterPlantDoor: TRSObjectV2;
+    Annette: TRSObjectV2;
+    Underwater_DriftNet_North_Anchor: TRSObjectV2;
+    Underwater_DriftNet_South_Anchor: TRSObjectV2;
+    Underwater_DriftNet_North_Full: TRSObjectV2;
+    Underwater_DriftNet_South_Full: TRSObjectV2;
+    Underwater_DriftNet_North_NotFull: TRSObjectV2;
+    Underwater_DriftNet_South_NotFull: TRSObjectV2;
+    Underwater_FishShoal_North: TRSObjectV2;
+    Underwater_FishShoal_South: TRSObjectV2;
+  end;
+
+  TGUI = record(TScriptForm)
+    combo_Weapon: TLabeledCombobox;
+    cb_DisposeFish: TLabeledCheckbox;
+    cb_TakeBreaks, cb_TakeSleeps: TLabeledCheckbox;
+    edit_BreakAfter, edit_BreakFor: TLabeledEdit;
+    edit_SleepAtTime, edit_SleepForHours: TLabeledEdit;
+    edit_ShutdownAfter: TLabeledEdit;
+    cb_RecordCrashes: TLabeledCheckbox;
+    edit_VideoTime: TLabeledEdit;
+    cb_CheckGameSettings: TLabeledCheckbox;
+    DiscordEnabledCheckbox: TLabeledCheckBox;
+    DiscordAnonymousCheckbox: TLabeledCheckBox;
+    DiscordWebhookEdit: TLabeledEdit;
+    DiscordTestButton: TButton;
+  end;
+
+// =============================================================================
+// GLOBAL VARIABLES
+// =============================================================================
+var
+  DriftNetFishingObjects: TDriftNetFishingObjects;
+  GUI: TGUI;
+  Config: TConfigJSON;
+  Discord: TDiscordClient;
+
+  // Chase tracking
+  PreviousShoals: array of TShoal;
+  NextShoalID: Int32;
+  ChasedIDs: TIntegerArray;
+  CurrentArea: EArea;
+  NoTargetSince: UInt64;
+  LastDetectionTick: UInt64;
+  ChaseState: EChaseState;
+  ChaseTargetID: Int32;
+  ChatSnapshot: TStringArray;
+  ChaseClickTick: UInt64;
+  ChaseChatTimeout: UInt64;
+  LastChatPollTick: UInt64;
+  ConsecutiveSwitches: Int32;
+  NetFullSuspected: Boolean;
+  NeedsNetCheck: Boolean;
+  AreaRedone: Boolean;
+  NorthNetChecked: Boolean;
+  SouthNetChecked: Boolean;
+  LastLoopState: EState;
+  LastFullStateCheck: UInt64;
+  DetectedWeaponName: String;
+
+  // XP tracking
+  StartXP, GainedXP: Int32;
+  GainedFishingXP, GainedHunterXP: Int32;
+  FishingLevel, HunterLevel: Int32;
+  FishingXPRatio, HunterXPRatio: Double;
+  LevelsCached: Boolean;
+
+  // Activity tracking
+  TotalNetsHarvested: Int32;
+
+  // Fish handling
+  DisposeFish, BankFish: Boolean;
+
+  // Break/sleep config
+  TakeBreaks, TakeSleeps: Boolean;
+  BreakAfter, BreakFor: Int32;
+  SleepAtTime: String;
+  SleepForHours: Int32;
+
+  // Break/sleep tracking
+  ShutdownTime: Int64;
+  TotalBreakTime, LastBreakStartTime, LastBreakEndTime: Int64;
+  TotalSleepTime, LastSleepStartTime, LastSleepEndTime: Int64;
+
+  // Settings check
+  CheckGameSettings: Boolean;
+
+  // Discord
+  UseDiscord: Boolean;
+  AnonymousScreenshots: Boolean;
+  DiscordReportTimer: TCountDown;
+
+  // Timers
+  ReportTimer: TStopwatch;
+  LastSpecCheck: UInt64;
+  ResupplyFailCount: Int32;
+
+// =============================================================================
+// HELPER FUNCTIONS
+// =============================================================================
+
+(** Checks the active RuneLite profile for GPU plugin and auto-disables it. *)
+procedure DisableGPUPlugin();
+var
+  profilesDir, content, profileName, profileId: String;
+  json, profile: TJSONObject;
+  profiles: TJSONArray;
+  foundFiles: TStringArray;
+  fileName, propsPath, propsContent, output: String;
+  i: Int32;
+begin
+  profilesDir := GetEnvironmentVariable('USERPROFILE') + '\.runelite\profiles2';
+  if not FileExists(profilesDir + '\profiles.json') then Exit;
+
+  content := ReadFileContents(profilesDir + '\profiles.json');
+  if content = '' then Exit;
+
+  json.Init(content.Trim());
+  try
+    profiles := json.getJSONArray('profiles');
+    for i := 0 to profiles.High() do
+    begin
+      profile := profiles.getJSONObject(i);
+      if profile.has('active') and profile.getBoolean('active') then
+      begin
+        profileName := profile.getString('name');
+        profileId := ToString(Trunc(profile.getDouble('id')));
+        Break;
+      end;
+    end;
+  finally
+    json.Free();
+  end;
+
+  if (profileName = '') or (profileId = '') then Exit;
+
+  foundFiles := FindFiles(profilesDir, False);
+
+  for fileName in foundFiles do
+    if ExtractFileName(fileName) = (profileName + '-' + profileId + '.properties') then
+    begin
+      propsPath := fileName;
+      Break;
+    end;
+
+  if propsPath = '' then
+    for fileName in foundFiles do
+      if ExtractFileName(fileName).StartsWith(profileName) and ExtractFileName(fileName).EndsWith('.properties') then
+      begin
+        propsPath := fileName;
+        Break;
+      end;
+
+  if propsPath = '' then Exit;
+
+  propsContent := ReadFileContents(propsPath);
+  if Pos('runelite.gpuplugin=true', propsContent) = 0 then Exit;
+
+  propsContent := Replace(propsContent, 'runelite.gpuplugin=true', 'runelite.gpuplugin=false', [rfReplaceAll]);
+  if WriteFileContents(propsPath, propsContent, False) then
+  begin
+    WriteLn('GPU Plugin was enabled in profile "' + profileName + '" - disabled automatically.');
+    RunCommand('cmd', ['/c', 'taskkill /f /im RuneLite.exe'], output);
+    WriteLn('RuneLite closed. Please restart RuneLite and the script.');
+    TerminateScript();
+  end;
+end;
+
+(**
+ * WriteLog
+ *
+ * Always-visible log messages for important operations, errors, warnings.
+ *
+ * @param msg  Message to log
+ *)
+procedure WriteLog(msg: String);
+begin
+  WriteLn(SRL.TimeStamp(), ':[', SCRIPT_NAME, ']: ', msg);
+end;
+
+(**
+ * WriteDebug
+ *
+ * Verbose debug messages only shown when VERBOSE_LOGGING is True.
+ *
+ * @param msg  Message to log
+ *)
+procedure WriteDebug(msg: String);
+begin
+  if VERBOSE_LOGGING then
+    WriteLn(SRL.TimeStamp(), ':[', SCRIPT_NAME, ']: [DEBUG] ', msg);
+end;
+
+(**
+ * FormatNumber
+ *
+ * Formats an integer with thousand separators (e.g., 125000 -> "125,000").
+ *
+ * @param n  The number to format
+ * @return   Formatted string with commas as thousand separators
+ *)
+function FormatNumber(n: Int64): String;
+var
+  s: String;
+  i, count: Int32;
+begin
+  s := IntToStr(Abs(n));
+  Result := '';
+  count := 0;
+  for i := Length(s) downto 1 do
+  begin
+    if (count > 0) and (count mod 3 = 0) then
+      Result := ',' + Result;
+    Result := s[i] + Result;
+    Inc(count);
+  end;
+  if n < 0 then
+    Result := '-' + Result;
+end;
+
+// =============================================================================
+// MAP & OBJECT SETUP
+// =============================================================================
+
+(**
+ * SetupMapAndWalker
+ *
+ * Configures map chunks for Fossil Island surface and underwater areas.
+ *)
+procedure SetupMapAndWalker();
+begin
+  Map.SetupChunks([
+    Chunk([57,61,59,59], 0),
+    Chunk([57,161,59,159], 1)
+  ]);
+  Map.Walker.WebGraph^.DeleteNodes([23936, 9242, 23952, 9266]);
+  Map.Walker.WebGraph^.DeleteNodes([23928, 9246, 23936, 9254]);
+end;
+
+(**
+ * SetupObjects
+ *
+ * Configures all TRSObjectV2 instances with positions, colors, and UpText.
+ *)
+procedure SetupObjects();
+begin
+  with DriftNetFishingObjects.SurfaceBankChest do
+  begin
+    SetupEx([0.7, 1, 5], [[10972, 34834]]);
+    SetupUpText(['Bank', 'chest']);
+    Finder.Colors += [
+      CTS2(1776416, 1, 0.01, 0.01),
+      CTS2(5533565, 3, 0.24, 1.61)
+    ];
+    Finder.Erode := 2;
+    Finder.Grow := 3;
+    TrackTarget := True;
+    Walker := @Map.Walker;
+  end;
+
+  with DriftNetFishingObjects.SurfaceRowboat do
+  begin
+    SetupEx([1.5, 3.5, 4], [[10949, 34834]]);
+    SetupUpText(['Rowboat']);
+    Finder.Colors += [CTS2(5004135, 10, 0.18, 0.26)];
+    Finder.Erode := 5;
+    Finder.Grow := 3;
+    TrackTarget := True;
+    Walker := @Map.Walker;
+  end;
+
+  with DriftNetFishingObjects.UnderwaterAnchorRope do
+  begin
+    SetupEx([1, 1, 4], [[23884, 9302]]);
+    SetupUpText(['Climb', 'Anchor', 'Rope']);
+    Finder.Colors += [CTS2(7040095, 9, 0.42, 0.37)];
+    Finder.Erode := 1;
+    Finder.Grow := 2;
+    TrackTarget := True;
+    Walker := @Map.Walker;
+  end;
+
+  with DriftNetFishingObjects.UnderwaterTunnel do
+  begin
+    SetupEx([1.5, 1, 6], [[23876, 9250]]);
+    SetupUpText(['Enter', 'Tunnel']);
+    Finder.Colors += [CTS2(6381908, 3, 0.55, 0.59)];
+    Finder.Erode := 3;
+    Finder.Grow := 4;
+    TrackTarget := True;
+    Walker := @Map.Walker;
+  end;
+
+  with DriftNetFishingObjects.UnderwaterPlantDoor do
+  begin
+    SetupEx([0.5, 1.4, 7], [[23905, 9234]]);
+    SetupUpText(['Navigate', 'Plant', 'door']);
+    Finder.Colors += [CTS2(8356699, 5, 0.08, 0.78)];
+    Finder.Erode := 2;
+    Finder.Grow := 2;
+    TrackTarget := True;
+    Walker := @Map.Walker;
+  end;
+
+  with DriftNetFishingObjects.Annette do
+  begin
+    SetupEx([0.5, 0.5, 3.5], [[23912, 9226]]);
+    Offset := Vec3(0, 0, 4);
+    SetupUpText(['Annette']);
+    Finder.Colors += [
+      CTS2(10525577, 6, 0.55, 0.27),
+      CTS2(8288094, 10, 0.17, 0.13)
+    ];
+    Finder.Erode := 3;
+    Finder.Grow := 3;
+    TrackTarget := True;
+    Walker := @Map.Walker;
+  end;
+
+  with DriftNetFishingObjects.Underwater_DriftNet_North_Anchor do
+  begin
+    SetupEx([0.5, 0.5, 6], [[23943, 9246],[23961, 9246]]);
+    SetupUpText(['Set up', 'anchors']);
+    Finder.Colors += [CTS2(7235933, 7, 0.11, 0.35)];
+    Finder.Erode := 1;
+    Finder.Grow := 2;
+    TrackTarget := True;
+    Walker := @Map.Walker;
+  end;
+
+  with DriftNetFishingObjects.Underwater_DriftNet_South_Anchor do
+  begin
+    SetupEx([0.5, 0.5, 8], [[23932, 9261],[23932, 9279]]);
+    SetupUpText(['Set up', 'anchors']);
+    Finder.Colors += [CTS2(7235933, 7, 0.11, 0.35)];
+    Finder.Erode := 1;
+    Finder.Grow := 2;
+    TrackTarget := True;
+    Walker := @Map.Walker;
+  end;
+
+  with DriftNetFishingObjects.Underwater_DriftNet_North_Full do
+  begin
+    SetupEx([1.5, 1, 5], [[23952, 9247]]);
+    SetupUpText(['full']);
+    Finder.Colors += [
+      CTS2(6974303, 5, 0.81, 0.40),
+      CTS2(6512982, 8, 0.34, 0.44)
+    ];
+    Finder.Erode := 3;
+    Finder.Grow := 2;
+    Finder.MinShortSide := 30;
+    TrackTarget := True;
+    Walker := @Map.Walker;
+  end;
+
+  with DriftNetFishingObjects.Underwater_DriftNet_South_Full do
+  begin
+    SetupEx([1.5, 1.5, 7], [[23933, 9270]]);
+    SetupUpText(['full']);
+    Finder.Colors += [CTS2(6316113, 7, 0.60, 0.52)];
+    Finder.Erode := 3;
+    Finder.Grow := 2;
+    Finder.MinShortSide := 30;
+    TrackTarget := True;
+    Walker := @Map.Walker;
+  end;
+
+  with DriftNetFishingObjects.Underwater_DriftNet_North_NotFull do
+  begin
+    SetupEx([1.5, 0.5, 5], [[23952, 9246]]);
+    SetupUpText(['Harvest']);
+    Finder.Colors += [
+      CTS2(6119251, 2, 0.79, 0.54),
+      CTS2(7106148, 3, 1.89, 0.37)
+    ];
+    Finder.Erode := 3;
+    Finder.Grow := 2;
+    TrackTarget := True;
+    Walker := @Map.Walker;
+  end;
+
+  with DriftNetFishingObjects.Underwater_DriftNet_South_NotFull do
+  begin
+    SetupEx([0.5, 1.5, 5], [[23932, 9270]]);
+    SetupUpText(['Harvest']);
+    Finder.Colors += [
+      CTS2(6777439, 3, 0.65, 0.33),
+      CTS2(6316116, 2, 2.37, 0.74)
+    ];
+    Finder.Erode := 3;
+    Finder.Grow := 2;
+    TrackTarget := True;
+    Walker := @Map.Walker;
+  end;
+
+  with DriftNetFishingObjects.Underwater_FishShoal_North do
+  begin
+    SetupEx([1, 1, 3], NORTH_FISHING_AREA_TILES);
+    SetupUpText(['Fish', 'shoal']);
+    Finder.Colors += [
+      CTS2(5663611, 4, 0.29, 0.86),
+      CTS2(12367785, 1, 0.25, 0.73),
+      CTS2(7445874, 1, 0.01, 0.01),
+      CTS2(12034463, 3, 1.38, 0.34)
+    ];
+    Finder.Erode := 1;
+    Finder.Grow := 5;
+    TrackTarget := True;
+    Walker := @Map.Walker;
+  end;
+
+  with DriftNetFishingObjects.Underwater_FishShoal_South do
+  begin
+    SetupEx([1, 1, 3], SOUTH_FISHING_AREA_TILES);
+    SetupUpText(['Fish', 'shoal']);
+    Finder.Colors += [
+      CTS2(5663611, 4, 0.29, 0.86),
+      CTS2(12367785, 1, 0.25, 0.73),
+      CTS2(7445874, 1, 0.01, 0.01),
+      CTS2(12034463, 3, 1.38, 0.34)
+    ];
+    Finder.Erode := 1;
+    Finder.Grow := 5;
+    TrackTarget := True;
+    Walker := @Map.Walker;
+  end;
+end;
+
+// =============================================================================
+// ZONE CHECK FUNCTIONS
+// =============================================================================
+
+function IsOnSurface(): Boolean;
+begin
+  Result := Map.Position().InBox(SURFACE_BOX);
+end;
+
+function IsInUnderwaterEntrance(): Boolean;
+begin
+  Result := Map.Position().InBox(UNDERWATER_ENTRANCE_BOX);
+end;
+
+function IsInUnderwaterCorridor(): Boolean;
+begin
+  Result := Map.Position().InBox(UNDERWATER_CORRIDOR_BOX);
+end;
+
+function IsInFishingArea(): Boolean;
+begin
+  Result := Map.Position().InBox(UNDERWATER_FISHING_AREA_BOX);
+end;
+
+// =============================================================================
+// TRACKING & DETECTION FUNCTIONS
+// =============================================================================
+
+(**
+ * PointInArea
+ *
+ * Checks whether a point falls within 4 units of any tile in the given area.
+ *
+ * @param p     The point to check
+ * @param area  Array of tile coordinates defining the area
+ * @return      True if the point is within tolerance of any tile
+ *)
+function PointInArea(p: TPoint; area: TPointArray): Boolean;
+var
+  i: Int32;
+begin
+  for i := 0 to High(area) do
+    if p.DistanceTo(area[i]) <= 4 then
+      Exit(True);
+  Result := False;
+end;
+
+(**
+ * InitTracking
+ *
+ * Initializes all tracking state for the chase system.
+ *)
+procedure InitTracking();
+begin
+  NextShoalID := 1;
+  PreviousShoals := [];
+  ChasedIDs := [];
+  CurrentArea := AREA_SOUTH;
+  NoTargetSince := 0;
+  LastDetectionTick := 0;
+  ChaseState := CHASE_IDLE;
+  ChaseTargetID := -1;
+  ChatSnapshot := [];
+  ChaseClickTick := 0;
+  ChaseChatTimeout := 0;
+  LastChatPollTick := 0;
+  ConsecutiveSwitches := 0;
+  NetFullSuspected := False;
+  LastSpecCheck := 0;
+end;
+
+(**
+ * CheckAndUseSpec
+ *
+ * Uses Dragon Harpoon special attack for +3 Fishing boost if available.
+ * Throttled to ~5m intervals matching the spec regeneration timer.
+ *)
+procedure CheckAndUseSpec();
+begin
+  if not USE_WEAPON_SPEC then Exit;
+  if DetectedWeaponName <> 'Dragon harpoon' then Exit;
+  if GetTickCount() - LastSpecCheck < SRL.NormalRange(310000, 330000) then Exit;
+  LastSpecCheck := GetTickCount();
+
+  if Minimap.EnableSpec(100) then
+    WriteDebug('Spec | Used Dragon Harpoon special attack (+3 Fishing)');
+end;
+
+(**
+ * MatchShoals
+ *
+ * Assigns persistent IDs to detected shoals using nearest-neighbor matching.
+ * Unmatched previous shoals within SHOAL_GRACE_MS are carried forward in
+ * PreviousShoals so they can be re-matched if detection resumes. ChasedIDs
+ * are only purged when the grace period expires.
+ *
+ * @param currentShoals  Array of shoals detected this frame (IDs will be set)
+ *)
+procedure MatchShoals(var currentShoals: array of TShoal);
+var
+  claimed: array of Boolean;
+  matched: array of Boolean;
+  i, j, bestIdx, idx: Int32;
+  dist, bestDist: Double;
+  now: UInt64;
+begin
+  SetLength(claimed, Length(PreviousShoals));
+  SetLength(matched, Length(currentShoals));
+  now := GetTickCount();
+
+  for i := 0 to High(currentShoals) do
+  begin
+    bestIdx := -1;
+    bestDist := MAX_MATCH_DIST + 1;
+
+    for j := 0 to High(PreviousShoals) do
+    begin
+      if claimed[j] then
+        Continue;
+
+      dist := currentShoals[i].WalkerCoord.DistanceTo(PreviousShoals[j].WalkerCoord);
+      if dist < bestDist then
+      begin
+        bestDist := dist;
+        bestIdx := j;
+      end;
+    end;
+
+    if bestIdx >= 0 then
+    begin
+      currentShoals[i].ID := PreviousShoals[bestIdx].ID;
+      claimed[bestIdx] := True;
+      matched[i] := True;
+
+      currentShoals[i].WalkerCoord.X := (currentShoals[i].WalkerCoord.X + PreviousShoals[bestIdx].WalkerCoord.X) div 2;
+      currentShoals[i].WalkerCoord.Y := (currentShoals[i].WalkerCoord.Y + PreviousShoals[bestIdx].WalkerCoord.Y) div 2;
+    end;
+  end;
+
+  // Handle unmatched previous shoals
+  for j := 0 to High(PreviousShoals) do
+  begin
+    if claimed[j] then
+      Continue;
+
+    if now - PreviousShoals[j].LastSeen > SHOAL_GRACE_MS then
+    begin
+      // Grace expired: purge from ChasedIDs
+      idx := ChasedIDs.Find(PreviousShoals[j].ID);
+      if idx >= 0 then
+        Delete(ChasedIDs, idx, 1);
+    end;
+  end;
+
+  // Assign new IDs to unmatched current shoals
+  for i := 0 to High(currentShoals) do
+  begin
+    if matched[i] then
+      Continue;
+
+    currentShoals[i].ID := NextShoalID;
+    Inc(NextShoalID);
+  end;
+
+  // Set LastSeen on all detected shoals
+  for i := 0 to High(currentShoals) do
+    currentShoals[i].LastSeen := now;
+end;
+
+(**
+ * DetectShoals
+ *
+ * Detects fish shoals using TRSObjectV2 finders for both areas.
+ * After matching, merges grace-period survivors into PreviousShoals
+ * so that briefly-invisible shoals retain their IDs on reappearance.
+ *
+ * @param outShoals  Output array of detected and tracked shoals
+ * @return           True if at least one shoal was detected
+ *)
+function DetectShoals(out outShoals: array of TShoal): Boolean;
+var
+  atpa, atpa2: T2DPointArray;
+  allPoints, cleaned: TPointArray;
+  clusters: T2DPointArray;
+  shoal: TShoal;
+  oldPrevious: array of TShoal;
+  i, j: Int32;
+  cachedPos: TPoint;
+  wasClaimed: Boolean;
+  now: UInt64;
+begin
+  Result := False;
+  outShoals := [];
+
+  if (LastDetectionTick > 0) and (GetTickCount() - LastDetectionTick > MATCH_STALE_MS) then
+  begin
+    PreviousShoals := [];
+    LastDetectionTick := 0;
+  end;
+
+  if DriftNetFishingObjects.Underwater_FishShoal_North.Find(atpa) then
+    for i := 0 to High(atpa) do
+      allPoints := allPoints.Combine(atpa[i]);
+
+  if DriftNetFishingObjects.Underwater_FishShoal_South.Find(atpa2) then
+    for i := 0 to High(atpa2) do
+      allPoints := allPoints.Combine(atpa2[i]);
+
+  if Length(allPoints) = 0 then
+    Exit;
+
+  clusters := allPoints.Cluster(FISH_CLUSTER_DIST);
+  cachedPos := Map.Position();
+
+  for i := 0 to High(clusters) do
+  begin
+    cleaned := clusters[i].ShapeFill().Erode(2);
+    if Length(cleaned) < MIN_CLUSTER_SIZE then
+      Continue;
+
+    shoal.ScreenCenter := cleaned.Mean();
+    shoal.WalkerCoord := Map.MS2Map(cachedPos, shoal.ScreenCenter);
+    shoal.Bounds := cleaned.Bounds().Expand(15);
+    shoal.ID := 0;
+    shoal.LastSeen := 0;
+    SetLength(outShoals, Length(outShoals) + 1);
+    outShoals[High(outShoals)] := shoal;
+  end;
+
+  if Length(outShoals) = 0 then
+    Exit;
+
+  // Save old state before matching overwrites IDs
+  oldPrevious := Copy(PreviousShoals);
+
+  MatchShoals(outShoals);
+
+  // Build PreviousShoals: detected shoals + grace-period survivors
+  PreviousShoals := Copy(outShoals);
+  now := GetTickCount();
+
+  for j := 0 to High(oldPrevious) do
+  begin
+    // Check if this old shoal was matched to a current detection
+    wasClaimed := False;
+    for i := 0 to High(outShoals) do
+    begin
+      if outShoals[i].ID = oldPrevious[j].ID then
+      begin
+        wasClaimed := True;
+        Break;
+      end;
+    end;
+
+    if wasClaimed then
+      Continue;
+
+    // Keep ghost shoals within grace period for future matching
+    if now - oldPrevious[j].LastSeen <= SHOAL_GRACE_MS then
+    begin
+      SetLength(PreviousShoals, Length(PreviousShoals) + 1);
+      PreviousShoals[High(PreviousShoals)] := oldPrevious[j];
+    end;
+  end;
+
+  LastDetectionTick := GetTickCount();
+  Result := True;
+end;
+
+(**
+ * ShoalInCurrentArea
+ *
+ * Checks whether a shoal's walker coordinate falls within the current area.
+ *)
+function ShoalInCurrentArea(s: TShoal): Boolean;
+begin
+  if CurrentArea = AREA_NORTH then
+    Result := PointInArea(s.WalkerCoord, NORTH_FISHING_AREA_TILES)
+  else
+    Result := PointInArea(s.WalkerCoord, SOUTH_FISHING_AREA_TILES);
+end;
+
+(**
+ * GetAnchorsForArea
+ *
+ * Returns the drift net anchor positions for the specified area.
+ *)
+function GetAnchorsForArea(area: EArea): TPointArray;
+begin
+  if area = AREA_NORTH then
+    Result := NORTH_ANCHORS
+  else
+    Result := SOUTH_ANCHORS;
+end;
+
+(**
+ * DistanceToNearestAnchor
+ *
+ * Calculates minimum distance from a point to any anchor in the current area.
+ *)
+function DistanceToNearestAnchor(p: TPoint): Double;
+var
+  anchors: TPointArray;
+  i: Int32;
+  d: Double;
+begin
+  anchors := GetAnchorsForArea(CurrentArea);
+  Result := 999999.0;
+  for i := 0 to High(anchors) do
+  begin
+    d := p.DistanceTo(anchors[i]);
+    if d < Result then
+      Result := d;
+  end;
+end;
+
+(**
+ * SelectTarget
+ *
+ * Selects the best chase target from detected shoals. Filters by area and
+ * already-chased status, picks closest to a drift net anchor.
+ *)
+function SelectTarget(shoals: array of TShoal; out outTarget: TShoal): Boolean;
+var
+  i, bestIdx: Int32;
+  bestDist, dist: Double;
+begin
+  Result := False;
+  bestIdx := -1;
+  bestDist := 999999.0;
+
+  for i := 0 to High(shoals) do
+  begin
+    if not ShoalInCurrentArea(shoals[i]) then
+      Continue;
+    if ChasedIDs.Find(shoals[i].ID) >= 0 then
+      Continue;
+
+    dist := DistanceToNearestAnchor(shoals[i].WalkerCoord);
+    if dist < bestDist then
+    begin
+      bestDist := dist;
+      bestIdx := i;
+    end;
+  end;
+
+  if bestIdx >= 0 then
+  begin
+    outTarget := shoals[bestIdx];
+    Result := True;
+  end;
+end;
+
+(**
+ * RecordChase
+ *
+ * Records a shoal as chased by adding its ID to the ChasedIDs list.
+ *)
+procedure RecordChase(id: Int32);
+begin
+  SetLength(ChasedIDs, Length(ChasedIDs) + 1);
+  ChasedIDs[High(ChasedIDs)] := id;
+  WriteDebug('Chase | Chased shoal ID ' + ToStr(id) + ' (total: ' + ToStr(Length(ChasedIDs)) + ')');
+end;
+
+(**
+ * HasShoalsInArea
+ *
+ * Checks if any detected shoal falls within the current area, ignoring ChasedIDs.
+ * Used to decide whether to redo the current area before switching.
+ *)
+function HasShoalsInArea(shoals: array of TShoal): Boolean;
+var
+  i: Int32;
+begin
+  for i := 0 to High(shoals) do
+    if ShoalInCurrentArea(shoals[i]) then
+      Exit(True);
+  Result := False;
+end;
+
+(**
+ * SwitchArea
+ *
+ * Switches between north and south fishing areas and resets chase tracking.
+ *)
+procedure SwitchArea();
+begin
+  if CurrentArea = AREA_NORTH then
+    CurrentArea := AREA_SOUTH
+  else
+    CurrentArea := AREA_NORTH;
+
+  if CurrentArea = AREA_NORTH then
+  begin
+    if not NorthNetChecked then NeedsNetCheck := True;
+  end
+  else
+  begin
+    if not SouthNetChecked then NeedsNetCheck := True;
+  end;
+
+  NoTargetSince := 0;
+  PreviousShoals := [];
+  LastDetectionTick := 0;
+  ChasedIDs := [];
+  NextShoalID := 1;
+  AreaRedone := False;
+  WriteDebug('Chase | Switching to ' + ToStr(CurrentArea));
+end;
+
+(**
+ * DrawShoals
+ *
+ * Draws debug overlay for detected shoals with color coding.
+ *)
+procedure DrawShoals(shoals: array of TShoal);
+var
+  i: Int32;
+  boxColor: Int32;
+  bounds: TBox;
+begin
+  RSClient.Image.SetFontSize(16);
+  RSClient.Image.SetFontAntialiasing(True);
+
+  for i := 0 to High(shoals) do
+  begin
+    if ChasedIDs.Find(shoals[i].ID) >= 0 then
+      boxColor := COLOR_RED
+    else if ShoalInCurrentArea(shoals[i]) then
+      boxColor := COLOR_GREEN
+    else
+      boxColor := COLOR_YELLOW;
+
+    bounds := shoals[i].Bounds;
+    RSClient.Image.DrawBox(bounds, boxColor);
+    RSClient.Image.DrawText(
+      ToStr(shoals[i].ID),
+      [bounds.X1 + (bounds.Width() div 2) - 5, bounds.Y1 + (bounds.Height() div 2) - 8],
+      boxColor
+    );
+  end;
+end;
+
+(**
+ * QuickNetFullCheck
+ *
+ * Checks whether a full drift net is visible in the current area using
+ * Find() + UpText verification. Called during CHASE_IDLE.
+ *
+ * @return True if a confirmed full net is detected in the current area
+ *)
+function QuickNetFullCheck(): Boolean;
+var
+  atpa: T2DPointArray;
+  found: Boolean;
+begin
+  Result := False;
+
+  if CurrentArea = AREA_NORTH then
+    found := DriftNetFishingObjects.Underwater_DriftNet_North_Full.Find(atpa)
+  else
+    found := DriftNetFishingObjects.Underwater_DriftNet_South_Full.Find(atpa);
+
+  Result := found;
+
+  if Result then
+    WriteDebug('Net | QuickNetFullCheck: Full net detected in ' + ToStr(CurrentArea));
+end;
+
+function SetNetOnAnchor(area: EArea): Boolean; forward;
+function CheckAndHandleFullNet(): Boolean; forward;
+function DepositNotedNetsToAnnette(): Boolean; forward;
+
+(**
+ * DetectNetStatus
+ *
+ * Detects the current state of the drift net in the specified area by
+ * checking for full and not-full net objects.
+ *
+ * @param area  The area to check
+ * @return      NET_FULL, NET_ACTIVE, or NET_MISSING
+ *)
+function DetectNetStatus(area: EArea): ENetStatus;
+var
+  atpa: T2DPointArray;
+  fullNet, notFullNet: TRSObjectV2;
+begin
+  if area = AREA_NORTH then
+  begin
+    fullNet := DriftNetFishingObjects.Underwater_DriftNet_North_Full;
+    notFullNet := DriftNetFishingObjects.Underwater_DriftNet_North_NotFull;
+  end
+  else
+  begin
+    fullNet := DriftNetFishingObjects.Underwater_DriftNet_South_Full;
+    notFullNet := DriftNetFishingObjects.Underwater_DriftNet_South_NotFull;
+  end;
+
+  if fullNet.Find(atpa) then
+  begin
+    WriteDebug('NetCheck | Full net detected in ' + ToStr(area));
+    Result := NET_FULL;
+  end
+  else if notFullNet.Find(atpa) then
+  begin
+    WriteDebug('NetCheck | Active net detected in ' + ToStr(area));
+    Result := NET_ACTIVE;
+  end
+  else
+  begin
+    WriteDebug('NetCheck | No net detected in ' + ToStr(area));
+    Result := NET_MISSING;
+  end;
+end;
+
+(**
+ * HandleNetOnArrival
+ *
+ * Walks to the area center, detects net status, and takes the appropriate
+ * action: harvest full net, skip active net, or set a new net if missing.
+ *
+ * @param area  The area to check and handle
+ *)
+procedure HandleNetOnArrival(area: EArea);
+var
+  center: TPoint;
+  status: ENetStatus;
+begin
+  if area = AREA_NORTH then
+    center := NORTH_CENTER
+  else
+    center := SOUTH_CENTER;
+
+  WriteLog('NetCheck | Walking to ' + ToStr(area) + ' center for net check');
+  Map.Walker.WebWalk(center, 4);
+  Wait(500, 800);
+
+  status := DetectNetStatus(area);
+
+  case status of
+    NET_FULL:
+    begin
+      WriteLog('NetCheck | Full net in ' + ToStr(area) + ', harvesting');
+      CurrentArea := area;
+      CheckAndHandleFullNet();
+    end;
+
+    NET_ACTIVE:
+      WriteLog('NetCheck | Net already active in ' + ToStr(area) + ', skipping');
+
+    NET_MISSING:
+    begin
+      if Inventory.ContainsItem('Drift net') then
+      begin
+        WriteLog('NetCheck | No net in ' + ToStr(area) + ', setting one');
+        SetNetOnAnchor(area);
+      end
+      else
+        WriteLog('NetCheck | No net in ' + ToStr(area) + ' but no drift nets in inventory');
+    end;
+  end;
+end;
+
+// =============================================================================
+// NET MANAGEMENT FUNCTIONS
+// =============================================================================
+
+(**
+ * WithdrawNetsFromAnnette
+ *
+ * Opens Annette's nets interface and withdraws drift nets.
+ *
+ * @param amount  Number of drift nets to withdraw
+ * @return        True if nets were successfully withdrawn
+ *)
+function WithdrawNetsFromAnnette(amount: Int32): Boolean;
+var
+  countBefore, attempt: Int32;
+  hasNets: Boolean;
+begin
+  Result := False;
+
+  countBefore := Inventory.CountItem('Drift net');
+  WriteDebug('Annette | Current drift nets: ' + ToStr(countBefore));
+
+  WriteDebug('Annette | Opening nets interface');
+  for attempt := 1 to 3 do
+  begin
+    if DriftNetFishingObjects.Annette.WalkSelectOption(['Nets']) then
+      Break;
+    WriteDebug('Annette | Failed to select Nets option (attempt ' + ToStr(attempt) + '/3)');
+    if attempt = 3 then Exit;
+    Wait(800, 2000);
+  end;
+
+  if not AnnettesNets.IsOpen(5000) then
+  begin
+    WriteDebug('Annette | Interface did not open');
+    Exit;
+  end;
+
+  hasNets := False;
+  for attempt := 1 to 3 do
+  begin
+    if AnnettesNets.Items.CountStack(0) > 0 then
+    begin
+      hasNets := True;
+      Break;
+    end;
+    WriteDebug('Annette | CountStack returned 0 (attempt ' + ToStr(attempt) + '/3)');
+    if attempt = 3 then Break;
+    Wait(800, 2000);
+  end;
+
+  if not hasNets then
+  begin
+    WriteDebug('Annette | No nets stored after 3 checks');
+    if AnnettesNets.IsOpen() then
+    begin
+      Mouse.Click(AnnettesNets.CloseButtonBounds, MOUSE_LEFT);
+      WaitUntil(not AnnettesNets.IsOpen(), 100, 3000);
+    end;
+    Exit;
+  end;
+
+  if amount = 5 then
+  begin
+    WriteDebug('Annette | Withdrawing 5 nets');
+    AnnettesNets.Items.InteractSlot(0, 'Withdraw-5');
+  end
+  else
+  begin
+    WriteDebug('Annette | Withdrawing ' + ToStr(amount) + ' nets via Withdraw-X');
+    AnnettesNets.Items.InteractSlot(0, 'Withdraw-X');
+    Wait(1000, 1500);
+    Keyboard.Send(ToStr(amount), VK_ENTER);
+  end;
+
+  Wait(1000, 1500);
+
+  if AnnettesNets.IsOpen() then
+  begin
+    Mouse.Click(AnnettesNets.CloseButtonBounds, MOUSE_LEFT);
+    WaitUntil(not AnnettesNets.IsOpen(), 100, 3000);
+  end;
+
+  Wait(300, 500);
+
+  if Inventory.CountItem('Drift net') > countBefore then
+  begin
+    WriteLog('Annette | Withdrew nets (now have ' + ToStr(Inventory.CountItem('Drift net')) + ')');
+    Result := True;
+  end
+  else
+    WriteDebug('Annette | Withdrawal failed (count unchanged)');
+end;
+
+(**
+ * UnequipWeapon
+ *
+ * Unequips the detected weapon for tunnel passage. Drops a drift net if
+ * inventory is full to make room.
+ *)
+function UnequipWeapon(): Boolean;
+var
+  slot: Int32;
+begin
+  if DetectedWeaponName = '' then
+    Exit(True);
+
+  if not Equipment.ContainsItem(DetectedWeaponName) then
+  begin
+    WriteDebug('Weapon | "' + DetectedWeaponName + '" not currently equipped');
+    Exit(True);
+  end;
+
+  WriteDebug('Weapon | Unequipping "' + DetectedWeaponName + '"');
+
+  if Inventory.IsFull() then
+  begin
+    WriteDebug('Weapon | Inventory full, dropping one drift net');
+    if Inventory.FindItem('Drift net', slot) then
+      Inventory.ShiftDrop([slot])
+    else
+    begin
+      WriteLog('WARNING | No drift net to drop, cannot make room');
+      Exit(False);
+    end;
+    Wait(300, 500);
+  end;
+
+  Equipment.ClickItem(DetectedWeaponName);
+  Wait(600, 900);
+
+  Result := not Equipment.ContainsItem(DetectedWeaponName);
+  if Result then
+    WriteDebug('Weapon | Successfully unequipped')
+  else
+    WriteLog('WARNING | Failed to verify unequip');
+end;
+
+(**
+ * EquipWeapon
+ *
+ * Equips the detected weapon from inventory. Handles the 'steer clear'
+ * chat dialogue that appears when wielding certain underwater weapons.
+ *)
+function EquipWeapon(): Boolean;
+begin
+  if DetectedWeaponName = '' then
+    Exit(True);
+
+  if Equipment.ContainsItem(DetectedWeaponName) then
+  begin
+    WriteDebug('Weapon | "' + DetectedWeaponName + '" already equipped');
+    Exit(True);
+  end;
+
+  if not Inventory.ContainsItem(DetectedWeaponName) then
+  begin
+    WriteDebug('Weapon | "' + DetectedWeaponName + '" not in inventory');
+    Exit(False);
+  end;
+
+  WriteDebug('Weapon | Equipping "' + DetectedWeaponName + '"');
+
+  Inventory.Open();
+  if Inventory.ClickItem(DetectedWeaponName, 'Wield') then
+  begin
+    if WaitUntil(Chat.HasContinue(), 100, 2000) then
+    begin
+      Chat.ClickContinue();
+      Wait(300, 500);
+      Chat.ClickOption('steer clear');
+      Wait(300, 600);
+    end;
+  end;
+
+  Wait(300, 500);
+  Result := Equipment.ContainsItem(DetectedWeaponName);
+  if Result then
+    WriteDebug('Weapon | Successfully equipped')
+  else
+    WriteLog('WARNING | Failed to verify equip');
+end;
+
+(**
+ * EnsureWeaponEquipped
+ *
+ * Safety net: re-equips weapon if it's in inventory while in the fishing area.
+ * Idempotent and location-gated — safe to call at any transition point.
+ *)
+procedure EnsureWeaponEquipped();
+begin
+  if DetectedWeaponName = '' then Exit;
+  if not IsInFishingArea() then Exit;
+
+  if Inventory.ContainsItem(DetectedWeaponName) then
+  begin
+    WriteLog('Weapon | Safety net: weapon in inventory while in fishing area, re-equipping');
+    EquipWeapon();
+  end;
+end;
+
+(**
+ * WalkViaMiddleToArea
+ *
+ * Walks to a destination via MIDDLE_CENTER waypoint, resupplying from Annette
+ * if needed while passing through.
+ *)
+procedure WalkViaMiddleToArea(destCenter: TPoint);
+var
+  attempt: Int32;
+  withdrawAmount: Int32;
+begin
+  WriteDebug('Walk | Walking to MIDDLE_CENTER waypoint');
+  Map.Walker.WebWalk(MIDDLE_CENTER, 8);
+  Wait(300, 500);
+
+  if not Inventory.ContainsItem('Drift net') then
+  begin
+    WriteDebug('Walk | No drift nets, resupplying from Annette');
+
+    for attempt := 1 to MAX_RESUPPLY_RETRIES do
+    begin
+      withdrawAmount := Random(NETS_WITHDRAW_MIN, NETS_WITHDRAW_MAX);
+      if WithdrawNetsFromAnnette(withdrawAmount) then
+        Break;
+
+      if attempt < MAX_RESUPPLY_RETRIES then
+        Wait(1000, 1500);
+    end;
+
+    if not Inventory.ContainsItem('Drift net') then
+    begin
+      // Annette empty - try depositing noted nets as fallback
+      if Inventory.ContainsItem('noted drift net') then
+      begin
+        WriteDebug('Walk | Annette empty, depositing noted nets');
+        DepositNotedNetsToAnnette();
+      end;
+
+      if not Inventory.ContainsItem('Drift net') then
+        WriteLog('WARNING | Still no drift nets after resupply attempts');
+    end;
+  end;
+
+  WriteDebug('Walk | Walking to destination ' + ToStr(destCenter));
+  Map.Walker.WebWalk(destCenter, 4);
+  EnsureWeaponEquipped();
+end;
+
+// =============================================================================
+// CHASE CHAT MONITORING
+// =============================================================================
+
+(**
+ * SnapshotChat
+ *
+ * Captures all 8 chat lines as a baseline for detecting new messages
+ * after a chase click. Must be called immediately before clicking a shoal.
+ *)
+procedure SnapshotChat();
+var
+  i: Int32;
+begin
+  SetLength(ChatSnapshot, CHAT_LINE_COUNT);
+  for i := 0 to CHAT_LINE_COUNT - 1 do
+    ChatSnapshot[i] := Chat.GetMessage(i, [CHAT_COLOR_BLACK]);
+end;
+
+(**
+ * PollChaseChat
+ *
+ * Reads all 8 chat lines and detects new chase-related messages by
+ * comparing against the pre-click snapshot. Uses shift detection to
+ * identify which lines are new (messages scroll up as new ones appear).
+ *
+ * @return  EChaseChatResult indicating what new message was detected
+ *)
+function PollChaseChat(): EChaseChatResult;
+var
+  i, shift: Int32;
+  currentLines, newMessages: TStringArray;
+  hasChanged: Boolean;
+begin
+  Result := EChaseChatResult.CHAT_NONE;
+
+  // Read all 8 lines
+  SetLength(currentLines, CHAT_LINE_COUNT);
+  hasChanged := False;
+  for i := 0 to CHAT_LINE_COUNT - 1 do
+  begin
+    currentLines[i] := Chat.GetMessage(i, [CHAT_COLOR_BLACK]);
+    if currentLines[i] <> ChatSnapshot[i] then
+      hasChanged := True;
+  end;
+
+  if not hasChanged then Exit;
+
+  // Check only the most recent chat line for net-full (avoids stale message re-detection)
+  if (currentLines[CHAT_LINE_COUNT - 1] <> ChatSnapshot[CHAT_LINE_COUNT - 1]) and
+     (CHAT_MSG_NET_FULL in currentLines[CHAT_LINE_COUNT - 1]) then
+  begin
+    ChatSnapshot := currentLines;
+    Exit(EChaseChatResult.CHAT_NET_FULL);
+  end;
+
+  // Shift detection: find where old bottom line moved to
+  shift := 0;
+  for i := (CHAT_LINE_COUNT - 2) downto 0 do
+    if (ChatSnapshot[CHAT_LINE_COUNT - 1] <> '') and
+       (ChatSnapshot[CHAT_LINE_COUNT - 1] in currentLines[i]) then
+    begin
+      shift := (CHAT_LINE_COUNT - 1) - i;
+      Break;
+    end;
+
+  // Fallback: try second-to-last line
+  if shift = 0 then
+    for i := (CHAT_LINE_COUNT - 3) downto 0 do
+      if (ChatSnapshot[CHAT_LINE_COUNT - 2] <> '') and
+         (ChatSnapshot[CHAT_LINE_COUNT - 2] in currentLines[i]) then
+      begin
+        shift := (CHAT_LINE_COUNT - 2) - i;
+        Break;
+      end;
+
+  // Extract new messages
+  if shift > 0 then
+  begin
+    for i := (CHAT_LINE_COUNT - shift) to (CHAT_LINE_COUNT - 1) do
+      newMessages += currentLines[i];
+  end
+  else
+  begin
+    // Can't determine shift — check all changed lines
+    for i := (CHAT_LINE_COUNT - 1) downto 0 do
+      if currentLines[i] <> ChatSnapshot[i] then
+        newMessages += currentLines[i];
+  end;
+
+  // Update snapshot
+  ChatSnapshot := currentLines;
+
+  // Scan new messages for events (priority: STRANGELY > PROD > CAUGHT)
+  for i := High(newMessages) downto 0 do
+    if CHAT_MSG_STRANGELY in newMessages[i] then
+      Exit(EChaseChatResult.CHAT_STRANGELY);
+
+  for i := High(newMessages) downto 0 do
+    if CHAT_MSG_PROD in newMessages[i] then
+      Exit(EChaseChatResult.CHAT_PROD);
+
+  for i := High(newMessages) downto 0 do
+    if CHAT_MSG_CAUGHT in newMessages[i] then
+      Exit(EChaseChatResult.CHAT_CAUGHT);
+end;
+
+// =============================================================================
+// CHASE LOOP
+// =============================================================================
+
+(**
+ * RunChaseFrame
+ *
+ * Main per-frame function for the chase loop. Detects, tracks, and draws
+ * shoals. Uses chat confirmation for chase completion:
+ *   CHASE_IDLE -> click shoal -> CHASE_WAIT_CHAT
+ *   CHASE_WAIT_CHAT -> chat confirms -> CHASE_IDLE
+ *)
+procedure RunChaseFrame();
+var
+  shoals: array of TShoal;
+  target: TShoal;
+  found, hasTarget: Boolean;
+  distToTarget: Double;
+  center: TPoint;
+  attempt: Int32;
+begin
+  RSClient.Image.Clear();
+  found := DetectShoals(shoals);
+
+  if found and DEBUG_SHOALS then
+    DrawShoals(shoals);
+
+  case ChaseState of
+    CHASE_IDLE:
+    begin
+      if not NetFullSuspected then
+      begin
+        NetFullSuspected := QuickNetFullCheck();
+        if NetFullSuspected then
+        begin
+          WriteDebug('Chase | Net full detected before chase, exiting');
+          Exit;
+        end;
+      end;
+
+      hasTarget := False;
+      if found then
+        hasTarget := SelectTarget(shoals, target);
+
+      if hasTarget then
+      begin
+        NoTargetSince := 0;
+        ConsecutiveSwitches := 0;
+      end
+      else
+      begin
+        if found and HasShoalsInArea(shoals) and not AreaRedone then
+        begin
+          ChasedIDs := [];
+          NoTargetSince := 0;
+          AreaRedone := True;
+          WriteDebug('Chase | All area shoals chased, instant redo');
+          Exit;
+        end;
+
+        if NoTargetSince = 0 then
+          NoTargetSince := GetTickCount();
+
+        if GetTickCount() - NoTargetSince >= NO_TARGET_SWITCH_MS then
+        begin
+          if not NetFullSuspected then
+          begin
+            WriteDebug('Chase | Checking net before area switch');
+            NetFullSuspected := QuickNetFullCheck();
+          end;
+
+          if NetFullSuspected then
+            Exit;
+
+          if not Inventory.ContainsItem('Drift net') then
+          begin
+            if CurrentArea = AREA_NORTH then
+              center := SOUTH_CENTER
+            else
+              center := NORTH_CENTER;
+
+            WriteDebug('Chase | No nets before area switch, resupplying via Annette');
+            WalkViaMiddleToArea(center);
+            SwitchArea();
+            ConsecutiveSwitches := 0;
+            NoTargetSince := 0;
+          end
+          else
+          begin
+            Inc(ConsecutiveSwitches);
+
+            if ConsecutiveSwitches >= 2 then
+            begin
+              if CurrentArea = AREA_NORTH then
+                center := NORTH_CENTER
+              else
+                center := SOUTH_CENTER;
+
+              WriteDebug('Chase | No targets after switch, walking to center');
+              Map.Walker.WebWalk(center, 4);
+              ConsecutiveSwitches := 0;
+              NoTargetSince := 0;
+
+              if not NetFullSuspected then
+                NetFullSuspected := QuickNetFullCheck();
+            end
+            else
+            begin
+              WriteDebug('Chase | No target for ' + ToStr(NO_TARGET_SWITCH_MS) + 'ms, switching area');
+              SwitchArea();
+            end;
+          end;
+
+          Exit;
+        end;
+
+        Exit;
+      end;
+
+      WriteDebug('Chase | Targeting shoal ID ' + ToStr(target.ID) + ' at ' + ToStr(target.WalkerCoord));
+
+      for attempt := 1 to CHASE_RETRIES do
+      begin
+        if attempt = 1 then
+          Mouse.Move(target.Bounds)
+        else
+          Mouse.Move(target.Bounds, True);
+
+        if MainScreen.IsUpText(['Chase']) then
+        begin
+          SnapshotChat();
+          Mouse.Click(MOUSE_LEFT);
+
+          if not MainScreen.DidRedClick() then
+          begin
+            WriteDebug('Chase | Misclick (no red click) on attempt ' + ToStr(attempt));
+            Continue;
+          end;
+
+          ChaseTargetID := target.ID;
+
+          distToTarget := Map.Position().DistanceTo(target.WalkerCoord);
+
+          if distToTarget <= ADJACENT_DIST then
+            ChaseChatTimeout := CHAT_TIMEOUT_ADJACENT
+          else
+            ChaseChatTimeout := CHAT_TIMEOUT_DISTANT;
+
+          ChaseClickTick := GetTickCount();
+          LastChatPollTick := 0;
+          ChaseState := EChaseState.CHASE_WAIT_CHAT;
+          WriteDebug('Chase | Clicked shoal ID ' + ToStr(ChaseTargetID) +
+                     ' (dist=' + ToStr(Round(distToTarget)) +
+                     ', timeout=' + ToStr(ChaseChatTimeout) + 'ms)');
+
+          Break;
+        end;
+
+        if attempt = 2 then
+        begin
+          WriteDebug('Chase | UpText miss (' + ToStr(attempt) + '/' + ToStr(CHASE_RETRIES) + '), re-detecting');
+          if not DetectShoals(shoals) then Break;
+          if not SelectTarget(shoals, target) then Break;
+        end
+        else
+          WriteDebug('Chase | UpText miss (' + ToStr(attempt) + '/' + ToStr(CHASE_RETRIES) + '), repositioning cursor');
+      end;
+    end;
+
+    CHASE_WAIT_CHAT:
+    begin
+      // Rate-limit OCR polling
+      if GetTickCount() - LastChatPollTick < CHAT_POLL_INTERVAL then
+        Exit;
+      LastChatPollTick := GetTickCount();
+
+      case PollChaseChat() of
+        EChaseChatResult.CHAT_PROD:
+        begin
+          WriteDebug('Chase | Chat confirmed: chase successful on ID ' + ToStr(ChaseTargetID));
+          RecordChase(ChaseTargetID);
+          ChaseState := EChaseState.CHASE_IDLE;
+        end;
+
+        EChaseChatResult.CHAT_STRANGELY:
+        begin
+          WriteLog('Chase | Chat: weapon not equipped! Re-equipping');
+          EnsureWeaponEquipped();
+          ChaseState := EChaseState.CHASE_IDLE;
+        end;
+
+        EChaseChatResult.CHAT_NET_FULL:
+        begin
+          WriteLog('Chase | Chat: drift nets are full! Switching to handle net');
+          NetFullSuspected := True;
+          ChaseState := EChaseState.CHASE_IDLE;
+        end;
+
+        EChaseChatResult.CHAT_CAUGHT:
+          WriteDebug('Chase | Chat: passive fish caught during chase');
+
+        EChaseChatResult.CHAT_NONE:
+        begin
+          if GetTickCount() - ChaseClickTick >= ChaseChatTimeout then
+          begin
+            WriteDebug('Chase | Chat timeout (' + ToStr(ChaseChatTimeout) + 'ms), recording chase as fallback');
+            RecordChase(ChaseTargetID);
+            ChaseState := EChaseState.CHASE_IDLE;
+          end;
+        end;
+      end;
+    end;
+  end;
+end;
+
+(**
+ * ResetChaseState
+ *
+ * Resets all chase tracking state without changing CurrentArea.
+ *)
+procedure ResetChaseState();
+begin
+  NextShoalID := 1;
+  PreviousShoals := [];
+  ChasedIDs := [];
+  NoTargetSince := 0;
+  LastDetectionTick := 0;
+  ChaseState := CHASE_IDLE;
+  ChaseTargetID := -1;
+  ChatSnapshot := [];
+  ChaseClickTick := 0;
+  ChaseChatTimeout := 0;
+  LastChatPollTick := 0;
+  ConsecutiveSwitches := 0;
+  NetFullSuspected := False;
+  AreaRedone := False;
+  WriteDebug('Chase | State reset (area unchanged: ' + ToStr(CurrentArea) + ')');
+end;
+
+(**
+ * ProcessDriftNetInterface
+ *
+ * Processes the DriftNet catch interface. Banks all fish, confirms overlays,
+ * discards pufferfish if present, and closes the interface.
+ *)
+procedure ProcessDriftNetInterface();
+begin
+  WriteDebug('Net | Processing DriftNet interface');
+
+  Wait(200, 600);
+
+  if DisposeFish then
+  begin
+    WriteDebug('Net | Dispose mode — closing interface without banking');
+    DriftNet.Close(True);
+    WaitUntil(not DriftNet.IsOpen(), 100, 1500);
+  end
+  else
+  begin
+    // Bank all fish
+    DriftNet.GetButton(ERSDriftNetButton.BANK_ALL).Click();
+
+    if WaitUntil(DriftNet.HasOverlay(), 200, 3000) then
+    begin
+      DriftNet.GetButton(ERSDriftNetButton.OVERLAY_CONFIRM).Click();
+      Wait(300, 600);
+    end;
+
+    // Handle pufferfish (interface still open after banking)
+    if DriftNet.IsOpen(1500) then
+    begin
+      WaitUntil(not DriftNet.HasOverlay(), 100, 1500);
+      Wait(300, 500);
+
+      if SRL.Dice(CLOSE_X_CHANCE) then
+      begin
+        WriteDebug('Net | Pufferfish present, closing via X button');
+        DriftNet.Close(True);
+        WaitUntil(not DriftNet.IsOpen(), 100, 1500);
+      end
+      else
+      begin
+        WriteDebug('Net | Pufferfish present, discarding');
+        DriftNet.GetButton(ERSDriftNetButton.DISCARD_ALL).Click();
+        Wait(300, 600);
+
+        if WaitUntil(DriftNet.HasOverlay(), 100, 3000) then
+        begin
+          DriftNet.GetButton(ERSDriftNetButton.OVERLAY_CONFIRM).Click();
+          Wait(300, 600);
+        end;
+      end;
+    end;
+
+    // Final cleanup
+    if DriftNet.IsOpen() then
+    begin
+      DriftNet.Close(True);
+      WaitUntil(not DriftNet.IsOpen(), 100, 1500);
+    end;
+  end;
+
+  Inc(TotalNetsHarvested);
+  WriteLog('Net | Harvest #' + ToStr(TotalNetsHarvested) + ' completed');
+end;
+
+(**
+ * HandleFullNet
+ *
+ * Detects a full net in the current area, harvests it, and sets a new net.
+ *
+ * @return True if a full net was successfully harvested and replaced
+ *)
+function HandleFullNet(): Boolean;
+var
+  atpa: T2DPointArray;
+  fullNet, anchor, notFullNet: TRSObjectV2;
+  pos, center: TPoint;
+  attempt: Int32;
+begin
+  Result := False;
+
+  pos := Map.Position();
+  if PointInArea(pos, NORTH_FISHING_AREA_TILES) then
+    CurrentArea := AREA_NORTH
+  else if PointInArea(pos, SOUTH_FISHING_AREA_TILES) then
+    CurrentArea := AREA_SOUTH
+  else
+  begin
+    WriteDebug('Net | Player at ' + ToStr(pos) + ' is not in any fishing area');
+    Exit;
+  end;
+
+  WriteDebug('Net | Detected area = ' + ToStr(CurrentArea));
+
+  if CurrentArea = AREA_NORTH then
+  begin
+    fullNet := DriftNetFishingObjects.Underwater_DriftNet_North_Full;
+    anchor := DriftNetFishingObjects.Underwater_DriftNet_North_Anchor;
+    notFullNet := DriftNetFishingObjects.Underwater_DriftNet_North_NotFull;
+  end
+  else
+  begin
+    fullNet := DriftNetFishingObjects.Underwater_DriftNet_South_Full;
+    anchor := DriftNetFishingObjects.Underwater_DriftNet_South_Anchor;
+    notFullNet := DriftNetFishingObjects.Underwater_DriftNet_South_NotFull;
+  end;
+
+  if not fullNet.Find(atpa) then
+  begin
+    WriteDebug('Net | No full net detected in ' + ToStr(CurrentArea));
+    Exit;
+  end;
+
+  WriteLog('Net | Full net detected, walking to harvest');
+
+  if not fullNet.WalkClick() then
+  begin
+    WriteDebug('Net | Failed to WalkClick full net');
+    Exit;
+  end;
+
+  Minimap.WaitMoving(False);
+
+  if not DriftNet.IsOpen(5000) then
+  begin
+    WriteDebug('Net | DriftNet interface did not open');
+    Exit;
+  end;
+
+  ProcessDriftNetInterface();
+
+  if not Inventory.ContainsItem('Drift net') then
+  begin
+    WriteLog('WARNING | No drift nets in inventory after harvest');
+    Exit;
+  end;
+
+  if CurrentArea = AREA_NORTH then
+    center := NORTH_CENTER
+  else
+    center := SOUTH_CENTER;
+
+  for attempt := 1 to 3 do
+  begin
+    WriteDebug('Net | Setting new net on anchor (attempt ' + ToStr(attempt) + '/3)');
+
+    if attempt > 1 then
+    begin
+      Map.Walker.WebWalk(center, 4);
+      Wait(800, 1500);
+    end;
+
+    if not anchor.WalkClick() then
+    begin
+      WriteDebug('Net | Failed to WalkClick anchor');
+      Wait(500, 800);
+      Continue;
+    end;
+
+    Minimap.WaitMoving(False);
+    Wait(800, 1200);
+
+    if WaitUntil(notFullNet.Find(atpa), 500, 8000) then
+    begin
+      WriteLog('Net | New net successfully set');
+      Result := True;
+      Exit;
+    end;
+
+    WriteDebug('Net | Net not detected after setting, retrying...');
+    Wait(500, 800);
+  end;
+
+  WriteLog('WARNING | Failed to set new net after 3 attempts');
+end;
+
+(**
+ * SetNetOnAnchor
+ *
+ * Walks to area center and clicks the anchor to set a new drift net.
+ *
+ * @param area  The area where the net should be set
+ * @return      True if a new net was successfully set
+ *)
+function SetNetOnAnchor(area: EArea): Boolean;
+var
+  center: TPoint;
+  anchor, notFullNet: TRSObjectV2;
+  atpa: T2DPointArray;
+begin
+  Result := False;
+
+  if area = AREA_NORTH then
+  begin
+    center := NORTH_CENTER;
+    anchor := DriftNetFishingObjects.Underwater_DriftNet_North_Anchor;
+    notFullNet := DriftNetFishingObjects.Underwater_DriftNet_North_NotFull;
+  end
+  else
+  begin
+    center := SOUTH_CENTER;
+    anchor := DriftNetFishingObjects.Underwater_DriftNet_South_Anchor;
+    notFullNet := DriftNetFishingObjects.Underwater_DriftNet_South_NotFull;
+  end;
+
+  WriteDebug('Net | Walking to ' + ToStr(area) + ' center');
+  Map.Walker.WebWalk(center, 4);
+  Wait(500, 800);
+
+  WriteDebug('Net | Clicking anchor to set net');
+  if not anchor.WalkClick() then
+  begin
+    WriteDebug('Net | Failed to WalkClick anchor');
+    Exit;
+  end;
+
+  Minimap.WaitMoving(False);
+  Wait(800, 1200);
+
+  if WaitUntil(notFullNet.Find(atpa), 500, 8000) then
+  begin
+    WriteLog('Net | New net set in ' + ToStr(area));
+    Result := True;
+  end
+  else
+    WriteDebug('Net | Net not detected after setting');
+end;
+
+(**
+ * HandleResupply
+ *
+ * Withdraws nets from Annette then walks back to set a new net.
+ *)
+function HandleResupply(area: EArea): Boolean;
+var
+  attempt: Int32;
+  withdrawAmount: Int32;
+begin
+  Result := False;
+
+  for attempt := 1 to MAX_RESUPPLY_RETRIES do
+  begin
+    withdrawAmount := Random(NETS_WITHDRAW_MIN, NETS_WITHDRAW_MAX);
+    WriteDebug('Resupply | Attempt ' + ToStr(attempt) + '/' + ToStr(MAX_RESUPPLY_RETRIES));
+
+    if WithdrawNetsFromAnnette(withdrawAmount) then
+      Break;
+
+    if attempt = MAX_RESUPPLY_RETRIES then
+    begin
+      WriteLog('Resupply | Failed after ' + ToStr(MAX_RESUPPLY_RETRIES) + ' attempts');
+      Exit;
+    end;
+
+    Wait(1000, 1500);
+  end;
+
+  if not Inventory.ContainsItem('Drift net') then
+  begin
+    // Annette empty - try depositing noted nets as fallback
+    if Inventory.ContainsItem('noted drift net') then
+    begin
+      WriteDebug('Resupply | Annette empty, depositing noted nets');
+      DepositNotedNetsToAnnette();
+    end;
+
+    if not Inventory.ContainsItem('Drift net') then
+    begin
+      WriteLog('Resupply | No drift nets after withdrawal');
+      Exit;
+    end;
+  end;
+
+  WriteDebug('Resupply | Walking back to ' + ToStr(area));
+  Result := SetNetOnAnchor(area);
+  EnsureWeaponEquipped();
+end;
+
+(**
+ * CheckAndHandleFullNet
+ *
+ * Orchestrates full net handling: harvests, resupplies if needed.
+ *)
+function CheckAndHandleFullNet(): Boolean;
+var
+  savedArea: EArea;
+  handleResult: Boolean;
+begin
+  Result := True;
+
+  WriteLog('Net | Full net confirmed in ' + ToStr(CurrentArea));
+  savedArea := CurrentArea;
+
+  handleResult := HandleFullNet();
+
+  if handleResult then
+  begin
+    WriteLog('Net | Net handled successfully');
+    CurrentArea := savedArea;
+    ResetChaseState();
+  end
+  else if not Inventory.ContainsItem('Drift net') then
+  begin
+    WriteLog('Net | No drift nets, initiating resupply');
+    HandleResupply(savedArea);
+    CurrentArea := savedArea;
+    ResetChaseState();
+  end
+  else
+  begin
+    WriteLog('Net | Harvest done but net not set, retrying');
+    SetNetOnAnchor(savedArea);
+    CurrentArea := savedArea;
+    ResetChaseState();
+  end;
+
+  EnsureWeaponEquipped();
+end;
+
+// =============================================================================
+// NAVIGATION & TRANSITION FUNCTIONS
+// =============================================================================
+
+(**
+ * WaitForTransition
+ *
+ * Polls Map.Position() until the player lands inside the destination box.
+ *)
+function WaitForTransition(destBox: TBox; timeout: Int32 = 10000): Boolean;
+begin
+  Result := WaitUntil(Map.Position().InBox(destBox), 200, timeout);
+  if Result then
+    WriteLog('Transition | Arrived at ' + ToStr(Map.Position()))
+  else
+    WriteLog('Transition | Timeout at ' + ToStr(Map.Position()));
+end;
+
+(**
+ * DoTransition
+ *
+ * Clicks an object and waits for arrival in destination box with retries.
+ *)
+function DoTransition(var obj: TRSObjectV2; destBox: TBox; maxAttempts: Int32 = 3): Boolean;
+var
+  attempt: Int32;
+begin
+  Result := False;
+  for attempt := 1 to maxAttempts do
+  begin
+    WriteLog('Transition | Attempt ' + ToStr(attempt) + '/' + ToStr(maxAttempts));
+    if not obj.WalkClick() then
+    begin
+      WriteLog('Transition | WalkClick failed');
+      if attempt < maxAttempts then begin Wait(600, 900); Continue; end;
+      Exit;
+    end;
+    Minimap.WaitMoving(False);
+    if WaitForTransition(destBox, 10000) then
+    begin
+      WriteLog('Transition | OK');
+      Result := True;
+      Exit;
+    end;
+    if attempt < maxAttempts then Wait(600, 900);
+  end;
+  WriteLog('Transition | Failed after ' + ToStr(maxAttempts) + ' attempts');
+end;
+
+(**
+ * HandleCetoDialogue
+ *
+ * Handles the Ceto payment dialogue that appears after entering the tunnel.
+ *)
+function HandleCetoDialogue(): Boolean;
+begin
+  Result := True;
+  Wait(800, 1200);
+
+  if Chat.HasContinue() then
+  begin
+    WriteDebug('Dialogue | Chat continue detected, clicking through');
+    Chat.ClickContinue();
+    Wait(300, 500);
+  end;
+
+  if Chat.ClickOption('nter instance') then
+  begin
+    WriteDebug('Dialogue | Clicked enter instance');
+    Wait(1800, 2000);
+  end
+  else
+    WriteDebug('Dialogue | No instance dialogue detected');
+end;
+
+(**
+ * DepositNotedNetsToAnnette
+ *
+ * Deposits all noted drift nets to Annette then withdraws un-noted ones.
+ *)
+function DepositNotedNetsToAnnette(): Boolean;
+var
+  attempt: Int32;
+begin
+  Result := False;
+
+  WriteLog('Annette | Depositing noted drift nets');
+  for attempt := 1 to 3 do
+  begin
+    if DriftNetFishingObjects.Annette.WalkSelectOption(['Nets']) then
+      Break;
+    WriteDebug('Annette | Failed to select Nets option (attempt ' + ToStr(attempt) + '/3)');
+    if attempt = 3 then Exit;
+    Wait(800, 2000);
+  end;
+
+  if not AnnettesNets.IsOpen(5000) then
+  begin
+    WriteDebug('Annette | Interface did not open');
+    Exit;
+  end;
+
+  WriteDebug('Annette | Storing all noted drift nets');
+  Inventory.Items.InteractItem('noted drift net', 'Store-All');
+  Wait(150, 250);
+
+  if not WaitUntil(AnnettesNets.Items.CountStack(0) > 0, 50, 3000) then
+  begin
+    WriteDebug('Annette | Failed to verify nets stored');
+    AnnettesNets.Close(False);
+    Exit;
+  end;
+
+  WriteDebug('Annette | Nets stored, withdrawing un-noted');
+  AnnettesNets.Items.InteractSlot(0, 'Withdraw-5');
+  Wait(1000, 1500);
+
+  if AnnettesNets.IsOpen() then
+  begin
+    Mouse.Click(AnnettesNets.CloseButtonBounds, MOUSE_LEFT);
+    WaitUntil(not AnnettesNets.IsOpen(), 100, 3000);
+  end;
+
+  Wait(300, 500);
+
+  Result := Inventory.ContainsItem('Drift net');
+  if Result then
+    WriteLog('Annette | Success - have ' + ToStr(Inventory.CountItem('Drift net')) + ' drift nets')
+  else
+    WriteLog('WARNING | Annette deposit failed');
+end;
+
+(**
+ * AdjustCameraForTunnel
+ *
+ * Ensures camera faces South (160-200) or North (320-40) before
+ * clicking the underwater tunnel. These angles provide the best
+ * visibility of the tunnel entrance.
+ *)
+procedure AdjustCameraForTunnel();
+var
+  currentAngle: Double;
+begin
+  currentAngle := Minimap.GetCompassAngle();
+
+  // Already facing South (160-200)?
+  if SRL.Modulo(currentAngle - 160, 360) <= SRL.Modulo(200 - 160, 360) then
+    Exit;
+
+  // Already facing North (320-400, i.e. 320-360 and 0-40)?
+  if SRL.Modulo(currentAngle - 320, 360) <= SRL.Modulo(400 - 320, 360) then
+    Exit;
+
+  // Randomly pick South or North
+  if Random(2) = 0 then
+    Minimap.SetCompassAngle(Random(160, 200))
+  else
+    Minimap.SetCompassAngle(Random(-40, 40));
+
+  Wait(100, 300);
+end;
+
+(**
+ * RestockDriftNetsFromBank
+ *
+ * Full round-trip to restock drift nets when Annette is empty.
+ * 11-step process: exit fishing area -> surface -> bank -> dive -> return.
+ *)
+function RestockDriftNetsFromBank(): Boolean;
+var
+  bankItem: TRSBankItem;
+  exitAttempt: Int32;
+  startStep: Int32;
+begin
+  Result := False;
+  WriteLog('');
+  WriteLog('=== RestockDriftNetsFromBank: Starting ===');
+
+  // Zone detection: determine starting step based on current position
+  if IsOnSurface() then
+  begin
+    startStep := 5;
+    WriteLog('  Zone: Surface - skipping to Step 5 (bank)');
+  end
+  else if IsInUnderwaterEntrance() then
+  begin
+    startStep := 4;
+    WriteLog('  Zone: Underwater entrance - skipping to Step 4 (climb anchor rope)');
+  end
+  else if IsInUnderwaterCorridor() then
+  begin
+    startStep := 2;
+    WriteLog('  Zone: Underwater corridor - starting at Step 2 (unequip + tunnel)');
+  end
+  else if IsInFishingArea() then
+  begin
+    startStep := 1;
+    WriteLog('  Zone: Fishing area - starting from Step 1 (exit via PlantDoor)');
+  end
+  else
+  begin
+    WriteLog('  ERROR: Player at ' + ToStr(Map.Position()) + ' is not in any known zone');
+    Exit;
+  end;
+
+  // Step 1: Exit fishing area via PlantDoor
+  if startStep <= 1 then
+  begin
+    WriteLog('Step 1/11: Exiting fishing area via PlantDoor');
+    for exitAttempt := 1 to 3 do
+    begin
+      WriteLog('  Exit attempt ' + ToStr(exitAttempt) + '/3');
+      if not DriftNetFishingObjects.UnderwaterPlantDoor.WalkClick() then
+      begin
+        WriteLog('  FAILED: Could not click PlantDoor');
+        Exit;
+      end;
+      Minimap.WaitMoving(False);
+
+      if WaitForTransition(UNDERWATER_CORRIDOR_BOX) then
+      begin
+        WriteLog('  OK: Confirmed in corridor');
+        Break;
+      end;
+
+      if IsInFishingArea() then
+      begin
+        WriteLog('  WARNING: Bounced back (double-click)');
+        if exitAttempt = 3 then
+        begin
+          WriteLog('  FAILED: Could not exit after 3 attempts');
+          Exit;
+        end;
+        Wait(600, 900);
+        Continue;
+      end;
+
+      WriteLog('  FAILED: Unknown zone after PlantDoor');
+      Exit;
+    end;
+  end;
+
+  // Step 2: Unequip weapon
+  if startStep <= 2 then
+  begin
+    WriteLog('Step 2/11: Unequipping weapon for tunnel');
+    if not UnequipWeapon() then
+    begin
+      WriteLog('  FAILED: Could not unequip weapon');
+      Exit;
+    end;
+  end;
+
+  // Step 3: Enter tunnel
+  if startStep <= 3 then
+  begin
+    WriteLog('Step 3/11: Walking towards tunnel then entering');
+    WriteLog('  Position before WebWalk: ' + ToStr(Map.Position()));
+    Map.Walker.WebWalk([23876, 9250], 4);
+    WriteLog('  Position after WebWalk: ' + ToStr(Map.Position()));
+    Wait(300, 500);
+    AdjustCameraForTunnel();
+    if not DriftNetFishingObjects.UnderwaterTunnel.WalkClick() then
+    begin
+      WriteLog('  FAILED: Could not click tunnel');
+      Exit;
+    end;
+    Minimap.WaitMoving(False);
+
+    if not WaitForTransition(UNDERWATER_ENTRANCE_BOX) then
+    begin
+      WriteLog('  FAILED: Did not arrive at entrance');
+      Exit;
+    end;
+    WriteLog('  OK: Arrived at entrance');
+  end;
+
+  // Step 4: Climb anchor rope to surface
+  if startStep <= 4 then
+  begin
+    WriteLog('Step 4/11: Climbing anchor rope to surface');
+    if not DoTransition(DriftNetFishingObjects.UnderwaterAnchorRope, SURFACE_BOX) then
+    begin
+      WriteLog('  FAILED: Did not arrive at surface');
+      Exit;
+    end;
+    WriteLog('  OK: Arrived at surface');
+  end;
+
+  // Step 5: Bank
+  WriteLog('Step 5/11: Banking for noted drift nets');
+  if not DriftNetFishingObjects.SurfaceBankChest.WalkClick() then
+  begin
+    WriteLog('  FAILED: Could not click bank chest');
+    Exit;
+  end;
+
+  if not Bank.IsOpen(5000, 200) then
+  begin
+    WriteLog('  FAILED: Bank did not open');
+    Exit;
+  end;
+
+  bankItem := TRSBankItem.Setup('Drift net', 2000, True);
+  Bank.WithdrawItem(bankItem, False);
+  Wait(775, 1250);
+  Bank.Close(True);
+  Wait(300, 500);
+
+  if not Inventory.ContainsAny(['Drift net', 'noted drift net']) then
+  begin
+    WriteLog('  FAILED: No drift nets after banking');
+    Exit;
+  end;
+  WriteLog('  OK: Withdrew drift nets from bank');
+
+  // Step 6: Dive back underwater
+  WriteLog('Step 6/11: Diving back underwater');
+  if not DriftNetFishingObjects.SurfaceRowboat.WalkSelectOption(['Dive']) then
+  begin
+    WriteLog('  FAILED: Could not select Dive');
+    Exit;
+  end;
+
+  Wait(120, 200);
+  Minimap.WaitMoving(False);
+  SRL.IsAnimating(Minimap.Bounds, 1000, 3000, 1);
+
+  if not WaitForTransition(UNDERWATER_ENTRANCE_BOX, 15000) then
+  begin
+    WriteLog('  FAILED: Did not arrive underwater');
+    Exit;
+  end;
+  WriteLog('  OK: Arrived underwater');
+
+  // Step 7: Enter tunnel
+  WriteLog('Step 7/11: Entering tunnel');
+  WriteLog('  Position before WebWalk: ' + ToStr(Map.Position()));
+  Map.Walker.WebWalk([23876, 9250], 4);
+  WriteLog('  Position after WebWalk: ' + ToStr(Map.Position()));
+  Wait(300, 500);
+  AdjustCameraForTunnel();
+  if not DriftNetFishingObjects.UnderwaterTunnel.WalkClick() then
+  begin
+    WriteLog('  FAILED: Could not click tunnel');
+    Exit;
+  end;
+  Minimap.WaitMoving(False);
+
+  // Step 8: Handle Ceto dialogue
+  WriteLog('Step 8/11: Handling Ceto dialogue');
+  HandleCetoDialogue();
+
+  if not WaitForTransition(UNDERWATER_CORRIDOR_BOX) then
+  begin
+    WriteLog('  FAILED: Did not arrive at corridor');
+    Exit;
+  end;
+  WriteLog('  OK: Arrived at corridor');
+
+  // Step 9: Enter fishing area
+  WriteLog('Step 9/11: Entering fishing area via PlantDoor');
+  if not DoTransition(DriftNetFishingObjects.UnderwaterPlantDoor, UNDERWATER_FISHING_AREA_BOX) then
+  begin
+    WriteLog('  FAILED: Did not arrive in fishing area');
+    Exit;
+  end;
+  WriteLog('  OK: Arrived in fishing area');
+
+  // Step 10: Re-equip weapon
+  WriteLog('Step 10/11: Re-equipping weapon');
+  if not EquipWeapon() then
+    WriteLog('  WARNING: Could not re-equip weapon');
+
+  // Step 11: Deposit noted nets to Annette
+  WriteLog('Step 11/11: Depositing noted nets to Annette');
+  if DepositNotedNetsToAnnette() then
+    WriteLog('  OK: Nets restocked via Annette')
+  else
+    WriteLog('  WARNING: Annette deposit failed');
+
+  Result := Inventory.ContainsItem('Drift net');
+  WriteLog('=== RestockDriftNetsFromBank: ' + BoolToStr(Result, 'SUCCESS', 'FAILED') + ' ===');
+end;
+
+(**
+ * RestockNumulitesFromBank
+ *
+ * Navigates from the fishing area to the surface bank, withdraws all numulites,
+ * and returns to the fishing area. Terminates if no numulites are found.
+ *)
+function RestockNumulitesFromBank(): Boolean;
+var
+  bankItem: TRSBankItem;
+  exitAttempt: Int32;
+  startStep: Int32;
+begin
+  Result := False;
+  WriteLog('');
+  WriteLog('=== RestockNumulitesFromBank: Starting ===');
+
+  if IsOnSurface() then
+  begin
+    startStep := 5;
+    WriteLog('  Zone: Surface - skipping to Step 5 (bank)');
+  end
+  else if IsInUnderwaterEntrance() then
+  begin
+    startStep := 4;
+    WriteLog('  Zone: Underwater entrance - skipping to Step 4 (climb anchor rope)');
+  end
+  else if IsInUnderwaterCorridor() then
+  begin
+    startStep := 2;
+    WriteLog('  Zone: Underwater corridor - starting at Step 2 (unequip + tunnel)');
+  end
+  else if IsInFishingArea() then
+  begin
+    startStep := 1;
+    WriteLog('  Zone: Fishing area - starting from Step 1 (exit via PlantDoor)');
+  end
+  else
+  begin
+    WriteLog('  ERROR: Player at ' + ToStr(Map.Position()) + ' is not in any known zone');
+    Exit;
+  end;
+
+  // Step 1: Exit fishing area via PlantDoor
+  if startStep <= 1 then
+  begin
+    WriteLog('Step 1/10: Exiting fishing area via PlantDoor');
+    for exitAttempt := 1 to 3 do
+    begin
+      WriteLog('  Exit attempt ' + ToStr(exitAttempt) + '/3');
+      if not DriftNetFishingObjects.UnderwaterPlantDoor.WalkClick() then
+      begin
+        WriteLog('  FAILED: Could not click PlantDoor');
+        Exit;
+      end;
+      Minimap.WaitMoving(False);
+
+      if WaitForTransition(UNDERWATER_CORRIDOR_BOX) then
+      begin
+        WriteLog('  OK: Confirmed in corridor');
+        Break;
+      end;
+
+      if IsInFishingArea() then
+      begin
+        WriteLog('  WARNING: Bounced back (double-click)');
+        if exitAttempt = 3 then
+        begin
+          WriteLog('  FAILED: Could not exit after 3 attempts');
+          Exit;
+        end;
+        Wait(600, 900);
+        Continue;
+      end;
+
+      WriteLog('  FAILED: Unknown zone after PlantDoor');
+      Exit;
+    end;
+  end;
+
+  // Step 2: Unequip weapon
+  if startStep <= 2 then
+  begin
+    WriteLog('Step 2/10: Unequipping weapon for tunnel');
+    if not UnequipWeapon() then
+    begin
+      WriteLog('  FAILED: Could not unequip weapon');
+      Exit;
+    end;
+  end;
+
+  // Step 3: Enter tunnel
+  if startStep <= 3 then
+  begin
+    WriteLog('Step 3/10: Walking towards tunnel then entering');
+    WriteLog('  Position before WebWalk: ' + ToStr(Map.Position()));
+    Map.Walker.WebWalk([23876, 9250], 4);
+    WriteLog('  Position after WebWalk: ' + ToStr(Map.Position()));
+    Wait(300, 500);
+    AdjustCameraForTunnel();
+    if not DriftNetFishingObjects.UnderwaterTunnel.WalkClick() then
+    begin
+      WriteLog('  FAILED: Could not click tunnel');
+      Exit;
+    end;
+    Minimap.WaitMoving(False);
+
+    if not WaitForTransition(UNDERWATER_ENTRANCE_BOX) then
+    begin
+      WriteLog('  FAILED: Did not arrive at entrance');
+      Exit;
+    end;
+    WriteLog('  OK: Arrived at entrance');
+  end;
+
+  // Step 4: Climb anchor rope to surface
+  if startStep <= 4 then
+  begin
+    WriteLog('Step 4/10: Climbing anchor rope to surface');
+    if not DoTransition(DriftNetFishingObjects.UnderwaterAnchorRope, SURFACE_BOX) then
+    begin
+      WriteLog('  FAILED: Did not arrive at surface');
+      Exit;
+    end;
+    WriteLog('  OK: Arrived at surface');
+  end;
+
+  // Step 5: Bank - withdraw all numulites
+  WriteLog('Step 5/10: Banking for numulites');
+  if not DriftNetFishingObjects.SurfaceBankChest.WalkClick() then
+  begin
+    WriteLog('  FAILED: Could not click bank chest');
+    Exit;
+  end;
+
+  if not Bank.IsOpen(5000, 200) then
+  begin
+    WriteLog('  FAILED: Bank did not open');
+    Exit;
+  end;
+
+  bankItem := TRSBankItem.Setup('Numulite', -1, False);
+  Bank.WithdrawItem(bankItem, False);
+  Wait(775, 1250);
+  Bank.Close(True);
+  Wait(300, 500);
+
+  if not Inventory.ContainsItem('Numulite') then
+  begin
+    WriteLog('  FAILED: No numulites after banking');
+    TerminateScript('No numulites found in bank. Cannot continue banking fish.');
+  end;
+  WriteLog('  OK: Withdrew numulites from bank');
+
+  // Step 6: Dive back underwater
+  WriteLog('Step 6/10: Diving back underwater');
+  if not DriftNetFishingObjects.SurfaceRowboat.WalkSelectOption(['Dive']) then
+  begin
+    WriteLog('  FAILED: Could not select Dive');
+    Exit;
+  end;
+
+  Wait(120, 200);
+  Minimap.WaitMoving(False);
+  SRL.IsAnimating(Minimap.Bounds, 1000, 3000, 1);
+
+  if not WaitForTransition(UNDERWATER_ENTRANCE_BOX, 15000) then
+  begin
+    WriteLog('  FAILED: Did not arrive underwater');
+    Exit;
+  end;
+  WriteLog('  OK: Arrived underwater');
+
+  // Step 7: Enter tunnel
+  WriteLog('Step 7/10: Entering tunnel');
+  WriteLog('  Position before WebWalk: ' + ToStr(Map.Position()));
+  Map.Walker.WebWalk([23876, 9250], 4);
+  WriteLog('  Position after WebWalk: ' + ToStr(Map.Position()));
+  Wait(300, 500);
+  AdjustCameraForTunnel();
+  if not DriftNetFishingObjects.UnderwaterTunnel.WalkClick() then
+  begin
+    WriteLog('  FAILED: Could not click tunnel');
+    Exit;
+  end;
+  Minimap.WaitMoving(False);
+
+  // Step 8: Handle Ceto dialogue
+  WriteLog('Step 8/10: Handling Ceto dialogue');
+  HandleCetoDialogue();
+
+  if not WaitForTransition(UNDERWATER_CORRIDOR_BOX) then
+  begin
+    WriteLog('  FAILED: Did not arrive at corridor');
+    Exit;
+  end;
+  WriteLog('  OK: Arrived at corridor');
+
+  // Step 9: Enter fishing area
+  WriteLog('Step 9/10: Entering fishing area via PlantDoor');
+  if not DoTransition(DriftNetFishingObjects.UnderwaterPlantDoor, UNDERWATER_FISHING_AREA_BOX) then
+  begin
+    WriteLog('  FAILED: Did not arrive in fishing area');
+    Exit;
+  end;
+  WriteLog('  OK: Arrived in fishing area');
+
+  // Step 10: Re-equip weapon
+  WriteLog('Step 10/10: Re-equipping weapon');
+  if not EquipWeapon() then
+    WriteLog('  WARNING: Could not re-equip weapon');
+
+  Result := Inventory.ContainsItem('Numulite');
+  WriteLog('=== RestockNumulitesFromBank: ' + BoolToStr(Result, 'SUCCESS', 'FAILED') + ' ===');
+end;
+
+(**
+ * NavigateToFishingArea
+ *
+ * Handles any starting position and navigates to the fishing area.
+ *)
+function NavigateToFishingArea(): Boolean;
+begin
+  Result := False;
+  WriteLog('');
+  WriteLog('=== NavigateToFishingArea: Starting ===');
+  WriteLog('  Current position: ' + ToStr(Map.Position()));
+
+  // Case 1: Already in fishing area
+  if IsInFishingArea() then
+  begin
+    WriteLog('  Already in fishing area');
+    EquipWeapon();
+    Result := True;
+    Exit;
+  end;
+
+  // Case 2: On the surface
+  if IsOnSurface() then
+  begin
+    WriteLog('  On surface, diving underwater');
+
+    if not UnequipWeapon() then
+    begin
+      WriteLog('  FAILED: Could not unequip weapon');
+      Exit;
+    end;
+
+    if not DriftNetFishingObjects.SurfaceRowboat.WalkSelectOption(['Dive']) then
+    begin
+      WriteLog('  FAILED: Could not select Dive');
+      Exit;
+    end;
+
+    Wait(120, 200);
+    Minimap.WaitMoving(False);
+    SRL.IsAnimating(Minimap.Bounds, 1000, 3000, 1);
+
+    if not WaitForTransition(UNDERWATER_ENTRANCE_BOX, 15000) then
+    begin
+      WriteLog('  FAILED: Did not arrive underwater');
+      Exit;
+    end;
+    WriteLog('  OK: Arrived in underwater entrance');
+  end;
+
+  // Case 3: In underwater entrance
+  if IsInUnderwaterEntrance() then
+  begin
+    WriteLog('  In entrance, unequipping and entering tunnel');
+
+    if not UnequipWeapon() then
+    begin
+      WriteLog('  FAILED: Could not unequip weapon');
+      Exit;
+    end;
+
+    WriteLog('  Position before WebWalk: ' + ToStr(Map.Position()));
+    Map.Walker.WebWalk([23876, 9250], 4);
+    WriteLog('  Position after WebWalk: ' + ToStr(Map.Position()));
+    Wait(300, 500);
+    AdjustCameraForTunnel();
+    if not DriftNetFishingObjects.UnderwaterTunnel.WalkClick() then
+    begin
+      WriteLog('  FAILED: Could not click tunnel');
+      Exit;
+    end;
+    Minimap.WaitMoving(False);
+
+    HandleCetoDialogue();
+
+    if not WaitForTransition(UNDERWATER_CORRIDOR_BOX) then
+    begin
+      WriteLog('  FAILED: Did not arrive at corridor');
+      if (not BankFish) and (not Inventory.ContainsItem('Numulite')) then
+        TerminateScript('Tunnel passage failed without numulites. Buy lifetime access or add numulites to bank.');
+      Exit;
+    end;
+    WriteLog('  OK: Arrived in corridor');
+  end;
+
+  // Case 4: In underwater corridor
+  if IsInUnderwaterCorridor() then
+  begin
+    WriteLog('  In corridor, entering fishing area via PlantDoor');
+
+    if not DoTransition(DriftNetFishingObjects.UnderwaterPlantDoor, UNDERWATER_FISHING_AREA_BOX) then
+    begin
+      WriteLog('  FAILED: Did not arrive in fishing area');
+      Exit;
+    end;
+
+    WriteLog('  OK: Arrived in fishing area');
+    EquipWeapon();
+    Result := True;
+    WriteLog('=== NavigateToFishingArea: SUCCESS ===');
+    Exit;
+  end;
+
+  WriteLog('  ERROR: Player at ' + ToStr(Map.Position()) + ' is not in any known zone');
+  WriteLog('=== NavigateToFishingArea: FAILED ===');
+end;
+
+// =============================================================================
+// ANTIBAN
+// =============================================================================
+
+procedure TAntiban.DoLoseFocus();
+begin
+  Self.LoseFocus(SRL.NormalRange(450, 2750));
+end;
+
+(**
+ * CalculateXPRatios
+ *
+ * Computes FishingXPRatio and HunterXPRatio from the current FishingLevel
+ * and HunterLevel using known drift net XP formulas.
+ *
+ * Per chase/catch:
+ *   Fishing: 77 XP if level >= 70, else level * 1.1
+ *   Hunter:  101.5 XP if level >= 70, else level * 1.13
+ *)
+procedure CalculateXPRatios();
+var
+  fishXP, hunterXP, totalXP: Double;
+begin
+  if FishingLevel >= 70 then fishXP := 77.0
+  else fishXP := FishingLevel * 1.1;
+
+  if HunterLevel >= 70 then hunterXP := 101.5
+  else hunterXP := HunterLevel * 1.13;
+
+  totalXP := fishXP + hunterXP;
+  FishingXPRatio := fishXP / totalXP;
+  HunterXPRatio := hunterXP / totalXP;
+
+  WriteDebug('XP | Ratios recalculated: Fishing=' + ToStr(Round(FishingXPRatio * 100)) +
+             '%, Hunter=' + ToStr(Round(HunterXPRatio * 100)) + '%');
+end;
+
+(**
+ * ReadSkillLevelConfirmed
+ *
+ * Reads a skill level from the Stats tab 3 times and returns the value
+ * that appears at least twice (majority vote). If all 3 readings differ,
+ * returns -1 to signal no reliable reading was obtained.
+ * @param skill - The skill to read.
+ * @return The confirmed skill level, or -1 if no agreement.
+ *)
+function ReadSkillLevelConfirmed(skill: ERSSkill): Int32;
+var
+  r1, r2, r3: Int32;
+begin
+  r1 := Stats.GetSkillInfo(skill).Level;
+  Wait(SRL.TruncatedGauss(300, 600));
+  r2 := Stats.GetSkillInfo(skill).Level;
+  Wait(SRL.TruncatedGauss(300, 600));
+  r3 := Stats.GetSkillInfo(skill).Level;
+
+  if (r1 = r2) or (r1 = r3) then
+    Result := r1
+  else if (r2 = r3) then
+    Result := r2
+  else
+    Result := -1;
+end;
+
+(**
+ * CalibrateSkillLevels
+ *
+ * Antiban task that periodically reads Fishing and Hunter levels from
+ * the Stats tab. If levels changed (level-up), recalculates XP ratios.
+ *)
+procedure CalibrateSkillLevels();
+var
+  newFishLvl, newHunterLvl: Int32;
+begin
+  if LevelsCached then Exit;
+
+  newFishLvl := ReadSkillLevelConfirmed(ERSSkill.FISHING);
+  Wait(SRL.TruncatedGauss(500, 2000));
+  newHunterLvl := ReadSkillLevelConfirmed(ERSSkill.HUNTER);
+  Wait(SRL.TruncatedGauss(500, 2000));
+
+  if (newFishLvl < 1) or (newHunterLvl < 1) then
+  begin
+    WriteDebug('XP | Skill level read had no agreement, skipping calibration');
+  end
+  else
+  begin
+    if (newFishLvl <> FishingLevel) or (newHunterLvl <> HunterLevel) then
+    begin
+      WriteLog('XP | Levels changed: Fishing ' + ToStr(FishingLevel) + '->' + ToStr(newFishLvl) +
+               ', Hunter ' + ToStr(HunterLevel) + '->' + ToStr(newHunterLvl));
+      FishingLevel := newFishLvl;
+      HunterLevel := newHunterLvl;
+      CalculateXPRatios();
+    end;
+
+    if (FishingLevel >= 70) and (HunterLevel >= 70) then
+      LevelsCached := True;
+  end;
+
+  if SRL.Dice(50) then
+    Inventory.Open();
+end;
+
+procedure OnBreakStart(Task: PBreakTask);
+begin
+  Task;
+  LastBreakStartTime := GetTimeRunning();
+  WriteLog('Break | Starting break');
+end;
+
+procedure OnBreakEnd(Task: PBreakTask);
+begin
+  Task;
+  LastBreakEndTime := GetTimeRunning();
+  TotalBreakTime += LastBreakEndTime - LastBreakStartTime;
+  WriteLog('Break | Break ended (duration: ' + SRL.MsToTime(LastBreakEndTime - LastBreakStartTime, Time_Short) + ')');
+
+  if not RSClient.IsLoggedIn() then
+  begin
+    Login.LoginPlayer();
+    WaitUntil(RSClient.IsLoggedIn(), 250, 12000);
+    Wait(1000, 2000);
+  end;
+
+  WL.Activity.Restart();
+end;
+
+procedure OnSleepStart(Task: PSleepTask);
+begin
+  Task;
+  LastSleepStartTime := GetTimeRunning();
+  WriteLog('Sleep | Starting sleep');
+end;
+
+procedure OnSleepEnd(Task: PSleepTask);
+begin
+  Task;
+  LastSleepEndTime := GetTimeRunning();
+  TotalSleepTime += LastSleepEndTime - LastSleepStartTime;
+  WriteLog('Sleep | Sleep ended (duration: ' + SRL.MsToTime(LastSleepEndTime - LastSleepStartTime, Time_Short) + ')');
+
+  if not RSClient.IsLoggedIn() then
+  begin
+    Login.LoginPlayer();
+    WaitUntil(RSClient.IsLoggedIn(), 250, 12000);
+    Wait(1000, 2000);
+  end;
+
+  WL.Activity.Restart();
+end;
+
+procedure SetupAntiban();
+begin
+  Antiban.Skills := [ERSSkill.FISHING, ERSSkill.HUNTER, ERSSkill.TOTAL];
+  Antiban.MinZoom := ZOOM_MIN;
+  Antiban.MaxZoom := ZOOM_MAX;
+
+  Antiban.AddTask(ONE_MINUTE * 4,  @Antiban.SmallRandomMouse, 0.25);
+  Antiban.AddTask(ONE_MINUTE * 7,  @Antiban.RandomRotate, 0.3);
+  Antiban.AddTask(ONE_MINUTE * 14, @Antiban.DoLoseFocus, 0.25);
+  Antiban.AddTask(ONE_MINUTE * 14, @Antiban.HoverSkills, 0.5);
+  Antiban.AddTask(ONE_MINUTE * 30, @CalibrateSkillLevels, 0.3);
+  Antiban.AddTask(ONE_MINUTE * 15, @Antiban.RandomTab, 0.5);
+  Antiban.AddBreak(ONE_MINUTE * 10, ONE_SECOND * 60, 0.25, 0.0);
+
+  if TakeBreaks then
+  begin
+    Antiban.AddBreak(BreakAfter * ONE_MINUTE, BreakFor * ONE_MINUTE, 0.3, 1);
+    Antiban.OnStartBreak := @OnBreakStart;
+    Antiban.OnFinishBreak := @OnBreakEnd;
+  end;
+
+  if TakeSleeps then
+  begin
+    Antiban.AddSleep(SleepAtTime, SleepForHours * ONE_HOUR, 0.1, 1);
+    Antiban.OnStartSleep := @OnSleepStart;
+    Antiban.OnFinishSleep := @OnSleepEnd;
+  end;
+end;
+
+// =============================================================================
+// STATE MACHINE
+// =============================================================================
+
+(**
+ * GetState
+ *
+ * Priority chain determining the next action.
+ *)
+function GetState(): EState;
+begin
+  if not RSClient.IsLoggedIn() then
+    Exit(HANDLE_LOGIN);
+
+  if HANDLE_LEVEL_UP_CHAT and Chat.LeveledUp() then
+    Exit(HANDLE_LEVEL_UP);
+
+  if DriftNet.IsOpen() then
+    Exit(HANDLE_DRIFT_NET_CATCH);
+
+  if RSInterface.IsOpen() then
+    Exit(CLOSE_INTERFACE);
+
+  if not IsInFishingArea() then
+    Exit(NAVIGATE_TO_FISHING);
+
+  if NeedsNetCheck then
+    Exit(CHECK_AREA_NET);
+
+  if NetFullSuspected then
+    Exit(HANDLE_FULL_NET);
+
+  if BankFish and (not Inventory.ContainsItem('Numulite')) then
+    Exit(RESUPPLY_NUMULITES);
+
+  if not Inventory.ContainsItem('Drift net') then
+    Exit(RESUPPLY_NETS);
+
+  Result := CHASING;
+end;
+
+// =============================================================================
+// REPORT
+// =============================================================================
+
+(**
+ * Report
+ *
+ * Robust progress report with Progress, XP Tracking, Breaks & Sleeps,
+ * and Activity sections.
+ *)
+procedure Report();
+
+  procedure WriteXPRow(skillName: String; xp, xpPerHour: Int32; colWidth: Int32);
+  var
+    line: String;
+  begin
+    line := '     ' + PadR(skillName, 12, ' ') +
+            PadR(FormatNumber(xp), 12, ' ') +
+            FormatNumber(xpPerHour);
+    WriteLn('| ' + PadR(line, colWidth, ' ') + ' |');
+  end;
+
+var
+  RunTime, ActiveTime: Int64;
+  line: String;
+  bannerWidth: Int32 = REPORT_BANNER_WIDTH;
+  colWidth: Int32;
+  borderLine, dividerLine, sectionHeader, title: String;
+  TimeSinceLastBreak: Int64;
+  xpPerHour: Int32;
+  netsPerHour: Int32;
+begin
+  RunTime := GetTimeRunning();
+  GainedXP := XPBar.Read() - StartXP;
+  GainedFishingXP := Round(GainedXP * FishingXPRatio);
+  GainedHunterXP := Round(GainedXP * HunterXPRatio);
+
+  colWidth := bannerWidth - 4;
+  borderLine := '+' + StringOfChar('-', bannerWidth - 2) + '+';
+  dividerLine := '|' + StringOfChar('-', bannerWidth - 2) + '|';
+
+  title := 'Orka Drift Net Fisher';
+  title := '|' + PadR(PadL(title, (bannerWidth - 2 + Length(title)) div 2, ' '), bannerWidth - 2, ' ') + '|';
+
+  WriteLn('');
+  WriteLn(borderLine);
+  WriteLn(title);
+  WriteLn(borderLine);
+
+  // >> Progress
+  sectionHeader := '| >> Progress';
+  WriteLn(PadR(sectionHeader, bannerWidth - 1, ' ') + '|');
+
+  line := '     Runtime: ' + SRL.MsToTime(RunTime, Time_Short);
+  WriteLn('| ' + PadR(line, colWidth, ' ') + ' |');
+  WriteLn(dividerLine);
+
+  // >> XP Tracking (Active)
+  ActiveTime := RunTime - TotalBreakTime - TotalSleepTime;
+  sectionHeader := '| >> XP Tracking (Active)';
+  WriteLn(PadR(sectionHeader, bannerWidth - 1, ' ') + '|');
+
+  line := '     ' + PadR('Skill', 12, ' ') + PadR('Gained', 12, ' ') + 'XP/Hour';
+  WriteLn('| ' + PadR(line, colWidth, ' ') + ' |');
+
+  if ActiveTime > 0 then
+    xpPerHour := Round(GainedFishingXP / (ActiveTime / 3600000))
+  else
+    xpPerHour := 0;
+  WriteXPRow('Fishing', GainedFishingXP, xpPerHour, colWidth);
+
+  if ActiveTime > 0 then
+    xpPerHour := Round(GainedHunterXP / (ActiveTime / 3600000))
+  else
+    xpPerHour := 0;
+  WriteXPRow('Hunter', GainedHunterXP, xpPerHour, colWidth);
+
+  if ActiveTime > 0 then
+    xpPerHour := Round(GainedXP / (ActiveTime / 3600000))
+  else
+    xpPerHour := 0;
+  WriteXPRow('Total', GainedXP, xpPerHour, colWidth);
+  WriteLn(dividerLine);
+
+  // >> XP Tracking
+  sectionHeader := '| >> XP Tracking';
+  WriteLn(PadR(sectionHeader, bannerWidth - 1, ' ') + '|');
+
+  line := '     ' + PadR('Skill', 12, ' ') + PadR('Gained', 12, ' ') + 'XP/Hour';
+  WriteLn('| ' + PadR(line, colWidth, ' ') + ' |');
+
+  if RunTime > 0 then
+    xpPerHour := Round(GainedFishingXP / (RunTime / 3600000))
+  else
+    xpPerHour := 0;
+  WriteXPRow('Fishing', GainedFishingXP, xpPerHour, colWidth);
+
+  if RunTime > 0 then
+    xpPerHour := Round(GainedHunterXP / (RunTime / 3600000))
+  else
+    xpPerHour := 0;
+  WriteXPRow('Hunter', GainedHunterXP, xpPerHour, colWidth);
+
+  if RunTime > 0 then
+    xpPerHour := Round(GainedXP / (RunTime / 3600000))
+  else
+    xpPerHour := 0;
+  WriteXPRow('Total', GainedXP, xpPerHour, colWidth);
+  WriteLn(dividerLine);
+
+  // >> Breaks & Sleeps
+  sectionHeader := '| >> Breaks & Sleeps';
+  WriteLn(PadR(sectionHeader, bannerWidth - 1, ' ') + '|');
+
+  if TakeBreaks then
+  begin
+    if Length(Antiban.Breaks) > 0 then
+      line := '     Next break: ' + SRL.MsToTime(Max(0, Round(Antiban.Breaks[0].NextAtTime - RunTime)), Time_Short)
+    else
+      line := '     Next break: N/A';
+    WriteLn('| ' + PadR(line, colWidth, ' ') + ' |');
+
+    if LastBreakEndTime > 0 then
+    begin
+      TimeSinceLastBreak := RunTime - LastBreakEndTime;
+      line := '     Since last: ' + SRL.MsToTime(TimeSinceLastBreak, Time_Short);
+    end
+    else
+      line := '     Since last: N/A';
+    WriteLn('| ' + PadR(line, colWidth, ' ') + ' |');
+
+    if TotalBreakTime > 0 then
+      line := '     Total break time: ' + SRL.MsToTime(TotalBreakTime, Time_Short)
+    else
+      line := '     Total break time: 0s';
+    WriteLn('| ' + PadR(line, colWidth, ' ') + ' |');
+  end
+  else
+  begin
+    line := '     Breaks: Disabled';
+    WriteLn('| ' + PadR(line, colWidth, ' ') + ' |');
+  end;
+
+  if TakeSleeps then
+  begin
+    if Length(Antiban.Sleeps) > 0 then
+      line := '     Next sleep: ' + SRL.MsToTime(Max(0, Round(Antiban.Sleeps[0].NextAtTime - RunTime)), Time_Short)
+    else
+      line := '     Next sleep: N/A';
+    WriteLn('| ' + PadR(line, colWidth, ' ') + ' |');
+  end
+  else
+  begin
+    line := '     Next sleep: Disabled';
+    WriteLn('| ' + PadR(line, colWidth, ' ') + ' |');
+  end;
+
+  if ShutdownTime > 0 then
+    line := '     Shutdown: ' + SRL.MsToTime(Max(0, ShutdownTime - RunTime), Time_Short)
+  else
+    line := '     Shutdown: Disabled';
+  WriteLn('| ' + PadR(line, colWidth, ' ') + ' |');
+
+  // >> Activity
+  WriteLn(dividerLine);
+  sectionHeader := '| >> Activity';
+  WriteLn(PadR(sectionHeader, bannerWidth - 1, ' ') + '|');
+
+  if RunTime > 0 then
+    netsPerHour := Round(TotalNetsHarvested / (RunTime / 3600000))
+  else
+    netsPerHour := 0;
+  line := '     Nets harvested: ' + PadR(FormatNumber(TotalNetsHarvested), 8, ' ') +
+          FormatNumber(netsPerHour) + '/hr';
+  WriteLn('| ' + PadR(line, colWidth, ' ') + ' |');
+
+  // Footer
+  WriteLn(borderLine);
+  title := 'Orka Scripts';
+  title := '|' + PadR(PadL(title, (bannerWidth - 2 + Length(title)) div 2, ' '), bannerWidth - 2, ' ') + '|';
+  WriteLn(title);
+  WriteLn(borderLine);
+  WriteLn('');
+end;
+
+// -----------------------------------------------------------------------------
+// Discord Reporting
+// -----------------------------------------------------------------------------
+
+(**
+ * SendDiscordReport
+ *
+ * Sends a progress report embed to Discord with a screenshot.
+ *
+ * @param reportTitle  The embed title (e.g. 'Hourly Report', 'Level Up!')
+ * @param embedColor   The embed color
+ *)
+procedure SendDiscordReport(reportTitle: String; embedColor: Int32);
+var
+  RunTime: Int64;
+  XPPerHour, NetsPerHour, EmbedIdx: Int32;
+begin
+  if not UseDiscord then Exit;
+
+  GainedXP := XPBar.Read() - StartXP;
+  GainedFishingXP := Round(GainedXP * FishingXPRatio);
+  GainedHunterXP := Round(GainedXP * HunterXPRatio);
+  RunTime := GetTimeRunning();
+  if RunTime > 0 then
+  begin
+    XPPerHour := Round(GainedXP / (RunTime / 3600000));
+    NetsPerHour := Round(TotalNetsHarvested / (RunTime / 3600000));
+  end;
+
+  try
+    EmbedIdx := Discord.Webhook.AddEmbed();
+    with Discord.Webhook.Embeds[EmbedIdx] do
+    begin
+      Title := reportTitle;
+      Description :=
+        'Runtime: ' + SRL.MsToTime(RunTime, Time_Short) + LineEnding +
+        'Nets Harvested: ' + ToString(TotalNetsHarvested) + LineEnding +
+        'Nets/Hr: ' + ToString(NetsPerHour) + LineEnding +
+        'Fishing XP: ' + ToString(GainedFishingXP) + LineEnding +
+        'Hunter XP: ' + ToString(GainedHunterXP) + LineEnding +
+        'Total XP: ' + ToString(GainedXP) + LineEnding +
+        'XP/Hr: ' + ToString(XPPerHour);
+      Color := embedColor;
+      Footer := SCRIPT_NAME;
+    end;
+
+    Discord.SendScreenshot(AnonymousScreenshots);
+  except
+    WriteLn('[Orka Drift Net Fisher]: Discord report error: ' + GetExceptionMessage());
+  end;
+end;
+
+procedure _OnTerminateDiscord();
+var
+  RunTime: Int64;
+  XPPerHour, NetsPerHour, EmbedIdx: Int32;
+begin
+  if not UseDiscord then Exit;
+
+  Config.IsSetup := False;
+  Discord.Config.IsSetup := False;
+
+  try
+    RunTime := GetTimeRunning();
+    if RunTime > 0 then
+    begin
+      XPPerHour := Round(GainedXP / (RunTime / 3600000));
+      NetsPerHour := Round(TotalNetsHarvested / (RunTime / 3600000));
+    end;
+
+    Discord.Webhook.Content := ':white_check_mark: **Session Complete**';
+    EmbedIdx := Discord.Webhook.AddEmbed();
+    with Discord.Webhook.Embeds[EmbedIdx] do
+    begin
+      Title := 'Session Summary';
+      Description :=
+        'Runtime: ' + SRL.MsToTime(RunTime, Time_Short) + LineEnding +
+        'Nets Harvested: ' + ToString(TotalNetsHarvested) + LineEnding +
+        'Nets/Hr: ' + ToString(NetsPerHour) + LineEnding +
+        'Fishing XP: ' + ToString(GainedFishingXP) + LineEnding +
+        'Hunter XP: ' + ToString(GainedHunterXP) + LineEnding +
+        'Total XP: ' + ToString(GainedXP) + LineEnding +
+        'XP/Hr: ' + ToString(XPPerHour);
+      Color := $00AA00;
+      Footer := SCRIPT_NAME;
+    end;
+
+    Discord.SendScreenshot(AnonymousScreenshots);
+    Discord.Free();
+  except
+    WriteLn('[Orka Drift Net Fisher]: Discord termination error: ' + GetExceptionMessage());
+  end;
+end;
+
+// =============================================================================
+// MAIN LOOP
+// =============================================================================
+
+(**
+ * Loop
+ *
+ * Main loop iteration. Checks activity, reports, dispatches state.
+ *)
+procedure Loop();
+var
+  state: EState;
+begin
+  // Inactivity termination
+  if WL.Activity.IsFinished() then
+  begin
+    if RSClient.IsLoggedIn() then Logout.ClickLogout();
+    TerminateScript('No activity detected for 5 minutes');
+  end;
+
+  // Shutdown timer
+  if (ShutdownTime > 0) and (GetTimeRunning() >= ShutdownTime) then
+  begin
+    Report();
+    if RSClient.IsLoggedIn() then Logout.ClickLogout();
+    TerminateScript('Shutdown timer reached');
+  end;
+
+  // Periodic report
+  if ReportTimer.ElapsedTime() > REPORT_FREQUENCY then
+  begin
+    Report();
+    ReportTimer.Reset();
+  end;
+
+  // Discord hourly report
+  if UseDiscord and DiscordReportTimer.IsFinished() then
+  begin
+    SendDiscordReport('Hourly Report', $0000FF);
+    DiscordReportTimer.Restart();
+  end;
+
+  // During CHASING, skip expensive checks (Inventory, IsInFishingArea)
+  // to match object-mapper frame rate. Full check every 10s as safety net.
+  if (LastLoopState = CHASING) and (GetTickCount() - LastFullStateCheck < 10000) then
+  begin
+    if not RSClient.IsLoggedIn() then
+      state := HANDLE_LOGIN
+    else if HANDLE_LEVEL_UP_CHAT and Chat.LeveledUp() then
+      state := HANDLE_LEVEL_UP
+    else if DriftNet.IsOpen() then
+      state := HANDLE_DRIFT_NET_CATCH
+    else if RSInterface.IsOpen() then
+      state := CLOSE_INTERFACE
+    else if NeedsNetCheck then
+      state := CHECK_AREA_NET
+    else if NetFullSuspected then
+      state := HANDLE_FULL_NET
+    else
+      state := CHASING;
+  end
+  else
+  begin
+    state := GetState();
+    LastFullStateCheck := GetTickCount();
+  end;
+
+  if state <> CHASING then
+  begin
+    RSClient.Image.Clear();
+    WriteDebug('State: ' + ToStr(state));
+  end;
+
+  case state of
+    HANDLE_LOGIN:
+    begin
+      WriteLog('Login | Attempting to log in');
+      if Login.LoginPlayer() then
+      begin
+        Wait(2000, 3000);
+        WL.Activity.Restart();
+        WriteLog('Login | Successfully logged in');
+      end
+      else
+        Wait(3000, 5000);
+    end;
+
+    HANDLE_LEVEL_UP:
+    begin
+      WriteLog('Level | Level-up detected, dismissing dialogue');
+      Chat.HandleLevelUp();
+      Wait(300, 500);
+      if UseDiscord then
+        SendDiscordReport('Level Up!', $FFA500);
+      WL.Activity.Restart();
+    end;
+
+    HANDLE_DRIFT_NET_CATCH:
+    begin
+      WriteLog('Net | DriftNet interface detected (misclick), processing');
+      ProcessDriftNetInterface();
+
+      if Inventory.ContainsItem('Drift net') then
+      begin
+        WriteDebug('Net | Setting new net after unexpected harvest');
+        SetNetOnAnchor(CurrentArea);
+      end;
+
+      ResetChaseState();
+      WL.Activity.Restart();
+    end;
+
+    CLOSE_INTERFACE:
+    begin
+      WriteDebug('Interface | Closing open interface');
+      RSInterface.Close(True);
+      Wait(300, 500);
+    end;
+
+    NAVIGATE_TO_FISHING:
+    begin
+      WriteLog('Navigate | Moving to fishing area');
+      if NavigateToFishingArea() then
+      begin
+        NorthNetChecked := False;
+        SouthNetChecked := False;
+        NeedsNetCheck := True;
+        ResetChaseState();
+        WL.Activity.Restart();
+      end;
+    end;
+
+    CHECK_AREA_NET:
+    begin
+      HandleNetOnArrival(CurrentArea);
+      NeedsNetCheck := False;
+      if CurrentArea = AREA_NORTH then
+        NorthNetChecked := True
+      else
+        SouthNetChecked := True;
+      ResetChaseState();
+      EnsureWeaponEquipped();
+      WL.Activity.Restart();
+    end;
+
+    HANDLE_FULL_NET:
+    begin
+      WriteLog('Net | Handling full net in ' + ToStr(CurrentArea));
+      NetFullSuspected := False;
+      CheckAndHandleFullNet();
+      WL.Activity.Restart();
+    end;
+
+    RESUPPLY_NETS:
+    begin
+      WriteLog('Resupply | No drift nets, attempting restock (fail count: ' + ToStr(ResupplyFailCount) + ')');
+
+      // Safety net: terminate after 5 consecutive failures
+      if ResupplyFailCount >= 5 then
+      begin
+        WriteLog('Resupply | FATAL: 5 consecutive resupply failures, terminating');
+        TerminateScript('Resupply stuck: 5 consecutive failures');
+      end;
+
+      // After 2 consecutive failures, try WalkBlind to escape dead zone
+      if ResupplyFailCount >= 2 then
+      begin
+        WriteLog('Resupply | DeadZone | Using WalkBlind to escape (pos=' + ToStr(Map.Position()) + ')');
+        Map.Walker.WalkBlind(MIDDLE_CENTER, 8);
+        Wait(600, 1000);
+      end;
+
+      if IsInFishingArea() or IsInUnderwaterCorridor() then
+      begin
+        // Near Annette: try withdrawal first
+        if not WithdrawNetsFromAnnette(Random(NETS_WITHDRAW_MIN, NETS_WITHDRAW_MAX)) then
+        begin
+          // Annette empty - deposit noted nets if we have them
+          if Inventory.ContainsItem('noted drift net') then
+          begin
+            WriteLog('Resupply | Annette empty, depositing noted nets');
+            if DepositNotedNetsToAnnette() and Inventory.ContainsItem('Drift net') then
+            begin
+              WriteLog('Resupply | Resolved via noted net deposit');
+              ResetChaseState();
+              EnsureWeaponEquipped();
+              ResupplyFailCount := 0;
+              WL.Activity.Restart();
+              Exit;
+            end;
+          end;
+
+          // Still no nets - full bank restock
+          if RSInterface.IsOpen() then
+          begin
+            RSInterface.Close(True);
+            Wait(300, 500);
+          end;
+          UnequipWeapon();
+          WriteLog('Resupply | Annette empty, full bank restock');
+          RestockDriftNetsFromBank();
+        end;
+      end
+      else
+      begin
+        // Not near Annette (mid-trip recovery): go straight to bank restock
+        WriteLog('Resupply | Not near Annette (pos=' + ToStr(Map.Position()) + '), bank restock');
+        RestockDriftNetsFromBank();
+      end;
+
+      ResetChaseState();
+      EnsureWeaponEquipped();
+
+      // Only restart activity timer on success; let inactivity timeout trigger on failure
+      if Inventory.ContainsItem('Drift net') then
+      begin
+        ResupplyFailCount := 0;
+        WL.Activity.Restart();
+      end
+      else
+      begin
+        Inc(ResupplyFailCount);
+        WriteLog('Resupply | Failed to obtain drift nets (fail count: ' + ToStr(ResupplyFailCount) + ')');
+      end;
+    end;
+
+    RESUPPLY_NUMULITES:
+    begin
+      WriteLog('Resupply | No numulites, restocking from bank');
+      RestockNumulitesFromBank();
+      ResetChaseState();
+      WL.Activity.Restart();
+    end;
+
+    CHASING:
+    begin
+      CheckAndUseSpec();
+      RunChaseFrame();
+    end;
+  end;
+
+  LastLoopState := state;
+  Antiban.DoAntiban(True, True);
+  Wait(50, 100);
+end;
+
+// =============================================================================
+// CONFIG SAVE/LOAD
+// =============================================================================
+
+procedure SaveConfig();
+begin
+  if not Config.IsSetup then
+    Config.Setup('orka-drift-net-fisher');
+
+  Config.Put('weapon_index', GUI.combo_Weapon.GetItemIndex());
+  Config.Put('disposeFish', DisposeFish);
+  Config.Put('takeBreaks', TakeBreaks);
+  Config.Put('breakAfter', BreakAfter);
+  Config.Put('breakFor', BreakFor);
+  Config.Put('takeSleeps', TakeSleeps);
+  Config.Put('sleepAtTime', SleepAtTime);
+  Config.Put('sleepForHours', SleepForHours);
+  Config.Put('shutdownAfter', GUI.edit_ShutdownAfter.GetText());
+  Config.Put('checkGameSettings', False);
+  Config.Put('discordEnabled', GUI.DiscordEnabledCheckbox.IsChecked());
+  Config.Put('discordAnonymous', GUI.DiscordAnonymousCheckbox.IsChecked());
+  Config.Put('discordWebhook', GUI.DiscordWebhookEdit.GetText());
+end;
+
+procedure LoadConfig();
+begin
+  if not Config.IsSetup then
+    Config.Setup('orka-drift-net-fisher');
+
+  if Config.Has('weapon_index') then
+    GUI.combo_Weapon.SetItemIndex(Config.GetInt('weapon_index'));
+  if Config.Has('disposeFish') then
+    GUI.cb_DisposeFish.SetChecked(Config.GetBoolean('disposeFish'));
+  if Config.Has('takeBreaks') then
+    GUI.cb_TakeBreaks.SetChecked(Config.GetBoolean('takeBreaks'));
+  if Config.Has('breakAfter') then
+    GUI.edit_BreakAfter.SetText(ToStr(Config.GetInt('breakAfter')));
+  if Config.Has('breakFor') then
+    GUI.edit_BreakFor.SetText(ToStr(Config.GetInt('breakFor')));
+  if Config.Has('takeSleeps') then
+    GUI.cb_TakeSleeps.SetChecked(Config.GetBoolean('takeSleeps'));
+  if Config.Has('sleepAtTime') then
+    GUI.edit_SleepAtTime.SetText(Config.GetString('sleepAtTime'));
+  if Config.Has('sleepForHours') then
+    GUI.edit_SleepForHours.SetText(ToStr(Config.GetInt('sleepForHours')));
+  if Config.Has('shutdownAfter') then
+    GUI.edit_ShutdownAfter.SetText(Config.GetString('shutdownAfter'));
+end;
+
+// =============================================================================
+// GUI
+// =============================================================================
+{$IFDEF SCRIPT_GUI}
+
+procedure TGUI.StartScript(Sender: TObject); override;
+var
+  shutdownMinutes: Int32;
+begin
+  // Read weapon selection
+  DetectedWeaponName := Self.combo_Weapon.GetText();
+
+  // Read fish handling
+  DisposeFish := Self.cb_DisposeFish.IsChecked();
+  BankFish := not DisposeFish;
+
+  // Read break/sleep settings
+  TakeBreaks := Self.cb_TakeBreaks.IsChecked();
+  BreakAfter := Self.edit_BreakAfter.GetText().ExtractInteger();
+  BreakFor := Self.edit_BreakFor.GetText().ExtractInteger();
+  TakeSleeps := Self.cb_TakeSleeps.IsChecked();
+  SleepAtTime := Self.edit_SleepAtTime.GetText();
+  SleepForHours := Self.edit_SleepForHours.GetText().ExtractInteger();
+
+  // Read shutdown timer
+  shutdownMinutes := Self.edit_ShutdownAfter.GetText().ExtractInteger();
+  if shutdownMinutes > 0 then
+    ShutdownTime := shutdownMinutes * ONE_MINUTE
+  else
+    ShutdownTime := 0;
+
+  // Settings check
+  CheckGameSettings := Self.cb_CheckGameSettings.IsChecked();
+
+  // Discord
+  UseDiscord := Self.DiscordEnabledCheckbox.IsChecked();
+  AnonymousScreenshots := Self.DiscordAnonymousCheckbox.IsChecked();
+  if UseDiscord then
+  begin
+    Discord.Setup();
+    Discord.SetWebhook(Self.DiscordWebhookEdit.GetText());
+    Discord.SetUsername(SCRIPT_NAME);
+    Discord.SetAvatar('https://raw.githubusercontent.com/orkabyte/orka-scripts/refs/heads/main/orka-drift-net-fisher/orka-drift-net-fisher-disc-notification.jpeg');
+  end;
+
+  // Block real input
+  WLSettings.RemoteInput.BlockInput := True;
+  RSClient.RemoteInput.DisableRealInput();
+
+  SaveConfig();
+  inherited;
+end;
+
+(**
+ * TGUI.OpenWebhookHelp
+ *
+ * Opens the Discord webhook setup guide in the browser.
+ *
+ * @param sender  The object that triggered the event
+ *)
+procedure TGUI.OpenWebhookHelp(sender: TObject);
+begin
+  sender; // suppress unused warning
+  OpenWebPage('https://support.discord.com/hc/en-us/articles/228383668-Intro-to-Webhooks');
+end;
+
+(**
+ * TGUI.TestDiscordWebhook
+ *
+ * Tests the configured Discord webhook by sending a test message.
+ *
+ * @param sender  The object that triggered the event
+ *)
+procedure TGUI.TestDiscordWebhook(sender: TObject);
+var
+  testClient: TDiscordClient;
+begin
+  testClient.Setup();
+  if testClient.SetWebhook(Self.DiscordWebhookEdit.GetText()) then
+  begin
+    testClient.SetUsername(SCRIPT_NAME);
+    testClient.SetAvatar('https://raw.githubusercontent.com/orkabyte/orka-scripts/refs/heads/main/orka-drift-net-fisher/orka-drift-net-fisher-disc-notification.jpeg');
+    testClient.Webhook.Content := 'Webhook test successful!';
+    if testClient.Send() then
+      Self.DiscordTestButton.SetCaption('Success!')
+    else
+      Self.DiscordTestButton.SetCaption('Send Failed');
+  end
+  else
+    Self.DiscordTestButton.SetCaption('Invalid URL');
+  testClient.Free();
+end;
+
+(**
+ * TGUI.OnRecordCrashesChange
+ *
+ * Handles toggling of the "Record crashes" checkbox, enabling/disabling
+ * the video time input and persisting the setting.
+ *
+ * @param Sender  The control that triggered the event
+ *)
+procedure TGUI.OnRecordCrashesChange(Sender: TObject);
+var
+  checked: Boolean;
+begin
+  checked := TCheckBox(Sender).IsChecked();
+  Self.edit_VideoTime.SetEnabled(checked);
+  WLSettings.GetObject('video').Put('enabled', checked);
+  WLSettings.SaveConfig();
+end;
+
+(**
+ * TGUI.OnVideoTimeChange
+ *
+ * Handles changes to the video time input field and persists the value.
+ *
+ * @param Sender  The control that triggered the event
+ *)
+procedure TGUI.OnVideoTimeChange(Sender: TObject);
+begin
+  WLSettings.GetObject('video').Put('time', StrToInt(TEdit(Sender).getText()));
+  WLSettings.SaveConfig();
+end;
+
+(**
+ * SetChildsWhiteBoldFont
+ *
+ * Recursively applies bold white font styling to a control and all its children.
+ *
+ * @param ctrl  The control to style
+ *)
+procedure SetChildsWhiteBoldFont(ctrl: TControl);
+var
+  i: Int32;
+  child: TControl;
+begin
+  for i := 0 to ctrl.getComponentCount() - 1 do
+  begin
+    child := ctrl.GetComponent(i);
+    SetChildsWhiteBoldFont(child);
+  end;
+
+  ctrl.GetFont().SetColor(clWhite);
+  ctrl.GetFont().SetStyle([fsBold]);
+end;
+
+procedure TGUI.Run(); override;
+var
+  Tab, AccountTab: TTabSheet;
+  AccountPanel: TPanel;
+  Font: TFont;
+  Img: TPicture;
+  BGImg: TImage;
+  col1, col2, currentTop, spacing: Int32;
+  amSelectorPanel, amUserPanel, amPassPanel, amPinPanel: TControl;
+  amWorldsPanel, amAddBtn, amSaveBtn, amDeleteBtn: TControl;
+  helpBtn: TButton;
+begin
+  Self.Setup(SCRIPT_NAME, [880, 495]);
+  Self.Start.SetOnClick(@Self.StartScript);
+
+  // Font setup
+  Font.Init();
+  Font.setName('Verdana');
+  Font.SetQuality(fqCleartype);
+  Self.Form.setFont(Font);
+  Self.PageControl.SetFont(Font);
+  Font.Free();
+
+  // Download background image if not exists
+  if not FileExists(AppPath + 'Resources\OrkaDriftNetFisherBG.jpg') then
+    DownloadToFile('https://raw.githubusercontent.com/orkabyte/orka-scripts/refs/heads/main/orka-drift-net-fisher/orka-drift-net-fisher-bg.jpg', AppPath + 'Resources\OrkaDriftNetFisherBG.jpg');
+
+  // Setup background image on PageControl
+  if FileExists(AppPath + 'Resources\OrkaDriftNetFisherBG.jpg') then
+  begin
+    Img.Init();
+    Img.LoadFromFile(AppPath + 'Resources\OrkaDriftNetFisherBG.jpg');
+    with BGImg do
+    begin
+      Init(Self.PageControl);
+      SetParent(Self.PageControl);
+      SetPicture(Img);
+      SetAlign(alClient);
+      SetStretch(True);
+    end;
+  end;
+
+  // Layout constants — col2 aligned with Start button (660 left, 190 wide)
+  col1 := TControl.AdjustToDPI(460);
+  col2 := TControl.AdjustToDPI(667);
+  spacing := TControl.AdjustToDPI(10);
+  currentTop := TControl.AdjustToDPI(30);
+
+  // ===== Tab 1: Script Settings =====
+  Self.AddTab('Script Settings');
+  Tab := Self.Tabs[High(Self.Tabs)];
+
+  // === Column 1: Weapon ===
+
+  // Weapon selection
+  with Self.combo_Weapon do
+  begin
+    Create(Tab);
+    SetCaption('Preferred Weapon:');
+    SetLeft(col1);
+    SetTop(currentTop + TControl.AdjustToDPI(39));
+    SetWidth(TControl.AdjustToDPI(180));
+    SetStyle(csDropDownList);
+    AddItemArray(WEAPON_NAMES);
+    SetItemIndex(1); // Default: Merfolk trident
+    SetFontColor($1A2A31);
+    Caption.GetFont().SetColor(clWhite);
+    Caption.GetFont().SetStyle([fsBold]);
+    SetHint('Select weapon to use underwater.');
+  end;
+
+  // Dispose fish checkbox
+  with Self.cb_DisposeFish do
+  begin
+    Create(Tab);
+    SetCaption('Dispose fish');
+    SetLeft(col1);
+    SetTop(Self.combo_Weapon.GetTop() + Self.combo_Weapon.GetHeight() + spacing + TControl.AdjustToDPI(10));
+    SetWidth(TControl.AdjustToDPI(180));
+    SetChecked(False);
+    SetFontColor($1A2A31);
+    Caption.GetFont().SetColor(clWhite);
+    Caption.GetFont().SetStyle([fsBold]);
+    SetHint('When enabled, fish are discarded instead of banked.');
+  end;
+
+  // === Column 2: Breaks, Sleeps, Shutdown ===
+
+  currentTop := TControl.AdjustToDPI(45);
+
+  // Take breaks checkbox
+  with Self.cb_TakeBreaks do
+  begin
+    Create(Tab);
+    SetCaption('Take breaks');
+    SetLeft(col2);
+    SetTop(currentTop);
+    SetWidth(TControl.AdjustToDPI(180));
+    SetChecked(True);
+    SetFontColor($1A2A31);
+    Caption.GetFont().SetColor(clWhite);
+    Caption.GetFont().SetStyle([fsBold]);
+  end;
+
+  currentTop := Self.cb_TakeBreaks.GetTop() + Self.cb_TakeBreaks.GetHeight() + spacing;
+
+  // Break after (minutes)
+  with Self.edit_BreakAfter do
+  begin
+    Create(Tab);
+    SetCaption('Break after (min):');
+    SetLeft(col2);
+    SetTop(currentTop);
+    SetWidth(TControl.AdjustToDPI(180));
+    SetHeight(TControl.AdjustToDPI(36));
+    SetText('120');
+    SetFontColor($1A2A31);
+    Caption.GetFont().SetColor(clWhite);
+    Caption.GetFont().SetStyle([fsBold]);
+    Edit.setOnKeyPress(@Edit.NumberField);
+  end;
+
+  currentTop := Self.edit_BreakAfter.GetTop() + Self.edit_BreakAfter.GetHeight() + spacing;
+
+  // Break for (minutes)
+  with Self.edit_BreakFor do
+  begin
+    Create(Tab);
+    SetCaption('Break for (min):');
+    SetLeft(col2);
+    SetTop(currentTop);
+    SetWidth(TControl.AdjustToDPI(180));
+    SetHeight(TControl.AdjustToDPI(36));
+    SetText('30');
+    SetFontColor($1A2A31);
+    Caption.GetFont().SetColor(clWhite);
+    Caption.GetFont().SetStyle([fsBold]);
+    Edit.setOnKeyPress(@Edit.NumberField);
+  end;
+
+  currentTop := Self.edit_BreakFor.GetTop() + Self.edit_BreakFor.GetHeight() + spacing + TControl.AdjustToDPI(15);
+
+  // Take sleeps checkbox
+  with Self.cb_TakeSleeps do
+  begin
+    Create(Tab);
+    SetCaption('Take sleeps');
+    SetLeft(col2);
+    SetTop(currentTop);
+    SetWidth(TControl.AdjustToDPI(180));
+    SetChecked(False);
+    SetFontColor($1A2A31);
+    Caption.GetFont().SetColor(clWhite);
+    Caption.GetFont().SetStyle([fsBold]);
+  end;
+
+  currentTop := Self.cb_TakeSleeps.GetTop() + Self.cb_TakeSleeps.GetHeight() + spacing;
+
+  // Sleep at time
+  with Self.edit_SleepAtTime do
+  begin
+    Create(Tab);
+    SetCaption('Sleep at time (HH:MM):');
+    SetLeft(col2);
+    SetTop(currentTop);
+    SetWidth(TControl.AdjustToDPI(180));
+    SetHeight(TControl.AdjustToDPI(36));
+    SetText('23:00');
+    SetFontColor($1A2A31);
+    Caption.GetFont().SetColor(clWhite);
+    Caption.GetFont().SetStyle([fsBold]);
+  end;
+
+  currentTop := Self.edit_SleepAtTime.GetTop() + Self.edit_SleepAtTime.GetHeight() + spacing;
+
+  // Sleep for (hours)
+  with Self.edit_SleepForHours do
+  begin
+    Create(Tab);
+    SetCaption('Sleep for (hours):');
+    SetLeft(col2);
+    SetTop(currentTop);
+    SetWidth(TControl.AdjustToDPI(180));
+    SetHeight(TControl.AdjustToDPI(36));
+    SetText('8');
+    SetFontColor($1A2A31);
+    Caption.GetFont().SetColor(clWhite);
+    Caption.GetFont().SetStyle([fsBold]);
+    Edit.setOnKeyPress(@Edit.NumberField);
+  end;
+
+  currentTop := Self.edit_SleepForHours.GetTop() + Self.edit_SleepForHours.GetHeight() + spacing + TControl.AdjustToDPI(15);
+
+  // Shutdown timer
+  with Self.edit_ShutdownAfter do
+  begin
+    Create(Tab);
+    SetCaption('Shutdown after (min):');
+    SetLeft(col2);
+    SetTop(currentTop);
+    SetWidth(TControl.AdjustToDPI(180));
+    SetHeight(TControl.AdjustToDPI(36));
+    SetText('600');
+    SetFontColor($1A2A31);
+    Caption.GetFont().SetColor(clWhite);
+    Caption.GetFont().SetStyle([fsBold]);
+    SetHint('Auto-shutdown after this many minutes. Set to 0 to disable.');
+    Edit.setOnKeyPress(@Edit.NumberField);
+  end;
+
+  // Start button
+  Self.Start.setVisible(False);
+  with Self.Start do
+  begin
+    SetAlign(alNone);
+    SetBounds(
+      Self.Form.GetWidth()  - TControl.AdjustToDPI(210),
+      Self.Form.GetHeight() - TControl.AdjustToDPI(80),
+      TControl.AdjustToDPI(180),
+      TControl.AdjustToDPI(60)
+    );
+    SetCaption('Start');
+    GetFont().SetName('Verdana');
+    GetFont().SetSize(15);
+    setVisible(True);
+  end;
+
+  // ===== Tab 2: Account Manager =====
+  Self.AddTab('Account Manager');
+  AccountTab := Self.Tabs[High(Self.Tabs)];
+  AccountPanel := Self.CreateAccountManager(AccountTab);
+
+  // Apply bold white styling to Account Manager labels
+  SetChildsWhiteBoldFont(AccountPanel);
+
+  // Move Account Manager panel down and ensure enough height for buttons
+  AccountPanel.SetTop(TControl.AdjustToDPI(10));
+  AccountPanel.SetHeight(TControl.AdjustToDPI(170));
+
+  // Reposition Account Manager fields to top-right
+  // Worlds width = selector width (200), right edge at 850, so worlds left = 650
+  // Left column shifts right by 60 (was 370, now 430)
+  amSelectorPanel := Self.Form.GetChild('am_selector_panel');
+  if amSelectorPanel <> nil then
+  begin
+    amSelectorPanel.SetLeft(TControl.AdjustToDPI(447));
+    amSelectorPanel.SetWidth(TControl.AdjustToDPI(200));
+  end;
+
+  amUserPanel := Self.Form.GetChild('am_user_panel');
+  if amUserPanel <> nil then
+  begin
+    amUserPanel.SetLeft(TControl.AdjustToDPI(447));
+    amUserPanel.SetWidth(TControl.AdjustToDPI(200));
+    amUserPanel.SetHeight(TControl.AdjustToDPI(36));
+  end;
+
+  amPassPanel := Self.Form.GetChild('am_pass_panel');
+  if amPassPanel <> nil then
+  begin
+    amPassPanel.SetLeft(TControl.AdjustToDPI(447));
+    amPassPanel.SetWidth(TControl.AdjustToDPI(120));
+    amPassPanel.SetHeight(TControl.AdjustToDPI(36));
+  end;
+
+  amPinPanel := Self.Form.GetChild('am_pin_panel');
+  if amPinPanel <> nil then
+  begin
+    amPinPanel.SetLeft(TControl.AdjustToDPI(577));
+    amPinPanel.SetWidth(TControl.AdjustToDPI(70));
+    amPinPanel.SetHeight(TControl.AdjustToDPI(36));
+  end;
+
+  amWorldsPanel := Self.Form.GetChild('am_worlds_panel');
+  if amWorldsPanel <> nil then
+  begin
+    amWorldsPanel.SetLeft(TControl.AdjustToDPI(667));
+    amWorldsPanel.SetWidth(TControl.AdjustToDPI(180));
+    amWorldsPanel.SetHeight(TControl.AdjustToDPI(120));
+    // Rename worlds label and add hint to panel
+    amWorldsPanel := Self.Form.GetChild('am_worlds_caption');
+    if amWorldsPanel <> nil then
+      amWorldsPanel.SetCaption('Worlds:');
+    amWorldsPanel := Self.Form.GetChild('am_worlds_panel');
+    if amWorldsPanel <> nil then
+    begin
+      amWorldsPanel.SetHint('Comma-separated world list, e.g. 302, 305, 444');
+      amWorldsPanel.SetShowHint(True);
+    end;
+  end;
+
+  // Reposition buttons below password/bank pin row
+  amAddBtn := Self.Form.GetChild('am_add_button');
+  if amAddBtn <> nil then
+  begin
+    amAddBtn.SetLeft(TControl.AdjustToDPI(447));
+    amAddBtn.SetTop(TControl.AdjustToDPI(135));
+    amAddBtn.SetWidth(TControl.AdjustToDPI(110));
+    amAddBtn.SetHeight(TControl.AdjustToDPI(30));
+  end;
+
+  amSaveBtn := Self.Form.GetChild('am_save_button');
+  if amSaveBtn <> nil then
+  begin
+    amSaveBtn.SetLeft(TControl.AdjustToDPI(562));
+    amSaveBtn.SetTop(TControl.AdjustToDPI(135));
+    amSaveBtn.SetWidth(TControl.AdjustToDPI(120));
+    amSaveBtn.SetHeight(TControl.AdjustToDPI(30));
+  end;
+
+  amDeleteBtn := Self.Form.GetChild('am_delete_button');
+  if amDeleteBtn <> nil then
+  begin
+    amDeleteBtn.SetLeft(TControl.AdjustToDPI(687));
+    amDeleteBtn.SetTop(TControl.AdjustToDPI(135));
+    amDeleteBtn.SetWidth(TControl.AdjustToDPI(115));
+    amDeleteBtn.SetHeight(TControl.AdjustToDPI(30));
+  end;
+
+  // Record crashes checkbox (second column, below buttons)
+  currentTop := TControl.AdjustToDPI(200);
+
+  with Self.cb_RecordCrashes do
+  begin
+    Create(AccountTab);
+    SetCaption('Record crashes');
+    SetLeft(TControl.AdjustToDPI(667));
+    SetTop(currentTop + TControl.AdjustToDPI(30));
+    SetWidth(TControl.AdjustToDPI(180));
+    SetChecked(WLSettings.GetObject('video').getBoolean('enabled'));
+    SetHint('Record script crashes with Simba. Videos are saved in Data/WaspLib/videos/. This is resource intensive - use only for debugging.');
+    SetFontColor($1A2A31);
+    Caption.GetFont().SetColor(clWhite);
+    Caption.GetFont().SetStyle([fsBold]);
+    CheckBox.setOnChange(@Self.OnRecordCrashesChange);
+  end;
+
+  currentTop := Self.cb_RecordCrashes.GetTop() + Self.cb_RecordCrashes.GetHeight() + spacing;
+
+  // Video time (seconds)
+  with Self.edit_VideoTime do
+  begin
+    Create(AccountTab);
+    SetCaption('Video time (seconds):');
+    SetLeft(TControl.AdjustToDPI(667));
+    SetTop(currentTop);
+    SetWidth(TControl.AdjustToDPI(180));
+    SetHeight(TControl.AdjustToDPI(36));
+    SetMaxLength(2);
+    SetEnabled(WLSettings.GetObject('video').getBoolean('enabled'));
+    SetText(ToStr(WLSettings.GetObject('video').getInt('time')));
+    SetFontColor($1A2A31);
+    Caption.GetFont().SetColor(clWhite);
+    Caption.GetFont().SetStyle([fsBold]);
+    Edit.setOnKeyPress(@Edit.NumberField);
+    Edit.SetOnChange(@Self.OnVideoTimeChange);
+  end;
+
+  currentTop := Self.edit_VideoTime.GetTop() + Self.edit_VideoTime.GetHeight() + TControl.AdjustToDPI(20);
+
+  with Self.cb_CheckGameSettings do
+  begin
+    Create(AccountTab);
+    SetCaption('Check Game Settings');
+    SetLeft(TControl.AdjustToDPI(667));
+    SetTop(currentTop);
+    SetWidth(TControl.AdjustToDPI(180));
+    if Config.Has('checkGameSettings') then
+      SetChecked(Config.GetBoolean('checkGameSettings'))
+    else
+      SetChecked(True);
+    SetFontColor($1A2A31);
+    Caption.GetFont().SetColor(clWhite);
+    Caption.GetFont().SetStyle([fsBold]);
+  end;
+
+  // ===== Tab 3: Discord =====
+  Self.AddTab('Discord');
+  Tab := Self.Tabs[High(Self.Tabs)];
+  currentTop := TControl.AdjustToDPI(30);
+
+  with Self.DiscordEnabledCheckbox do
+  begin
+    Create(Tab);
+    SetLeft(col1);
+    SetTop(currentTop);
+    SetName('discord_enabled');
+    SetCaption('Enable Discord Notifications');
+    SetWidth(TControl.AdjustToDPI(225));
+    SetHint('Sends hourly reports, level-ups, and session summaries to a Discord channel via webhook.' + LineEnding + 'To create one: Server Settings > Integrations > Webhooks > New Webhook > Copy URL.');
+    SetShowHint(True);
+    SetFontColor($1A2A31);
+    Caption.GetFont().SetColor(clWhite);
+    Caption.GetFont().SetStyle([fsBold]);
+  end;
+
+  with Self.DiscordAnonymousCheckbox do
+  begin
+    Create(Tab);
+    SetLeft(Self.DiscordEnabledCheckbox.GetRight());
+    SetTop(currentTop);
+    SetName('discord_anonymous');
+    SetCaption('Anonymous');
+    SetWidth(TControl.AdjustToDPI(180));
+    SetChecked(True);
+    SetHint('Hides your display name and XP bar in screenshots.' + LineEnding + 'Uncheck to include them. Screenshots are only sent to your webhook, never shared elsewhere.');
+    SetShowHint(True);
+    SetFontColor($1A2A31);
+    Caption.GetFont().SetColor(clWhite);
+    Caption.GetFont().SetStyle([fsBold]);
+  end;
+
+  currentTop := Self.DiscordEnabledCheckbox.GetTop() + Self.DiscordEnabledCheckbox.GetHeight() + spacing;
+
+  with Self.DiscordWebhookEdit do
+  begin
+    Create(Tab);
+    SetLeft(col1);
+    SetTop(currentTop);
+    SetName('discord_webhook');
+    SetCaption('Webhook URL:');
+    SetWidth(Self.Form.GetWidth() - col1 - TControl.AdjustToDPI(20));
+    SetFontColor($1A2A31);
+    Caption.GetFont().SetColor(clWhite);
+    Caption.GetFont().SetStyle([fsBold]);
+  end;
+
+  currentTop := Self.DiscordWebhookEdit.GetTop() + Self.DiscordWebhookEdit.GetHeight() + spacing;
+
+  with Self.DiscordTestButton do
+  begin
+    Init(Tab);
+    SetParent(Tab);
+    SetLeft(col1);
+    SetTop(currentTop);
+    SetWidth(TControl.AdjustToDPI(140));
+    SetHeight(TControl.AdjustToDPI(30));
+    SetCaption('Test Webhook');
+    SetOnClick(@Self.TestDiscordWebhook);
+  end;
+
+  helpBtn.Init(Tab);
+  helpBtn.SetParent(Tab);
+  helpBtn.SetLeft(Self.DiscordTestButton.GetRight() + TControl.AdjustToDPI(10));
+  helpBtn.SetTop(Self.DiscordTestButton.GetTop());
+  helpBtn.SetWidth(TControl.AdjustToDPI(140));
+  helpBtn.SetHeight(TControl.AdjustToDPI(30));
+  helpBtn.SetCaption('How to Set Up');
+  helpBtn.SetOnClick(@Self.OpenWebhookHelp);
+
+  if Config.Has('discordEnabled') then
+    Self.DiscordEnabledCheckbox.SetChecked(Config.GetBoolean('discordEnabled'));
+  if Config.Has('discordAnonymous') then
+    Self.DiscordAnonymousCheckbox.SetChecked(Config.GetBoolean('discordAnonymous'));
+  if Config.Has('discordWebhook') then
+    Self.DiscordWebhookEdit.SetText(Config.GetString('discordWebhook'));
+
+  // Load saved config and finalize
+  LoadConfig();
+
+  inherited;
+end;
+
+{$ENDIF}
+
+// =============================================================================
+// EQUIPMENT & INVENTORY VALIDATION
+// =============================================================================
+
+(**
+ * ValidateEquipmentAndInventory
+ *
+ * Validates diving gear, weapon, numulites, and cleans up junk items.
+ * Called in Init() after login, before navigation to fishing area.
+ * May navigate player to surface bank if items are missing.
+ *)
+procedure ValidateEquipmentAndInventory();
+var
+  missing: TStringArray;
+  weaponFound, numulitesFound, needBank: Boolean;
+  fallbackWeapons: TStringArray;
+  bankItem: TRSBankItem;
+  allowedItems: TRSItemArray;
+  i: Int32;
+begin
+  // --- Check required diving gear ---
+  WriteLog('Init | Validating diving gear...');
+  Equipment.Open();
+
+  missing := [];
+  if not Equipment.ContainsItem('Fishbowl helmet') then
+    missing += ['Fishbowl helmet (head slot)'];
+  if not Equipment.ContainsItem('Diving apparatus') then
+    missing += ['Diving apparatus (cape slot)'];
+  if not Equipment.ContainsItem('Flippers') then
+    missing += ['Flippers (feet slot)'];
+
+  if Length(missing) > 0 then
+    TerminateScript('Missing required diving gear: ' + Implode(', ', missing));
+
+  WriteLog('Init | Diving gear: OK');
+
+  // --- Check weapon in equipment/inventory ---
+  if DetectedWeaponName <> '' then
+    weaponFound := Equipment.ContainsItem(DetectedWeaponName) or Inventory.ContainsItem(DetectedWeaponName)
+  else
+    weaponFound := True;
+
+  // --- Check numulites in inventory ---
+  numulitesFound := Inventory.ContainsItem('Numulite');
+
+  needBank := (not weaponFound) or (not numulitesFound);
+
+  if not needBank then
+  begin
+    WriteLog('Init | Weapon and numulites: OK');
+    Exit;
+  end;
+
+  WriteLog('Init | Banking needed (weapon=' + BoolToStr(weaponFound, 'OK', 'MISSING') +
+           ', numulites=' + BoolToStr(numulitesFound, 'OK', 'MISSING') + ')');
+
+  // Navigate to surface if underwater
+  if not IsOnSurface() then
+  begin
+    WriteLog('Init | Navigating to surface for banking');
+
+    if IsInFishingArea() then
+    begin
+      if not DoTransition(DriftNetFishingObjects.UnderwaterPlantDoor, UNDERWATER_CORRIDOR_BOX) then
+        TerminateScript('Validation | Could not exit fishing area');
+    end;
+
+    if IsInUnderwaterCorridor() then
+    begin
+      UnequipWeapon();
+      Map.Walker.WebWalk([23876, 9250], 4);
+      Wait(300, 500);
+      AdjustCameraForTunnel();
+      if not DriftNetFishingObjects.UnderwaterTunnel.WalkClick() then
+        TerminateScript('Validation | Could not enter tunnel');
+      Minimap.WaitMoving(False);
+      if not WaitForTransition(UNDERWATER_ENTRANCE_BOX) then
+        TerminateScript('Validation | Did not arrive at entrance');
+    end;
+
+    if IsInUnderwaterEntrance() then
+    begin
+      if not DoTransition(DriftNetFishingObjects.UnderwaterAnchorRope, SURFACE_BOX) then
+        TerminateScript('Validation | Could not climb to surface');
+    end;
+  end;
+
+  // Open bank on surface
+  WriteLog('Init | Opening bank for item validation');
+  if not DriftNetFishingObjects.SurfaceBankChest.WalkClick() then
+    TerminateScript('Validation | Could not click bank chest');
+  if not Bank.IsOpen(5000, 200) then
+    TerminateScript('Validation | Bank did not open');
+
+  // --- Weapon withdrawal with fallback ---
+  if not weaponFound then
+  begin
+    // Try preferred weapon
+    bankItem := TRSBankItem.Setup(DetectedWeaponName, 1, False);
+    if Bank.WithdrawItem(bankItem, False) then
+    begin
+      Wait(300, 500);
+      weaponFound := True;
+      WriteLog('Init | Withdrew preferred weapon: ' + DetectedWeaponName);
+    end;
+
+    // Try fallback weapons
+    if not weaponFound then
+    begin
+      fallbackWeapons := ['Merfolk trident', 'Dragon harpoon', 'Trident of the seas', 'Trident of the swamp'];
+      for i := 0 to High(fallbackWeapons) do
+      begin
+        if fallbackWeapons[i] = DetectedWeaponName then
+          Continue;
+
+        bankItem := TRSBankItem.Setup(fallbackWeapons[i], 1, False);
+        if Bank.WithdrawItem(bankItem, False) then
+        begin
+          Wait(300, 500);
+          WriteLog('Init | Using fallback weapon: ' + fallbackWeapons[i] +
+                   ' (preferred "' + DetectedWeaponName + '" not found)');
+          DetectedWeaponName := fallbackWeapons[i];
+          weaponFound := True;
+          Break;
+        end;
+      end;
+    end;
+
+    if not weaponFound then
+    begin
+      Bank.Close(True);
+      WriteLn('');
+      WriteLn('ERROR: No weapon found in bank or inventory.');
+      WriteLn('One of these weapons is required for the +2 invisible Fishing level boost:');
+      WriteLn('');
+      WriteLn('| Weapon               | Weight   | Pros                                  | Cons                  |');
+      WriteLn('| Merfolk trident      | 0.907 kg | Lightest, cheap, stores 10 pufferfish | None significant      |');
+      WriteLn('| Trident of the seas  | 2.495 kg | Same chase bonus                      | Heavier, 75 Magic req |');
+      WriteLn('| Trident of the swamp | 2.495 kg | Same chase bonus                      | Heaviest cost         |');
+      WriteLn('| Dragon harpoon       | 2.722 kg | +3 Fishing boost special              | Heaviest, expensive   |');
+      TerminateScript('No valid weapon found in bank or inventory');
+    end;
+  end;
+
+  // --- Numulites withdrawal ---
+  if not numulitesFound then
+  begin
+    bankItem := TRSBankItem.Setup('Numulite', -1, False);
+    if not Bank.WithdrawItem(bankItem, False) then
+    begin
+      if BankFish then
+      begin
+        Bank.Close(True);
+        TerminateScript('No numulites found in bank. Numulites are required for tunnel passage and banking fish.');
+      end
+      else
+        WriteLog('Init | WARNING: No numulites in bank. Will terminate if tunnel passage fails.');
+    end
+    else
+    begin
+      Wait(300, 500);
+      WriteLog('Init | Withdrew numulites from bank');
+    end;
+  end;
+
+  // --- Deposit junk items ---
+  allowedItems := ['Numulite', 'Drift net', 'noted drift net', 'Pufferfish', 'Seaweed spore', DetectedWeaponName];
+  Bank.DepositRandomItems(allowedItems);
+  Wait(300, 500);
+
+  Bank.Close(True);
+  Wait(300, 500);
+  WriteLog('Init | Equipment and inventory validation complete');
+end;
+
+// =============================================================================
+// INIT
+// =============================================================================
+
+(**
+ * Init
+ *
+ * One-time setup after GUI closes. Handles login, validation, antiban, timers.
+ *)
+procedure Init();
+begin
+  // ASCII art branding
+  WriteLn('');
+  WriteLn(' _____                                           _____ ');
+  WriteLn('( ___ )                                         ( ___ )');
+  WriteLn(' |   |~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~|   | ');
+  WriteLn(' |   |    _______  ______    ___   _  _______    |   | ');
+  WriteLn(' |   |   |       ||    _ |  |   | | ||   _   |   |   | ');
+  WriteLn(' |   |   |   _   ||   | ||  |   |_| ||  |_|  |   |   | ');
+  WriteLn(' |   |   |  | |  ||   |_||_ |      _||       |   |   | ');
+  WriteLn(' |   |   |  |_|  ||    __  ||     |_ |       |   |   | ');
+  WriteLn(' |   |   |       ||   |  | ||    _  ||   _   |   |   | ');
+  WriteLn(' |   |   |_______||___|  |_||___| |_||__| |__|   |   | ');
+  WriteLn(' |   |                                           |   | ');
+  WriteLn(' |___|~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~|___| ');
+  WriteLn('(_____)                                         (_____)');
+
+  // ===== Credits block =====
+  WriteLn('');
+  WriteLn('  ___                                             ___  ');
+  WriteLn(' |   |****************  CREDITS  ****************|   | ');
+  WriteLn(' |   |                                           |   | ');
+  WriteLn(' |   |    3Garrett3  |  Torwent  |  Student      |   | ');
+  WriteLn(' |   |    BigAussie  |  Flight   |  Kriptic      |   | ');
+  WriteLn(' |   |    skunkworks |  Fik      |  XJ           |   | ');
+  WriteLn(' |   |    Sebastiaan |  unit     |  Baconadors   |   | ');
+  WriteLn(' |   |                                           |   | ');
+  WriteLn(' |___|~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~|___| ');
+  WriteLn('');
+
+  // Mouse speed (biohash base ± 2 jitter, clamped to range)
+  Mouse.Speed := MOUSE_SPEED_MIN + Antiban.GetBehavior(EBioBehavior.MOUSE_SPEED) * (MOUSE_SPEED_MAX - MOUSE_SPEED_MIN) div 9;
+  Mouse.Speed := EnsureRange(SRL.NormalRange(Mouse.Speed - 2, Mouse.Speed + 2), MOUSE_SPEED_MIN, MOUSE_SPEED_MAX);
+  WriteDebug('Init | Mouse speed: ' + ToStr(Mouse.Speed));
+
+  // Config block
+  WriteLn('  ___                                             ___  ');
+  WriteLn(' |   |*********  Orka Drift Net Fisher  *********|   | ');
+  WriteLn(' |   |                                           |   | ');
+  if DetectedWeaponName <> '' then
+    WriteLn(' |   |    ' + PadR('Weapon: ' + DetectedWeaponName, 39) + '|   | ')
+  else
+    WriteLn(' |   |    ' + PadR('Weapon: None', 39) + '|   | ');
+  WriteLn(' |   |    ' + PadR('Mouse speed: ' + ToStr(Mouse.Speed), 39) + '|   | ');
+  WriteLn(' |   |                                           |   | ');
+  WriteLn(' |___|~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~|___| ');
+  WriteLn('');
+
+  // Login
+  WriteLog('Init | Logging in');
+  if not RSClient.IsLoggedIn() then
+    Login.LoginPlayer();
+  if not WaitUntil(RSClient.IsLoggedIn(), 250, 12000) then
+    TerminateScript('Failed to log in');
+  WriteLog('Init | Login successful');
+
+  if CheckGameSettings then
+    SettingsHandler.CheckGameSettings();
+
+  // XP bar validation
+  StartXP := XPBar.Read();
+  if StartXP < 1024 then
+    TerminateScript('Failed to read XP bar. Enable the XP tracker overlay in-game.');
+  WriteLog('Init | Starting XP: ' + FormatNumber(StartXP));
+
+  // Per-skill XP estimation via ratios
+  FishingLevel := ReadSkillLevelConfirmed(ERSSkill.FISHING);
+  Wait(300, 500);
+  HunterLevel := ReadSkillLevelConfirmed(ERSSkill.HUNTER);
+  if (FishingLevel < 1) or (HunterLevel < 1) then
+    TerminateScript('Failed to get a confirmed skill level reading from the Stats tab.');
+  WriteLog('Init | Fishing level: ' + ToStr(FishingLevel) + ', Hunter level: ' + ToStr(HunterLevel));
+
+  if (FishingLevel >= 70) and (HunterLevel >= 70) then
+    LevelsCached := True;
+
+  CalculateXPRatios();
+
+  // Validate equipment and inventory
+  ValidateEquipmentAndInventory();
+
+  // Camera zoom
+  Options.SetZoomLevel(Random(ZOOM_MIN, ZOOM_MAX));
+
+  // Initialize tracking
+  InitTracking();
+
+  // Setup antiban
+  SetupAntiban();
+
+  // Activity timer
+  WL.Activity.Init(ACTIVITY_TIMEOUT);
+
+  // Start timers
+  ReportTimer.Start();
+
+  if UseDiscord then
+  begin
+    DiscordReportTimer.Setup(3600000);
+    DiscordReportTimer.Restart();
+    AddOnTerminate(@_OnTerminateDiscord);
+  end;
+
+  // Navigate to fishing area
+  WriteLog('Init | Navigating to fishing area');
+  if not NavigateToFishingArea() then
+    TerminateScript('Could not navigate to fishing area from current position');
+
+  // Randomly pick starting area
+  if Random(2) = 0 then
+    CurrentArea := AREA_NORTH
+  else
+    CurrentArea := AREA_SOUTH;
+
+  WriteLog('Init | Starting in ' + ToStr(CurrentArea));
+
+  // Handle net in starting area
+  if Inventory.ContainsItem('Drift net') then
+    HandleNetOnArrival(CurrentArea);
+
+  // Mark starting area as checked, other area will be checked on first switch
+  if CurrentArea = AREA_NORTH then
+    NorthNetChecked := True
+  else
+    SouthNetChecked := True;
+
+  WL.Activity.Restart();
+  WriteLog('Init | Script initialized successfully');
+end;
+
+// =============================================================================
+// ENTRY POINT
+// =============================================================================
+begin
+  {$IFDEF SCRIPT_GUI}
+  GUI.Run();
+  {$ENDIF}
+  DisableGPUPlugin();
+
+  SetupMapAndWalker();
+  SetupObjects();
+
+  Init();
+
+  repeat
+    Loop();
+  until False;
+end.
