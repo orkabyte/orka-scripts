@@ -18,7 +18,7 @@
  * ============================================================================
  *)
 
-{$DEFINE SCRIPT_REVISION := '6'}
+{$DEFINE SCRIPT_REVISION := '7'}
 program OrkaGECooker;
 {$DEFINE SCRIPT_GUI}
 {$I SRL-T/osr.simba}
@@ -162,6 +162,7 @@ type
 
     // Discord
     UseDiscord: Boolean;
+    AnonymousScreenshots: Boolean;
     DiscordReportTimer: TCountDown;
   end;
 
@@ -393,29 +394,41 @@ begin
     FoodPerHour := Round(Self.FoodCooked / (RunTime / 3600000));
   end;
 
-  EmbedIdx := Discord.Webhook.AddEmbed();
-  with Discord.Webhook.Embeds[EmbedIdx] do
-  begin
-    Title := reportTitle;
-    Description :=
-      'Runtime: ' + SRL.MsToTime(RunTime, Time_Short) + LineEnding +
-      'Food Cooked: ' + ToString(Self.FoodCooked) + LineEnding +
-      'Food/Hr: ' + ToString(FoodPerHour) + LineEnding +
-      'XP Gained: ' + ToString(Self.GainedXP) + LineEnding +
-      'XP/Hr: ' + ToString(XPPerHour);
-    Color := embedColor;
-    Footer := SCRIPT_NAME;
-  end;
+  try
+    EmbedIdx := Discord.Webhook.AddEmbed();
+    with Discord.Webhook.Embeds[EmbedIdx] do
+    begin
+      Title := reportTitle;
+      Description :=
+        'Runtime: ' + SRL.MsToTime(RunTime, Time_Short) + LineEnding +
+        'Food Cooked: ' + ToString(Self.FoodCooked) + LineEnding +
+        'Food/Hr: ' + ToString(FoodPerHour) + LineEnding +
+        'XP Gained: ' + ToString(Self.GainedXP) + LineEnding +
+        'XP/Hr: ' + ToString(XPPerHour);
+      Color := embedColor;
+      Footer := SCRIPT_NAME;
+    end;
 
-  Discord.SendScreenshot(True);
+    Discord.SendScreenshot(Self.AnonymousScreenshots);
+  except
+    WriteLn('[Discord] Error sending report: ' + GetExceptionMessage);
+  end;
 end;
 
 procedure _OnTerminateDiscord();
 begin
   if CookerBot.UseDiscord then
   begin
-    Discord.Webhook.Content := ':white_check_mark: **Session Complete**';
-    CookerBot.SendDiscordReport('Session Summary', $00AA00);
+    Config.IsSetup := False;
+    Discord.Config.IsSetup := False;
+
+    try
+      Discord.Webhook.Content := ':white_check_mark: **Session Complete**';
+      CookerBot.SendDiscordReport('Session Summary', $00AA00);
+    except
+      WriteLn('[Discord] Error sending session summary: ' + GetExceptionMessage);
+    end;
+
     Discord.Free();
   end;
 end;
@@ -522,6 +535,8 @@ begin
   Self.ReportTimer.Start();
 
   Map.SetupChunk(Chunk([48, 55, 50, 53], 0));
+  Objects.Setup(Map.Objects(), @Map.Walker);
+  NPCs.Setup(Map.NPCs(), @Map.Walker);
 
   MyPos := Map.Position();
   DistLeft := Round(MyPos.DistanceTo(LEFT_GE_TILES.Sorted(MyPos)[0]));
@@ -656,29 +671,6 @@ begin
   targetAngle := Random(Round(minAngle), Round(maxAngle));
   Minimap.SetCompassAngle(targetAngle);
   Wait(300, 600);
-end;
-
-(**
- * TGECooker.FindBank
- *
- * Locates and opens the bank using object finding with color.
- *
- * @return  True if the bank was successfully clicked
- *)
-function TGECooker.FindBank(): Boolean;
-var
-  BankObj: TRSObjectV2;
-begin
-  BankObj.SetupEx([1, 1, 6], [Self.BankTile]);
-  BankObj.SetupUpText(['Bank Grand Exchange', 'booth']);
-
-  if Self.IsLeftSide then
-    BankObj.Finder.Colors += [CTS2(7112598, 1, 0.01, 0.01)]
-  else
-    BankObj.Finder.Colors += [CTS2(3490121, 1, 0.01, 0.01)];
-
-  BankObj.Walker := @Map.Walker;
-  Result := BankObj.WalkClick();
 end;
 
 (**
@@ -1070,11 +1062,10 @@ begin
                       Self.PreferredFireTile := RIGHT_FIRE_TILE;
                   end;
 
-                  if Self.FindBank() then
+                  if Banks.WalkOpen() then
                   begin
-                       WaitUntil(Bank.IsOpen(), 200, 8000);
-                       if Bank.IsOpen() then
-                          Bank.Close();
+                    if Bank.IsOpen() then
+                      Bank.Close();
                   end;
               end;
 
@@ -1669,16 +1660,11 @@ begin
 
       EGECookerState.OPEN_BANK:
       begin
-        if Bank.IsOpen() then
+        if not Bank.IsOpen() then
         begin
-          Wait(500, 1000);
-          Exit;
+          Self.AdjustCameraForBanking();
+          Banks.WalkOpen();
         end;
-        Self.AdjustCameraForBanking();
-        if Self.FindBank() then
-          WaitUntil(Bank.IsOpen(), 200, 5000)
-        else
-          Wait(1000, 2000);
       end;
 
       EGECookerState.HANDLE_BANK:
@@ -1799,6 +1785,7 @@ type
     CheckSettingsCheckbox: TLabeledCheckBox;
     DiscordWebhookEdit: TLabeledEdit;
     DiscordEnabledCheckbox: TLabeledCheckBox;
+    DiscordAnonymousCheckbox: TLabeledCheckBox;
     DiscordTestButton: TButton;
   end;
 
@@ -1818,6 +1805,7 @@ begin
   Config.Put('foodIndex', CookerConfig.FoodSelector.GetItemIndex());
   Config.Put('checkGameSettings', False);
   Config.Put('discordEnabled', CookerConfig.DiscordEnabledCheckbox.IsChecked());
+  Config.Put('discordAnonymous', CookerConfig.DiscordAnonymousCheckbox.IsChecked());
   Config.Put('discordWebhook', CookerConfig.DiscordWebhookEdit.GetText());
 end;
 
@@ -1877,6 +1865,7 @@ begin
   end;
 
   CookerBot.UseDiscord := Self.DiscordEnabledCheckbox.IsChecked();
+  CookerBot.AnonymousScreenshots := Self.DiscordAnonymousCheckbox.IsChecked();
   if CookerBot.UseDiscord then
   begin
     Discord.Setup();
@@ -2047,6 +2036,21 @@ begin
     SetName('discord_enabled');
     SetCaption('Enable Discord Notifications');
     SetWidth(TControl.AdjustToDPI(250));
+    SetHint('Sends hourly reports, level-ups, and session summaries to a Discord channel via webhook.' + LineEnding + 'To create one: Server Settings > Integrations > Webhooks > New Webhook > Copy URL.');
+    SetShowHint(True);
+  end;
+
+  with Self.DiscordAnonymousCheckbox do
+  begin
+    Create(discordTab);
+    SetLeft(Self.DiscordEnabledCheckbox.GetRight() + TControl.AdjustToDPI(10));
+    SetTop(Self.DiscordEnabledCheckbox.GetTop());
+    SetName('discord_anonymous');
+    SetCaption('Anonymous');
+    SetWidth(TControl.AdjustToDPI(120));
+    SetChecked(True);
+    SetHint('Hides your display name and XP bar in screenshots.' + LineEnding + 'Uncheck to include them. Screenshots are only sent to your webhook, never shared elsewhere.');
+    SetShowHint(True);
   end;
 
   with Self.DiscordWebhookEdit do
@@ -2082,6 +2086,8 @@ begin
 
   if Config.Has('discordEnabled') then
     Self.DiscordEnabledCheckbox.SetChecked(Config.GetBoolean('discordEnabled'));
+  if Config.Has('discordAnonymous') then
+    Self.DiscordAnonymousCheckbox.SetChecked(Config.GetBoolean('discordAnonymous'));
   if Config.Has('discordWebhook') then
     Self.DiscordWebhookEdit.SetText(Config.GetString('discordWebhook'));
 
