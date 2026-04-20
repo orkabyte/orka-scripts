@@ -16,6 +16,7 @@ A collection of OSRS scripts for [Simba 1.4](https://github.com/Villavu/Simba).
 | [Orka Drift Net Fisher](orka-drift-net-fisher/) | Drift net fishing at Fossil Island                             |
 | [Orka GE Cooker](orka-ge-cooker/)           | Train Cooking 1-99 at the Grand Exchange                       |
 | [Orka GE Log Burner](orka-ge-log-burner/)   | Train Firemaking 1-99 at the Grand Exchange                    |
+| [Orka Giant Spiders](orka-giant-spiders/)   | AFK combat training on Giant Spiders at the Stronghold of Security |
 | [Orka Lead Miner](orka-lead-miner/)         | Mine lead ore on Pandemonium Island                            |
 | [Orka Reanimation](orka-reanimation/)       | Reanimate ensouled heads at the Dark Altar for Prayer XP       |
 

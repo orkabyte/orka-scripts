@@ -1,0 +1,3243 @@
+(**
+ * ============================================================================
+ * Orka Giant Spiders - Credits & Appreciation
+ * ============================================================================
+ *
+ * This script wouldn't exist without the incredible work of the WaspScripts community.
+ *
+ * Special thanks to the admins, moderators, scripters, and testers who
+ * maintain and continuously improve WaspLib, SRL-T, and the entire ecosystem.
+ *
+ * Credits:
+ * Torwent  |  3Garrett3  |  Student  |  BigAussie  |  Flight  |  Kriptic
+ * Fik  |  skunkworks  |  XJ  |  unit  | Sebastiaan  |  n0ll  |  Baconadors
+ *
+ * A huge thank you to everyone in the WaspScripts community who provides
+ * feedback, reports bugs, tests scripts, and helps newcomers learn.
+ *
+ * ============================================================================
+ *)
+{$DEFINE SCRIPT_REVISION := '1'}
+{$DEFINE SCRIPT_GUI}
+program OrkaGiantSpiders;
+{$I SRL-T/osr.simba}
+{$I WaspLib/osr.simba}
+{$I WaspLib/optional/handlers/discord.simba}
+
+const
+  SCRIPT_NAME = 'Orka Giant Spiders';
+  VERBOSE_LOGGING = True;
+
+  // --- Location tiles ---
+  EDGEVILLE_BANK_TILE: TPoint = [8284, 36470];
+  AGGRO_RESET_TILE: TPoint = [4376, 29418];
+  INITIAL_COMBAT_TILE: TPoint = [4380, 29322];
+
+  // --- Floor transition destination boxes ---
+  SURFACE_BOX: TBox = [7988, 36370, 8924, 36858];
+  FIRST_FLOOR_BOX: TBox = [3328, 29438, 3380, 29490];
+  FIRST_FLOOR_PAST_PORTAL_BOX: TBox = [3492, 29502, 3596, 29598];
+  SECOND_FLOOR_BOX: TBox = [4060, 29438, 4100, 29474];
+  SECOND_FLOOR_PAST_PORTAL_BOX: TBox = [3936, 29518, 4048, 29626];
+  THIRD_FLOOR_BOX: TBox = [4352, 29182, 4608, 29438];
+
+  // --- Gate area destination boxes (3rd floor) ---
+  COMBAT_AREA_GATE_BOX: TBox = [4424, 29382, 4444, 29390];
+  BETWEEN_GATES_BOX: TBox = [4424, 29394, 4444, 29402];
+  BEFORE_GATE1_BOX: TBox = [4364, 29406, 4448, 29434];
+
+  // --- Area detection radii ---
+  EDGEVILLE_RADIUS = 300;
+  STRONGHOLD_RADIUS = 100;
+
+  // --- Combat timing ---
+  COMBAT_TIMEOUT_MIN = 13 * ONE_SECOND;
+  COMBAT_TIMEOUT_MAX = 17 * ONE_SECOND;
+
+  // --- Health thresholds ---
+  HEAL_HP_MIN = 60;
+  HEAL_HP_MAX = 70;
+
+  // --- Potion timing ---
+  POTION_TIMER_MIN = 225 * ONE_SECOND;
+  POTION_TIMER_MAX = 290 * ONE_SECOND;
+
+  // --- Report ---
+  REPORT_FREQUENCY = 5 * ONE_MINUTE;
+  REPORT_BANNER_WIDTH = 42;
+
+  // --- Gate behavior ---
+  // Controls how Stronghold of Security gate dialogs are handled:
+  //   0 = Always brute-force (ignore questions, re-click gate up to 10 times)
+  //   1 = BioDice decides per gate (randomly answer or brute-force)
+  //   2 = Always answer security questions correctly
+  GATE_BEHAVIOR = 1;
+
+  // Chance (%) to intentionally select the wrong answer when in answer mode.
+  // Uses SRL.Dice — e.g. 10 = 10% chance to fail each question.
+  GATE_FAIL_ANSWER_CHANCE = 10;
+
+type
+  TGUI = record(TScriptForm)
+    edit_BreakFor, edit_BreakAfter, edit_PotionAmount, edit_ShutdownAfter: TLabeledEdit;
+    edit_SleepAtTime, edit_SleepForHours: TLabeledEdit;
+    cb_TakeBreaks, cb_TakeSleeps: TLabeledCheckbox;
+    combo_Food, combo_Potion: TLabeledCombobox;
+    // Discord
+    DiscordWebhookEdit: TLabeledEdit;
+    DiscordEnabledCheckbox: TLabeledCheckBox;
+    DiscordAnonymousCheckbox: TLabeledCheckBox;
+    DiscordTestButton: TButton;
+  end;
+
+  TSpiderObjects = record
+    StrongholdEntrance: TRSObjectV2;
+    FirstFloorLadderEntrance: TRSObjectV2;
+    FirstFloorPortal: TRSObjectV2;
+    FirstFloorLadderExit: TRSObjectV2;
+    SecondFloorLadderEntrance: TRSObjectV2;
+    SecondFloorPortal: TRSObjectV2;
+    SecondFloorLadderExit: TRSObjectV2;
+    ThirdFloorLadderEntrance: TRSObjectV2;
+    ThirdFloorGate1: TRSObjectV2;
+    ThirdFloorGate2: TRSObjectV2;
+  end;
+
+  EState = (HANDLE_LOGIN, CLOSE_INTERFACE, RESTOCK, NAVIGATE_TO_COMBAT,
+            RESET_AGGRO, FIGHTING, HEAL, BOOST, DO_ANTIBAN);
+
+  ECombatXPType = (
+    XP_ATTACK,       // 75% Attack, 25% HP
+    XP_STRENGTH,     // 75% Strength, 25% HP
+    XP_DEFENCE,      // 75% Defence, 25% HP
+    XP_CONTROLLED,   // 25% each: Att/Str/Def/HP
+    XP_RANGED,       // 75% Ranged, 25% HP
+    XP_RANGED_DEF,   // 50% Ranged, 25% Def, 25% HP (Longrange)
+    XP_MAGIC,        // 60% Magic, 40% HP
+    XP_UNKNOWN
+  );
+
+var
+  SpiderObjects: TSpiderObjects;
+  BreakFor, BreakAfter, StartXP, GainedXP, PotionAmount: Int32;
+  ShutdownTime: Int64;
+  UsePotions, UseFood: Boolean;
+  PotionTimer, ReportTimer: TStopwatch;
+  Potion, Food: TRSItem;
+  GUI: TGUI;
+  Config: TConfigJSON;
+  TakeBreaks, TakeSleeps: Boolean;
+  SleepAtTime: String;
+  SleepForHours: Int32;
+  TotalBreakTime, LastBreakStartTime, LastBreakEndTime: Int64;
+  CombatXPType: ECombatXPType;
+  TotalSleepTime, LastSleepStartTime, LastSleepEndTime: Int64;
+  WalkToBankFailCount: Int32;
+  // Discord
+  UseDiscord, AnonymousScreenshots: Boolean;
+  DiscordReportTimer: TCountDown;
+  Discord: TDiscordClient;
+
+
+(**
+ * WriteDebug
+ *
+ * Logs a timestamped verbose debug message, only when VERBOSE_LOGGING is enabled.
+ *
+ * @param Message  The message to log
+ *)
+procedure WriteDebug(Message: String);
+begin
+  if VERBOSE_LOGGING then
+    WriteLn(SRL.TimeStamp(), ':[', SCRIPT_NAME, ']: [DEBUG] ', Message);
+end;
+
+(**
+ * WriteLog
+ *
+ * Logs a timestamped key-event message that is always visible regardless of VERBOSE_LOGGING.
+ *
+ * @param Message  The message to log
+ *)
+procedure WriteLog(Message: String);
+begin
+  WriteLn(SRL.TimeStamp(), ':[', SCRIPT_NAME, ']: ', Message);
+end;
+
+(**
+ * FormatNumber
+ *
+ * Formats an integer with thousand separators (e.g., 125000 -> "125,000").
+ *
+ * @param n  The number to format
+ * @return   Formatted string with commas as thousand separators
+ *)
+function FormatNumber(n: Int32): String;
+var
+  s: String;
+  i, count: Int32;
+begin
+  s := IntToStr(Abs(n));
+  Result := '';
+  count := 0;
+  for i := Length(s) downto 1 do
+  begin
+    if (count > 0) and (count mod 3 = 0) then
+      Result := ',' + Result;
+    Result := s[i] + Result;
+    Inc(count);
+  end;
+  if n < 0 then
+    Result := '-' + Result;
+end;
+
+(**
+ * SetupMapAndWalker
+ *
+ * Initializes the map walker with Stronghold of Security and Edgeville map chunks.
+ *)
+procedure SetupMapAndWalker();
+begin
+  Map.SetupChunks([
+    Chunk([28,83,34,80], 0),  // Stronghold of Security 1st/2nd floor
+    Chunk([47,55,51,52], 0)   // Barb Village / Edgeville entrance / Varrock
+  ]);
+
+  Objects.Setup(Map.Objects(), @Map.Walker);
+  NPCs.Setup(Map.NPCs(), @Map.Walker);
+
+  // Exclude Cooking Guild bank area
+  Banks._FilterLocation(
+    [[8424, 36590], [8536, 36590], [8536, 36682], [8424, 36682]],
+    True
+  );
+end;
+
+(**
+ * SetupObjects
+ *
+ * Configures all game objects (entrance, ladders, portals, gates) for color
+ * detection and interaction. Must be called after SetupMapAndWalker().
+ *)
+procedure SetupObjects();
+begin
+  // --- Stronghold Entrance (surface) ---
+  SpiderObjects.StrongholdEntrance.SetupEx([0.8, 0.8, 3], [[8229, 36751]]);
+  SpiderObjects.StrongholdEntrance.SetupUpText(['Climb-down', 'Entrance']);
+  SpiderObjects.StrongholdEntrance.Finder.Colors += [CTS2(3421242, 10, 0.01, 0.31)];
+  SpiderObjects.StrongholdEntrance.Walker := @Map.Walker;
+  SpiderObjects.StrongholdEntrance.TrackTarget := True;
+
+  // --- 1st Floor: Ladder entrance (climb up/exit) ---
+  SpiderObjects.FirstFloorLadderEntrance.SetupEx([0.5, 1, 4], [[3340, 29454]]);
+  SpiderObjects.FirstFloorLadderEntrance.SetupUpText(['Ladder']);
+  SpiderObjects.FirstFloorLadderEntrance.Finder.Colors += [
+    CTS2(4934736, 6, 0.57, 0.10)
+  ];
+  SpiderObjects.FirstFloorLadderEntrance.Finder.Erode := 4;
+  SpiderObjects.FirstFloorLadderEntrance.Finder.Grow := 3;
+  SpiderObjects.FirstFloorLadderEntrance.Walker := @Map.Walker;
+  SpiderObjects.FirstFloorLadderEntrance.TrackTarget := False;
+
+  // --- 1st Floor: Portal ---
+  SpiderObjects.FirstFloorPortal.SetupEx([1.2, 1.2, 4], [[3356, 29478]]);
+  SpiderObjects.FirstFloorPortal.SetupUpText(['Enter', 'Portal']);
+  SpiderObjects.FirstFloorPortal.Finder.Colors += [
+    CTS2(6187370, 5, 0.23, 0.28),
+    CTS2(7837337, 16, 0.06, 0.47)
+  ];
+  SpiderObjects.FirstFloorPortal.Walker := @Map.Walker;
+  SpiderObjects.FirstFloorPortal.TrackTarget := False;
+
+  // --- 1st Floor: Ladder exit (descend to 2nd floor) ---
+  SpiderObjects.FirstFloorLadderExit.SetupEx([1, 0.8, 1], [[3512, 29542]]);
+  SpiderObjects.FirstFloorLadderExit.SetupUpText(['Ladder']);
+  SpiderObjects.FirstFloorLadderExit.Finder.Colors += [
+    CTS2(3947584, 8, 0.01, 0.04),
+    CTS2(0, 1, 0.01, 0.01)
+  ];
+  SpiderObjects.FirstFloorLadderExit.Finder.Erode := 4;
+  SpiderObjects.FirstFloorLadderExit.Finder.Grow := 3;
+  SpiderObjects.FirstFloorLadderExit.Walker := @Map.Walker;
+  SpiderObjects.FirstFloorLadderExit.TrackTarget := False;
+
+  // --- 2nd Floor: Ladder entrance (climb up/exit to 1st floor) ---
+  SpiderObjects.SecondFloorLadderEntrance.SetupEx([1, 0.5, 4], [[4072, 29446]]);
+  SpiderObjects.SecondFloorLadderEntrance.SetupUpText(['Ladder']);
+  SpiderObjects.SecondFloorLadderEntrance.Finder.Colors += [
+    CTS2(4813188, 20, 0.03, 0.31)
+  ];
+  SpiderObjects.SecondFloorLadderEntrance.Finder.Erode := 4;
+  SpiderObjects.SecondFloorLadderEntrance.Finder.Grow := 3;
+  SpiderObjects.SecondFloorLadderEntrance.Walker := @Map.Walker;
+  SpiderObjects.SecondFloorLadderEntrance.TrackTarget := False;
+
+  // --- 2nd Floor: Portal ---
+  SpiderObjects.SecondFloorPortal.SetupEx([1.2, 1.2, 4], [[4060, 29470]]);
+  SpiderObjects.SecondFloorPortal.SetupUpText(['Enter', 'Portal']);
+  SpiderObjects.SecondFloorPortal.Finder.Colors += [
+    CTS2(5673889, 6, 0.10, 0.67),
+    CTS2(8764613, 9, 0.10, 0.77),
+    CTS2(4159881, 1, 0.23, 0.76)
+  ];
+  SpiderObjects.SecondFloorPortal.Finder.Erode := 3;
+  SpiderObjects.SecondFloorPortal.Finder.Grow := 3;
+  SpiderObjects.SecondFloorPortal.Walker := @Map.Walker;
+  SpiderObjects.SecondFloorPortal.TrackTarget := True;
+
+  // --- 2nd Floor: Ladder exit (descend to 3rd floor) ---
+  SpiderObjects.SecondFloorLadderExit.SetupEx([1, 0.8, 3], [[4008, 29558]]);
+  SpiderObjects.SecondFloorLadderExit.SetupUpText(['Ladder']);
+  SpiderObjects.SecondFloorLadderExit.Finder.Colors += [
+    CTS2(2521758, 25, 0.04, 1.56)
+  ];
+  SpiderObjects.SecondFloorLadderExit.Finder.Erode := 6;
+  SpiderObjects.SecondFloorLadderExit.Finder.Grow := 2;
+  SpiderObjects.SecondFloorLadderExit.Walker := @Map.Walker;
+  SpiderObjects.SecondFloorLadderExit.TrackTarget := False;
+
+  // --- 3rd Floor: Ladder entrance (climb up/exit to 2nd floor) ---
+  SpiderObjects.ThirdFloorLadderEntrance.SetupEx([0.5, 1, 8], [[4396, 29427]]);
+  SpiderObjects.ThirdFloorLadderEntrance.SetupUpText(['Climb-up','Dripping']);
+  SpiderObjects.ThirdFloorLadderEntrance.Finder.Colors += [
+    CTS2(1591869, 7, 0.08, 1.76),
+    CTS2(2389601, 3, 0.08, 0.79)
+  ];
+  SpiderObjects.ThirdFloorLadderEntrance.Finder.Erode := 2;
+  SpiderObjects.ThirdFloorLadderEntrance.Finder.Grow := 2;
+  SpiderObjects.ThirdFloorLadderEntrance.Walker := @Map.Walker;
+  SpiderObjects.ThirdFloorLadderEntrance.TrackTarget := False;
+
+  // --- 3rd Floor: Gate 1 and Gate 2 ---
+  SpiderObjects.ThirdFloorGate1.SetupEx([1.5, 0.4, 8], [[4434, 29402]]);
+  SpiderObjects.ThirdFloorGate1.SetupUpText(['Open', 'Gate']);
+  SpiderObjects.ThirdFloorGate1.Finder.Colors += [CTS2(1270616, 11, 0.30, 3.08)];
+  SpiderObjects.ThirdFloorGate1.Walker := @Map.Walker;
+  SpiderObjects.ThirdFloorGate1.TrackTarget := False;
+
+  SpiderObjects.ThirdFloorGate2.SetupEx([1, 0.01, 4], [[4434, 29391]]);
+  SpiderObjects.ThirdFloorGate2.SetupUpText(['Open', 'Gate']);
+  SpiderObjects.ThirdFloorGate2.Finder.Colors += [CTS2(1270616, 11, 0.30, 3.08)];
+  SpiderObjects.ThirdFloorGate2.Walker := @Map.Walker;
+  SpiderObjects.ThirdFloorGate2.TrackTarget := False;
+end;
+
+(**
+ * IsInCombatArea
+ *
+ * Checks if the player is inside the spider combat area past both gates.
+ *
+ * @return  True if player is in the combat area
+ *)
+function IsInCombatArea(): Boolean;
+var
+  pos: TPoint;
+begin
+  pos := Map.Position();
+  // Square 1: [4364,29318] to [4452,29390]
+  // Square 2: [4368,29310] to [4396,29314]
+  Result := ((pos.X >= 4364) and (pos.X <= 4452) and (pos.Y >= 29318) and (pos.Y <= 29390)) or
+            ((pos.X >= 4368) and (pos.X <= 4396) and (pos.Y >= 29310) and (pos.Y <= 29314));
+end;
+
+(**
+ * IsInEdgeville
+ *
+ * Checks if the player is near the Edgeville bank area.
+ *
+ * @return  True if player is within EDGEVILLE_RADIUS of the bank tile
+ *)
+function IsInEdgeville(): Boolean;
+var
+  pos: TPoint;
+begin
+  pos := Map.Position();
+  Result := (pos.DistanceTo(EDGEVILLE_BANK_TILE) < EDGEVILLE_RADIUS);
+end;
+
+(**
+ * IsInStronghold
+ *
+ * Checks if the player is on the 3rd floor of the Stronghold of Security.
+ *
+ * @return  True if player is within STRONGHOLD_RADIUS of the 3rd floor center
+ *)
+function IsInStronghold(): Boolean;
+var
+  pos: TPoint;
+begin
+  pos := Map.Position();
+  // Check if on 3rd floor - includes combat area, between gates, and initial room
+  Result := (pos.DistanceTo([4434, 29400]) < STRONGHOLD_RADIUS);
+end;
+
+(**
+ * IsInBetweenGates
+ *
+ * Checks if the player is in the corridor between Gate 1 and Gate 2.
+ *
+ * @return  True if player is between the two gates
+ *)
+function IsInBetweenGates(): Boolean;
+begin
+  Result := Map.Position().InBox(BETWEEN_GATES_BOX);
+end;
+
+
+(**
+ * IsInInitialRoom
+ *
+ * Checks if the player is in the 3rd floor initial room (before Gate 1).
+ *
+ * @return  True if player is in the initial room area
+ *)
+function IsInInitialRoom(): Boolean;
+var
+  pos: TPoint;
+begin
+  pos := Map.Position();
+  // Square 1: [4364,29390] to [4424,29434]
+  // Square 2: [4428,29402] to [4440,29422] (Y starts at 29402 to match BEFORE_GATE1_BOX)
+  Result := ((pos.X >= 4364) and (pos.X <= 4424) and (pos.Y >= 29390) and (pos.Y <= 29434)) or
+            ((pos.X >= 4428) and (pos.X <= 4440) and (pos.Y >= 29402) and (pos.Y <= 29422));
+end;
+
+(**
+ * IsAtCombatTiles
+ *
+ * Checks if the player is standing on the designated combat tile grid.
+ *
+ * @return  True if player is on a combat tile
+ *)
+function IsAtCombatTiles(): Boolean;
+var
+  pos: TPoint;
+begin
+  pos := Map.Position();
+  // Combat area: 4 columns × 3 rows [4392, 29334] to [4404, 29342]
+  Result := (pos.X >= 4392) and (pos.X <= 4404) and (pos.Y >= 29334) and (pos.Y <= 29342);
+end;
+
+(**
+ * WaitForTransition
+ *
+ * Polls Map.Position() until the player lands inside the destination box.
+ *
+ * @param destBox  The destination area to wait for
+ * @param timeout  Maximum time in ms to wait (default 10 * ONE_SECOND)
+ * @return         True if the player arrived inside destBox
+ *)
+function WaitForTransition(destBox: TBox; timeout: Int32 = 10 * ONE_SECOND): Boolean;
+begin
+  Result := WaitUntil(Map.Position().InBox(destBox), 200, timeout);
+  if Result then
+    WriteLog('Transition | Arrived at ' + ToStr(Map.Position()))
+  else
+    WriteLog('Transition | Timeout at ' + ToStr(Map.Position()));
+end;
+
+(**
+ * DoTransition
+ *
+ * Clicks an object and waits for arrival in destination box with retries.
+ *
+ * @param obj          The object to click (ladder, portal, entrance)
+ * @param destBox      The destination area to verify arrival
+ * @param maxAttempts  Number of retry attempts (default 3)
+ * @return             True if successfully transitioned to destBox
+ *)
+function DoTransition(var obj: TRSObjectV2; destBox: TBox; maxAttempts: Int32 = 3): Boolean;
+var
+  attempt: Int32;
+begin
+  for attempt := 1 to maxAttempts do
+  begin
+    WriteLog('Transition | Attempt ' + ToStr(attempt) + '/' + ToStr(maxAttempts));
+    if not obj.WalkClick() then
+    begin
+      WriteLog('Transition | WalkClick failed');
+      if attempt < maxAttempts then begin Wait(600, 900); Continue; end;
+      Exit;
+    end;
+    Minimap.WaitMoving(False);
+    if WaitForTransition(destBox, 10 * ONE_SECOND) then
+      Exit(True);
+    if attempt < maxAttempts then Wait(600, 900);
+  end;
+  WriteLog('Transition | Failed after ' + ToStr(maxAttempts) + ' attempts');
+end;
+
+(**
+ * GetSecurityAnswer
+ *
+ * Maps Stronghold of Security question text to the correct answer keyword.
+ * Uses substring matching on the combined dialog text from Chat.GetChat().
+ *
+ * @param question  The full dialog text (question + answer options)
+ * @return          A keyword that uniquely identifies the correct answer option, or '' if unrecognized
+ *)
+function GetSecurityAnswer(question: String): String;
+begin
+  question := LowerCase(question);
+  Result := '';
+
+  if Pos('member for free', question) > 0 then Exit('Report Abuse');
+  if Pos('chat or email', question) > 0 then Exit('Report the incident');
+  if Pos('social media', question) > 0 then Exit('Report the incident');
+  if Pos('level your account', question) > 0 then Exit('never allow');
+  if Pos('randomly selected', question) > 0 then Exit('No way');
+
+  if Pos('registered email', question) > 0 then Exit('two-factor');
+  if Pos('best way to secure', question) > 0 then Exit('Two-factor');
+  if Pos('set a bank pin', question) > 0 then Exit('banker');
+  if Pos('suspicious activity', question) > 0 then Exit('Delete');
+  if Pos('who can i give', question) > 0 then Exit('Nobody');
+
+  if Pos('compromised', question) > 0 then Exit('Secure my device');
+  if Pos('moderator asks', question) > 0 then Exit('Report Abuse');
+  if Pos('provides a bond', question) > 0 then Exit('Decline');
+  if Pos('safe to use my', question) > 0 then Exit('Only on the');
+  if Pos('responsibility', question) > 0 then Exit('Me');
+
+  if Pos('back twice', question) > 0 then Exit('take my gold');
+  if Pos('okay to buy', question) > 0 then Exit('never buy');
+  if Pos('difficult quest', question) > 0 then Exit('give them my password');
+  if Pos('video online', question) > 0 then Exit('phishing');
+  if Pos('amazing price', question) > 0 then Exit('tricking');
+
+  if Pos('characteristic', question) > 0 then Exit('never used');
+  if Pos('claiming to be jagex', question) > 0 then Exit('Report the stream');
+  if Pos('saying my pin', question) > 0 then Exit('No');
+  if Pos('website claims', question) > 0 then Exit('fake');
+  if Pos('keylogger', question) > 0 then Exit('Virus scan');
+
+  if Pos('purchase items', question) > 0 then Exit('Do not visit');
+  if Pos('logged in while', question) > 0 then Exit('No');
+  if Pos('make you a player', question) > 0 then Exit('send an');
+  if Pos('good bank pin', question) > 0 then Exit('famous');
+  if Pos('check your stats', question) > 0 then Exit('anyone');
+
+  if Pos('specific details', question) > 0 then Exit('share');
+  if Pos('remove a hijacker', question) > 0 then Exit('Recovery');
+  if Pos('part way through', question) > 0 then Exit('follow the advice');
+end;
+
+(**
+ * HandleSecurityQuestion
+ *
+ * Detects if a Stronghold of Security question dialog is open, reads the text,
+ * finds the correct answer, and navigates through the entire dialog sequence.
+ *
+ * @return  True if a security question was detected and answered
+ *)
+function HandleSecurityQuestion(): Boolean;
+var
+  chatText, answer, title: String;
+  options: TRSChatboxOptionArray;
+  wrongIdx, i: Int32;
+begin
+  title := Chat.GetChatTitle();
+  if title = '' then
+    Exit;
+
+  Wait(400, 900);
+
+  WriteLog('Security | Dialog detected, title: ' + title);
+  chatText := Chat.GetChat();
+  WriteLog('Security | Chat text: ' + chatText);
+
+  // Handle "Correct!" confirmation dialog — just click through it
+  if Pos('Correct', chatText) > 0 then
+  begin
+    WriteLog('Security | Confirmation dialog detected, clicking through');
+    while Chat.HasContinue() do
+    begin
+      Chat.ClickContinue(True);
+      Wait(300, 800);
+    end;
+    Exit(True);
+  end;
+
+  answer := GetSecurityAnswer(chatText);
+  if answer = '' then
+  begin
+    WriteLog('Security | No keyword match on current page, clicking continue');
+    if Chat.HasContinue() then
+    begin
+      Chat.ClickContinue(True);
+      Wait(600, 1200);
+      chatText := Chat.GetChat();
+      WriteLog('Security | Chat text after continue: ' + chatText);
+      answer := GetSecurityAnswer(chatText);
+    end;
+    if answer = '' then
+    begin
+      WriteLog('Security | Still no match, giving up');
+      Exit;
+    end;
+  end;
+
+  // Intentionally pick wrong answer if dice rolls
+  if SRL.Dice(GATE_FAIL_ANSWER_CHANCE) then
+  begin
+    WriteLog('Security | Dice rolled FAIL — picking wrong answer');
+    options := Chat.GetOptions();
+    wrongIdx := -1;
+    for i := 0 to High(options) do
+      if not (answer in options[i].Text) then
+      begin
+        wrongIdx := i;
+        Break;
+      end;
+
+    if wrongIdx >= 0 then
+    begin
+      Wait(300, 700);
+      WriteLog('Security | Clicking wrong option: ' + options[wrongIdx].Text);
+      Keyboard.PressKey(options[wrongIdx].Number);
+      WaitUntil(Chat.HasContinue(), 100, 5 * ONE_SECOND);
+      repeat
+        Chat.ClickContinue(True);
+        Wait(300, 800);
+      until not Chat.HasContinue();
+      WriteLog('Security | Wrong answer submitted');
+      Exit(True);
+    end;
+    WriteLog('Security | No wrong option found, answering correctly');
+  end;
+
+  Wait(300, 700);
+  WriteLog('Security | Answering: ' + answer);
+
+  if not Chat.ChatToOption(answer) then
+  begin
+    WriteLog('Security | ChatToOption failed, trying ClickOption with black only');
+    if not Chat.ClickOption(answer, True, [CHAT_COLOR_BLACK]) then
+    begin
+      WriteLog('Security | ClickOption also failed');
+      Exit;
+    end;
+  end;
+
+  WaitUntil(Chat.HasContinue(), 100, 5 * ONE_SECOND);
+
+  repeat
+    Chat.ClickContinue(True);
+    Wait(300, 800);
+  until not Chat.HasContinue();
+
+  WriteLog('Security | Answered successfully');
+  Result := True;
+end;
+
+(**
+ * DoGateTransition
+ *
+ * Clicks a gate object and waits for arrival in destination box with retries.
+ * Handles Stronghold of Security question dialogs that may appear after clicking.
+ *
+ * @param obj          The gate object to click
+ * @param destBox      The destination area to verify arrival
+ * @param maxAttempts  Number of retry attempts (default 5)
+ * @return             True if successfully transitioned to destBox
+ *)
+function DoGateTransition(var obj: TRSObjectV2; destBox: TBox; maxAttempts: Int32 = 5): Boolean;
+var
+  attempt, effectiveMaxAttempts: Int32;
+  shouldAnswer: Boolean;
+  modeStr: String;
+  t: TCountDown;
+begin
+  case GATE_BEHAVIOR of
+    0: shouldAnswer := False;
+    2: shouldAnswer := True;
+  else
+    shouldAnswer := Antiban.BioDice();
+  end;
+
+  if shouldAnswer then
+    effectiveMaxAttempts := maxAttempts
+  else
+    effectiveMaxAttempts := 10;
+
+  if shouldAnswer then modeStr := 'ANSWER' else modeStr := 'BRUTE-FORCE';
+  WriteLog('Gate Transition | Mode: ' + modeStr +
+           ' (max ' + ToStr(effectiveMaxAttempts) + ' attempts)');
+
+  for attempt := 1 to effectiveMaxAttempts do
+  begin
+    WriteLog('Gate Transition | Attempt ' + ToStr(attempt) + '/' + ToStr(effectiveMaxAttempts));
+
+    // In answer mode, handle any pre-existing dialog
+    if shouldAnswer and (Chat.GetChatTitle() <> '') then
+    begin
+      WriteLog('Gate Transition | Existing dialog found, handling');
+      HandleSecurityQuestion();
+      if Map.Position().InBox(destBox) then
+        Exit(True);
+    end;
+
+    if not obj.WalkClick() then
+    begin
+      WriteLog('Gate Transition | WalkClick failed');
+      if attempt < effectiveMaxAttempts then begin Wait(2500, 3500); Continue; end;
+      Exit;
+    end;
+
+    Minimap.WaitMoving(False);
+    Wait(800, 1200);
+
+    // Check for immediate transition (common in brute-force when gate opens)
+    if Map.Position().InBox(destBox) then
+    begin
+      Wait(600, 900);
+      Minimap.WaitMoving(False);
+      if Map.Position().InBox(destBox) then
+        Exit(True);
+      WriteLog('Gate Transition | Position unstable after immediate check, continuing');
+    end;
+
+    if shouldAnswer then
+    begin
+      // Wait for dialog or transition
+      t.Init(3 * ONE_SECOND);
+      while not t.IsFinished() do
+      begin
+        if Map.Position().InBox(destBox) then
+          Exit(True);
+        if Chat.GetChatTitle() <> '' then
+          Break;
+        Wait(100);
+      end;
+
+      HandleSecurityQuestion();
+
+      if WaitForTransition(destBox, 10 * ONE_SECOND) then
+      begin
+        Wait(600, 900);
+        Minimap.WaitMoving(False);
+        if Map.Position().InBox(destBox) then
+          Exit(True);
+        WriteLog('Gate Transition | Position unstable after answer transition, continuing');
+      end;
+    end;
+
+    // Early exit if gate is unreachable (player in wrong room)
+    if Chat.FindMessage('reach') then
+    begin
+      WriteLog('Gate Transition | "Can''t reach" detected, aborting');
+      Exit(False);
+    end;
+
+    if attempt < effectiveMaxAttempts then
+      Wait(2500, 3500);
+  end;
+
+  WriteLog('Gate Transition | Failed after ' + ToStr(effectiveMaxAttempts) + ' attempts');
+end;
+
+(**
+ * PassThroughGate2Only
+ *
+ * Passes through Gate 2 only, entering the combat area from between the gates.
+ *
+ * @return  True if successfully passed through Gate 2
+ *)
+function PassThroughGate2Only(): Boolean;
+begin
+  WriteLog('Passing through Gate 2 only...');
+  Result := DoGateTransition(SpiderObjects.ThirdFloorGate2, COMBAT_AREA_GATE_BOX, 5);
+end;
+
+(**
+ * PassThroughGate1Only
+ *
+ * Passes through Gate 1 only, exiting from between the gates to the initial room.
+ *
+ * @return  True if successfully passed through Gate 1
+ *)
+function PassThroughGate1Only(): Boolean;
+begin
+  WriteLog('Passing through Gate 1 only (exiting)...');
+  Result := DoGateTransition(SpiderObjects.ThirdFloorGate1, BEFORE_GATE1_BOX, 5);
+end;
+
+(**
+ * GetIntoSpidersArea
+ *
+ * Navigates the player through both gates into the spider combat area.
+ *)
+procedure GetIntoSpidersArea();
+var
+  attempts: Int32;
+begin
+  WriteLog('=== ENTERING SPIDER AREA ===');
+
+  for attempts := 1 to 3 do
+  begin
+    if IsInCombatArea() then
+    begin
+      WriteLog('Already in combat area at ' + ToStr(Map.Position()));
+      Exit;
+    end;
+
+    if not IsInBetweenGates() then
+    begin
+      WriteLog('Passing through Gate 1 (attempt ' + ToStr(attempts) + ')...');
+      if not DoGateTransition(SpiderObjects.ThirdFloorGate1, BETWEEN_GATES_BOX, 5) then
+      begin
+        WriteLog('Failed to pass through Gate 1');
+        Continue;
+      end;
+    end;
+
+    if not IsInBetweenGates() then
+    begin
+      WriteLog('Not between gates after Gate 1, retrying');
+      Continue;
+    end;
+
+    WriteLog('Passing through Gate 2...');
+    if DoGateTransition(SpiderObjects.ThirdFloorGate2, COMBAT_AREA_GATE_BOX, 5) then
+    begin
+      WriteLog('Successfully entered spider area at ' + ToStr(Map.Position()));
+      Exit;
+    end;
+
+    WriteLog('Failed to pass through Gate 2, retrying from position check');
+  end;
+
+  WriteLog('Failed to enter spider area after multiple attempts');
+end;
+
+(**
+ * GetOutOfSpidersArea
+ *
+ * Navigates the player back through both gates from the combat area to the initial room.
+ * Uses retry loop to handle gate reversals.
+ *
+ * @return  True if player successfully reached the initial room
+ *)
+function GetOutOfSpidersArea(): Boolean;
+var
+  attempts: Int32;
+begin
+  WriteLog('=== EXITING SPIDER AREA ===');
+
+  for attempts := 1 to 3 do
+  begin
+    if IsInCombatArea() then
+    begin
+      WriteLog('Passing through Gate 2 (exit)...');
+      if not DoGateTransition(SpiderObjects.ThirdFloorGate2, BETWEEN_GATES_BOX, 5) then
+      begin
+        WriteLog('Failed to exit through Gate 2');
+        Continue;
+      end;
+    end;
+
+    if Map.Position().InBox(BETWEEN_GATES_BOX) then
+    begin
+      WriteLog('Passing through Gate 1 (exit)...');
+      if not DoGateTransition(SpiderObjects.ThirdFloorGate1, BEFORE_GATE1_BOX, 5) then
+      begin
+        WriteLog('Failed to exit through Gate 1');
+        Continue;
+      end;
+    end;
+
+    if IsInInitialRoom() then
+    begin
+      WriteLog('Successfully exited spider area at ' + ToStr(Map.Position()));
+      Exit(True);
+    end;
+  end;
+
+  if IsInInitialRoom() then
+  begin
+    WriteLog('Reached initial room despite gate failures at ' + ToStr(Map.Position()));
+    Exit(True);
+  end;
+
+  WriteLog('Failed to exit spider area after multiple attempts');
+end;
+
+(**
+ * GoToCombatTiles
+ *
+ * Walks the player to INITIAL_COMBAT_TILE then to a random tile in the combat grid.
+ *)
+procedure GoToCombatTiles();
+var
+  initialTile: TPoint;
+  combatTiles: TPointArray;
+  chosenTile: TPoint;
+  currentPos: TPoint;
+begin
+  currentPos := Map.Position();
+  WriteLog('Going to combat tiles...');
+  WriteDebug(ToStr('Starting from position: ', currentPos));
+
+  // If already at combat tiles, stay there
+  if IsAtCombatTiles() then
+  begin
+    WriteDebug('Already at combat tiles, no need to move');
+    WriteDebug(ToStr('Skipping movement - already at position: ', currentPos));
+    Exit;
+  end;
+
+  // First go to initial tile to maximize distance from reset area
+  initialTile := INITIAL_COMBAT_TILE;
+  WriteDebug(ToStr('Walking to initial combat tile: ', initialTile));
+  WriteDebug(ToStr('Distance to initial tile: ', currentPos.DistanceTo(initialTile)));
+
+  Map.Walker.WebWalk(initialTile, 2, 0.2);
+
+  currentPos := Map.Position();
+  WriteDebug(ToStr('Reached initial tile area - Position: ', currentPos));
+  Wait(1000, 2000);
+
+  // Define combat tiles - 4 columns × 3 rows [4392, 29334] to [4404, 29342]
+  combatTiles := [
+    [4392, 29334], [4396, 29334], [4400, 29334], [4404, 29334],
+    [4392, 29338], [4396, 29338], [4400, 29338], [4404, 29338],
+    [4392, 29342], [4396, 29342], [4400, 29342], [4404, 29342]
+  ];
+  chosenTile := combatTiles[Random(Length(combatTiles))];
+
+  WriteDebug(ToStr('Walking to combat tile: ', chosenTile));
+  WriteDebug(ToStr('Chosen tile: ', chosenTile, ' | Distance: ', currentPos.DistanceTo(chosenTile)));
+
+  Map.Walker.WebWalk(chosenTile, 2, 0.2);
+
+  currentPos := Map.Position();
+  WriteDebug(ToStr('Arrived at combat position: ', currentPos, ' | Distance from chosen tile: ', currentPos.DistanceTo(chosenTile)));
+
+  Wait(500, 1000);
+  WriteLog('Arrived at combat position');
+end;
+
+(**
+ * NavigateToCombat
+ *
+ * Navigates the player back to combat tiles from anywhere on the 3rd floor
+ * of the Stronghold of Security. Handles three sub-locations:
+ *   - Between gates: pass through Gate 2, then walk to combat tiles
+ *   - Initial room: pass through both gates, then walk to combat tiles
+ *   - Combat area (but not on tiles): walk directly to combat tiles
+ *)
+procedure NavigateToCombat();
+begin
+  if IsInBetweenGates() then
+  begin
+    if PassThroughGate2Only() then
+    begin
+      Wait(1000, 2000);
+      GoToCombatTiles();
+    end;
+  end
+  else if IsInInitialRoom() then
+  begin
+    GetIntoSpidersArea();
+    Wait(1000, 2000);
+    GoToCombatTiles();
+  end
+  else if IsInCombatArea() then
+    GoToCombatTiles();
+end;
+
+(**
+ * IsBreakDue
+ *
+ * Checks if any registered antiban break has elapsed and is due to trigger.
+ *
+ * @return  True if at least one break is due
+ *)
+function IsBreakDue(): Boolean;
+var
+  i: Int32;
+begin
+  Result := False;
+
+  if Length(Antiban.Breaks) = 0 then
+    Exit;
+
+  for i := 0 to High(Antiban.Breaks) do
+    if GetTimeRunning() >= Antiban.Breaks[i].NextAtTime then
+      Exit(True);
+end;
+
+(**
+ * TakeInitialRoomBreakIfDue
+ *
+ * Triggers a scheduled break if one is due and the player is in the initial room.
+ * Handles re-login after break if the player was logged out.
+ *)
+procedure TakeInitialRoomBreakIfDue();
+begin
+  if not IsBreakDue() then
+    Exit;
+
+  if not IsInInitialRoom() then
+    Exit;
+
+  WriteLog('Break timer reached - taking scheduled break in initial room');
+  Antiban.DoAntiban(True, False);
+
+  if not RSClient.IsLoggedIn() then
+  begin
+    WriteLog('Player logged out during break, logging back in');
+    Login.LoginPlayer();
+
+    if not WaitUntil(RSClient.IsLoggedIn(), 250, 12 * ONE_SECOND) then
+      TerminateScript('Failed to log back in after scheduled break');
+  end;
+
+  WL.Activity.Restart();
+end;
+
+(**
+ * IsSleepDue
+ *
+ * Checks if any registered antiban sleep has elapsed and is due to trigger.
+ *
+ * @return  True if at least one sleep is due
+ *)
+function IsSleepDue(): Boolean;
+var
+  i: Int32;
+begin
+  Result := False;
+
+  if Length(Antiban.Sleeps) = 0 then
+    Exit;
+
+  for i := 0 to High(Antiban.Sleeps) do
+    if GetTimeRunning() >= Antiban.Sleeps[i].NextAtTime then
+      Exit(True);
+end;
+
+(**
+ * TakeInitialRoomSleepIfDue
+ *
+ * Triggers a scheduled sleep if one is due and the player is in the initial room.
+ * Handles re-login after sleep if the player was logged out.
+ *)
+procedure TakeInitialRoomSleepIfDue();
+begin
+  if not IsSleepDue() then
+    Exit;
+
+  if not IsInInitialRoom() then
+    Exit;
+
+  WriteLog('Sleep timer reached - taking scheduled sleep in initial room');
+  Antiban.DoAntiban(True, False);
+
+  if not RSClient.IsLoggedIn() then
+  begin
+    WriteLog('Player logged out during sleep, logging back in');
+    Login.LoginPlayer();
+
+    if not WaitUntil(RSClient.IsLoggedIn(), 250, 12 * ONE_SECOND) then
+      TerminateScript('Failed to log back in after scheduled sleep');
+  end;
+
+  WL.Activity.Restart();
+end;
+
+(**
+ * ResetSpiderAggression
+ *
+ * Exits the combat area, walks to AGGRO_RESET_TILE, takes any due breaks/sleeps,
+ * then re-enters and returns to combat tiles.
+ *)
+procedure ResetSpiderAggression();
+var
+  resetTile: TPoint;
+  currentPos: TPoint;
+begin
+  currentPos := Map.Position();
+  WriteLog(ToStr('=== AGGRO RESET START - Position: ', currentPos, ' ==='));
+
+  // Exit the spiders area
+  WriteDebug('Step 1: Exiting spider area');
+  if not GetOutOfSpidersArea() then
+  begin
+    WriteLog('Failed to exit spider area during aggro reset, aborting reset');
+    Exit;
+  end;
+
+  currentPos := Map.Position();
+  WriteDebug(ToStr('After exiting spider area - Position: ', currentPos));
+  Wait(1000, 2000);
+
+  // Walk to reset aggro tile
+  resetTile := AGGRO_RESET_TILE;
+  currentPos := Map.Position();
+  WriteDebug(ToStr('Walking to reset tile: ', resetTile));
+  WriteDebug(ToStr('Step 2: Walking to reset tile from: ', currentPos, ' | Distance: ', currentPos.DistanceTo(resetTile)));
+
+  Map.Walker.WebWalk(resetTile, 2, 0.2);
+
+  currentPos := Map.Position();
+  WriteDebug(ToStr('Arrived at reset area - Position: ', currentPos, ' | Distance from target: ', currentPos.DistanceTo(resetTile)));
+
+  Wait(2000, 3000);
+  WriteLog('Aggression reset, returning to combat area');
+  TakeInitialRoomBreakIfDue();
+  TakeInitialRoomSleepIfDue();
+
+  // Go back into spiders area
+  currentPos := Map.Position();
+  WriteDebug(ToStr('Step 3: Re-entering spider area from: ', currentPos));
+  GetIntoSpidersArea();
+
+  currentPos := Map.Position();
+  WriteDebug(ToStr('Re-entered spider area - Position: ', currentPos));
+  Wait(1000, 2000);
+
+  // Go to combat tiles
+  currentPos := Map.Position();
+  WriteDebug(ToStr('Step 4: Going to combat tiles from: ', currentPos));
+  GoToCombatTiles();
+
+  currentPos := Map.Position();
+  WriteLog('Aggression reset complete');
+  WriteLog(ToStr('=== AGGRO RESET COMPLETE - Final position: ', currentPos, ' ==='));
+  WL.Activity.Restart();
+end;
+
+
+(**
+ * TAntiban.HasTaskWaiting
+ *
+ * Checks if any antiban task countdown has finished and is ready to execute.
+ *
+ * @return  True if at least one task is waiting
+ *)
+function TAntiban.HasTaskWaiting(): Boolean;
+var
+  i: Int32;
+begin
+  for i := 0 to High(Self.Tasks) do
+    if Self.Tasks[i].Countdown.IsFinished() then
+      Exit(True);
+end;
+
+(**
+ * HasPotions
+ *
+ * Checks if the inventory contains any dose of the configured potion.
+ *
+ * @return  True if any potion dose (1-4) is found
+ *)
+function HasPotions(): Boolean;
+var
+  i: Int32;
+begin
+  for i := 1 to 4 do
+    if Inventory.ContainsItem(Potion + '(' + ToStr(i) + ')') then
+      Exit(True);
+end;
+
+(**
+ * InCombat
+ *
+ * Waits for hitsplats on the mainscreen to detect active combat.
+ *
+ * @param WaitTime  Maximum time in ms to wait for hitsplats (default ONE_SECOND)
+ * @return          True if hitsplats are detected within the wait time
+ *)
+function InCombat(WaitTime: Int32 = ONE_SECOND): Boolean;
+begin
+  Result := WaitUntil((Length(Mainscreen.FindHitsplats()) > 0), 250, WaitTime);
+end;
+
+(**
+ * GetCombatTimeout
+ *
+ * Returns a randomized combat timeout within COMBAT_TIMEOUT_MIN..COMBAT_TIMEOUT_MAX.
+ *
+ * @return  Timeout value in ms
+ *)
+function GetCombatTimeout(): Int32;
+begin
+  Result := SRL.NormalRange(COMBAT_TIMEOUT_MIN, COMBAT_TIMEOUT_MAX);
+end;
+
+(**
+ * GetState
+ *
+ * Evaluates the current game state and returns the appropriate action.
+ *
+ * @return  The EState action to perform
+ *)
+function GetState(): EState;
+begin
+  if not RSClient.IsLoggedIn() then
+    Exit(HANDLE_LOGIN);
+
+  if RSInterface.IsOpen() then
+    Exit(CLOSE_INTERFACE);
+
+  if UseFood then
+    if Minimap.GetHPPercent() < SRL.NormalRange(HEAL_HP_MIN, HEAL_HP_MAX) then
+      if Inventory.ContainsItem(Food) then
+        Exit(HEAL)
+      else
+        Exit(RESTOCK);
+
+  if not IsAtCombatTiles() then
+  begin
+    if IsInEdgeville() then
+      Exit(RESTOCK);
+
+    if IsInStronghold() then
+    begin
+      if UseFood and (not Inventory.ContainsItem(Food)) then
+        Exit(RESTOCK);
+
+      Exit(NAVIGATE_TO_COMBAT);
+    end;
+
+    Exit(RESTOCK);
+  end;
+
+  if UsePotions then
+    if PotionTimer.ElapsedTime() > Random(POTION_TIMER_MIN, POTION_TIMER_MAX) then
+      if HasPotions() then
+        Exit(BOOST);
+
+  if Antiban.HasTaskWaiting() then
+    Exit(DO_ANTIBAN);
+
+  if InCombat(GetCombatTimeout()) then
+    Exit(FIGHTING);
+
+  Exit(RESET_AGGRO);
+end;
+
+(**
+ * IsOnFirstFloor
+ *
+ * Checks if the player is on the 1st floor of the Stronghold of Security.
+ *
+ * @return  True if player is on the 1st floor
+ *)
+function IsOnFirstFloor(): Boolean;
+begin
+  Result := Map.Position().InBox(FIRST_FLOOR_BOX) or Map.Position().InBox(FIRST_FLOOR_PAST_PORTAL_BOX);
+end;
+
+(**
+ * IsOnSecondFloor
+ *
+ * Checks if the player is on the 2nd floor of the Stronghold of Security.
+ *
+ * @return  True if player is on the 2nd floor
+ *)
+function IsOnSecondFloor(): Boolean;
+begin
+  Result := Map.Position().InBox(SECOND_FLOOR_BOX) or Map.Position().InBox(SECOND_FLOOR_PAST_PORTAL_BOX);
+end;
+
+(**
+ * IsOnThirdFloor
+ *
+ * Checks if the player is on the 3rd floor of the Stronghold of Security.
+ *
+ * @return  True if player is on the 3rd floor
+ *)
+function IsOnThirdFloor(): Boolean;
+begin
+  Result := Map.Position().InBox(THIRD_FLOOR_BOX);
+end;
+
+(**
+ * IsOnSurface
+ *
+ * Checks if the player is on the surface (overworld). Defined as "not on any
+ * known stronghold floor" so unknown/transitional positions fail open and
+ * still allow surface-side actions to attempt.
+ *
+ * @return  True if player is not on any stronghold floor
+ *)
+function IsOnSurface(): Boolean;
+begin
+  Result := not (IsOnFirstFloor() or IsOnSecondFloor() or IsOnThirdFloor());
+end;
+
+(**
+ * HasGainedXP
+ *
+ * Checks if the player has gained XP since the last check and updates GainedXP.
+ *
+ * @return  True if new XP was gained
+ *)
+function HasGainedXP(): Boolean;
+var
+  t: Int32 := XPBar.Read() - StartXP;
+begin
+  Result := t > GainedXP;
+
+  if Result then
+    GainedXP := t;
+end;
+
+(**
+ * GetCombatStyleName
+ *
+ * Returns a human-readable name for the current combat XP type.
+ *
+ * @return  The combat style name (e.g., "Strength", "Controlled")
+ *)
+function GetCombatStyleName(): String;
+begin
+  case CombatXPType of
+    ECombatXPType.XP_ATTACK:     Result := 'Attack';
+    ECombatXPType.XP_STRENGTH:   Result := 'Strength';
+    ECombatXPType.XP_DEFENCE:    Result := 'Defence';
+    ECombatXPType.XP_CONTROLLED: Result := 'Controlled';
+    ECombatXPType.XP_RANGED:     Result := 'Ranged';
+    ECombatXPType.XP_RANGED_DEF: Result := 'Ranged+Def';
+    ECombatXPType.XP_MAGIC:      Result := 'Magic';
+  else
+    Result := 'Unknown';
+  end;
+end;
+
+(**
+ * CalculateSkillXP
+ *
+ * Calculates the XP earned for a specific skill based on the combat XP type
+ * and OSRS XP distribution ratios.
+ *
+ * @param totalXP       Total combat XP earned
+ * @param xpType        The combat XP distribution type
+ * @param skill         The skill to calculate XP for
+ * @return              Estimated XP for the specified skill
+ *)
+function CalculateSkillXP(totalXP: Int32; xpType: ECombatXPType; skill: ERSSkill): Int32;
+begin
+  Result := 0;
+
+  case xpType of
+    ECombatXPType.XP_ATTACK:
+    begin
+      if skill = ERSSkill.ATTACK then Result := Round(totalXP * 0.75);
+      if skill = ERSSkill.HITPOINTS then Result := Round(totalXP * 0.25);
+    end;
+
+    ECombatXPType.XP_STRENGTH:
+    begin
+      if skill = ERSSkill.STRENGTH then Result := Round(totalXP * 0.75);
+      if skill = ERSSkill.HITPOINTS then Result := Round(totalXP * 0.25);
+    end;
+
+    ECombatXPType.XP_DEFENCE:
+    begin
+      if skill = ERSSkill.DEFENCE then Result := Round(totalXP * 0.75);
+      if skill = ERSSkill.HITPOINTS then Result := Round(totalXP * 0.25);
+    end;
+
+    ECombatXPType.XP_CONTROLLED:
+    begin
+      if skill = ERSSkill.ATTACK then Result := Round(totalXP * 0.25);
+      if skill = ERSSkill.STRENGTH then Result := Round(totalXP * 0.25);
+      if skill = ERSSkill.DEFENCE then Result := Round(totalXP * 0.25);
+      if skill = ERSSkill.HITPOINTS then Result := Round(totalXP * 0.25);
+    end;
+
+    ECombatXPType.XP_RANGED:
+    begin
+      if skill = ERSSkill.RANGE then Result := Round(totalXP * 0.75);
+      if skill = ERSSkill.HITPOINTS then Result := Round(totalXP * 0.25);
+    end;
+
+    ECombatXPType.XP_RANGED_DEF:
+    begin
+      if skill = ERSSkill.RANGE then Result := Round(totalXP * 0.50);
+      if skill = ERSSkill.DEFENCE then Result := Round(totalXP * 0.25);
+      if skill = ERSSkill.HITPOINTS then Result := Round(totalXP * 0.25);
+    end;
+
+    ECombatXPType.XP_MAGIC:
+    begin
+      if skill = ERSSkill.MAGIC then Result := Round(totalXP * 0.60);
+      if skill = ERSSkill.HITPOINTS then Result := Round(totalXP * 0.40);
+    end;
+  end;
+end;
+
+type
+  TSkillXPEntry = record
+    Name: String;
+    XP: Int32;
+    XPPerHour: Int32;
+  end;
+
+(**
+ * GetSkillXPEntries
+ *
+ * Returns per-skill XP breakdown entries for the current combat XP type.
+ *
+ * @param totalXP  Total combat XP earned
+ * @param timeMs   Time period in milliseconds (for XP/hr calculation)
+ * @return         Array of skill XP entries with name, XP, and XP/hr
+ *)
+function GetSkillXPEntries(totalXP: Int32; timeMs: Int64): array of TSkillXPEntry;
+var
+  entry: TSkillXPEntry;
+  skills: array of ERSSkill;
+  names: TStringArray;
+  i: Int32;
+begin
+  case CombatXPType of
+    ECombatXPType.XP_ATTACK:     begin skills := [ERSSkill.ATTACK, ERSSkill.HITPOINTS]; names := ['Attack', 'Hitpoints']; end;
+    ECombatXPType.XP_STRENGTH:   begin skills := [ERSSkill.STRENGTH, ERSSkill.HITPOINTS]; names := ['Strength', 'Hitpoints']; end;
+    ECombatXPType.XP_DEFENCE:    begin skills := [ERSSkill.DEFENCE, ERSSkill.HITPOINTS]; names := ['Defence', 'Hitpoints']; end;
+    ECombatXPType.XP_CONTROLLED: begin skills := [ERSSkill.ATTACK, ERSSkill.STRENGTH, ERSSkill.DEFENCE, ERSSkill.HITPOINTS]; names := ['Attack', 'Strength', 'Defence', 'Hitpoints']; end;
+    ECombatXPType.XP_RANGED:     begin skills := [ERSSkill.RANGE, ERSSkill.HITPOINTS]; names := ['Ranged', 'Hitpoints']; end;
+    ECombatXPType.XP_RANGED_DEF: begin skills := [ERSSkill.RANGE, ERSSkill.DEFENCE, ERSSkill.HITPOINTS]; names := ['Ranged', 'Defence', 'Hitpoints']; end;
+    ECombatXPType.XP_MAGIC:      begin skills := [ERSSkill.MAGIC, ERSSkill.HITPOINTS]; names := ['Magic', 'Hitpoints']; end;
+  end;
+
+  for i := 0 to High(skills) do
+  begin
+    entry.Name := names[i];
+    entry.XP := CalculateSkillXP(totalXP, CombatXPType, skills[i]);
+    if timeMs > 0 then
+      entry.XPPerHour := Round(entry.XP / (timeMs / ONE_HOUR))
+    else
+      entry.XPPerHour := 0;
+    Result += entry;
+  end;
+end;
+
+(**
+ * Report
+ *
+ * Prints a formatted progress report to the console including runtime, XP gained,
+ * XP/hour rates (active and total), break/sleep status, and shutdown timer.
+ *)
+procedure Report();
+
+  procedure WriteXPRow(skillName: String; xp, xpPerHour: Int32; colWidth: Int32);
+  var
+    line: String;
+  begin
+    line := '     ' + PadR(skillName, 12, ' ') +
+            PadR(FormatNumber(xp), 12, ' ') +
+            FormatNumber(xpPerHour);
+    WriteLn('| ' + PadR(line, colWidth, ' ') + ' |');
+  end;
+
+var
+  RunTime, ActiveTime: Int64;
+  line: String;
+  bannerWidth: Int32 = REPORT_BANNER_WIDTH;
+  colWidth: Int32;
+  borderLine, dividerLine, sectionHeader, title: String;
+  TimeSinceLastBreak: Int64;
+  totalXPPerHour: Int32;
+  entries: array of TSkillXPEntry;
+  i: Int32;
+begin
+  RunTime := GetTimeRunning();
+  ActiveTime := RunTime - TotalBreakTime - TotalSleepTime;
+  colWidth := bannerWidth - 4;
+  borderLine := '+' + StringOfChar('-', bannerWidth - 2) + '+';
+  dividerLine := '|' + StringOfChar('-', bannerWidth - 2) + '|';
+
+  // Center the title
+  title := 'Orka Giant Spiders';
+  title := '|' + PadR(PadL(title, (bannerWidth - 2 + Length(title)) div 2, ' '), bannerWidth - 2, ' ') + '|';
+
+  WriteLn('');
+  WriteLn(borderLine);
+  WriteLn(title);
+  WriteLn(borderLine);
+
+  // =========================================================================
+  // Section 1: Progress
+  // =========================================================================
+  sectionHeader := '| >> Progress';
+  WriteLn(PadR(sectionHeader, bannerWidth - 1, ' ') + '|');
+
+  line := '     Runtime: ' + SRL.MsToTime(RunTime, Time_Short);
+  WriteLn('| ' + PadR(line, colWidth, ' ') + ' |');
+  WriteLn(dividerLine);
+
+  // =========================================================================
+  // Section 2a: Combat XP Table (Active - excludes break/sleep time)
+  // =========================================================================
+  sectionHeader := '| >> Combat XP - Active (' + GetCombatStyleName() + ')';
+  WriteLn(PadR(sectionHeader, bannerWidth - 1, ' ') + '|');
+
+  line := '     ' + PadR('Skill', 12, ' ') + PadR('Gained', 12, ' ') + 'XP/Hour';
+  WriteLn('| ' + PadR(line, colWidth, ' ') + ' |');
+
+  entries := GetSkillXPEntries(GainedXP, ActiveTime);
+  for i := 0 to High(entries) do
+    WriteXPRow(entries[i].Name, entries[i].XP, entries[i].XPPerHour, colWidth);
+
+  // Total row
+  if ActiveTime > 0 then totalXPPerHour := Round(GainedXP / (ActiveTime / ONE_HOUR)) else totalXPPerHour := 0;
+  WriteXPRow('Total', GainedXP, totalXPPerHour, colWidth);
+  WriteLn(dividerLine);
+
+  // =========================================================================
+  // Section 2b: Combat XP Table (Total - includes break/sleep time)
+  // =========================================================================
+  sectionHeader := '| >> Combat XP - Total (' + GetCombatStyleName() + ')';
+  WriteLn(PadR(sectionHeader, bannerWidth - 1, ' ') + '|');
+
+  line := '     ' + PadR('Skill', 12, ' ') + PadR('Gained', 12, ' ') + 'XP/Hour';
+  WriteLn('| ' + PadR(line, colWidth, ' ') + ' |');
+
+  entries := GetSkillXPEntries(GainedXP, RunTime);
+  for i := 0 to High(entries) do
+    WriteXPRow(entries[i].Name, entries[i].XP, entries[i].XPPerHour, colWidth);
+
+  // Total row
+  if RunTime > 0 then totalXPPerHour := Round(GainedXP / (RunTime / ONE_HOUR)) else totalXPPerHour := 0;
+  WriteXPRow('Total', GainedXP, totalXPPerHour, colWidth);
+  WriteLn(dividerLine);
+
+  // =========================================================================
+  // Section 3: Breaks & Sleeps
+  // =========================================================================
+  sectionHeader := '| >> Breaks & Sleeps';
+  WriteLn(PadR(sectionHeader, bannerWidth - 1, ' ') + '|');
+
+  if TakeBreaks then
+  begin
+    // Next break
+    if Length(Antiban.Breaks) > 0 then
+      line := '     Next break: ' + SRL.MsToTime(Max(0, Round(Antiban.Breaks[0].NextAtTime - RunTime)), Time_Short)
+    else
+      line := '     Next break: N/A';
+    WriteLn('| ' + PadR(line, colWidth, ' ') + ' |');
+
+    // Since last break
+    if LastBreakEndTime > 0 then
+    begin
+      TimeSinceLastBreak := RunTime - LastBreakEndTime;
+      line := '     Since last: ' + SRL.MsToTime(TimeSinceLastBreak, Time_Short);
+    end
+    else
+      line := '     Since last: N/A';
+    WriteLn('| ' + PadR(line, colWidth, ' ') + ' |');
+
+    // Total break time
+    if TotalBreakTime > 0 then
+      line := '     Total break time: ' + SRL.MsToTime(TotalBreakTime, Time_Short)
+    else
+      line := '     Total break time: 0s';
+    WriteLn('| ' + PadR(line, colWidth, ' ') + ' |');
+  end
+  else
+  begin
+    line := '     Breaks: Disabled';
+    WriteLn('| ' + PadR(line, colWidth, ' ') + ' |');
+  end;
+
+  // Sleeps
+  if TakeSleeps then
+  begin
+    if Length(Antiban.Sleeps) > 0 then
+      line := '     Next sleep: ' + SRL.MsToTime(Max(0, Round(Antiban.Sleeps[0].NextAtTime - RunTime)), Time_Short)
+    else
+      line := '     Next sleep: N/A';
+    WriteLn('| ' + PadR(line, colWidth, ' ') + ' |');
+
+    // Total sleep time
+    if TotalSleepTime > 0 then
+      line := '     Total sleep time: ' + SRL.MsToTime(TotalSleepTime, Time_Short)
+    else
+      line := '     Total sleep time: 0s';
+    WriteLn('| ' + PadR(line, colWidth, ' ') + ' |');
+  end
+  else
+  begin
+    line := '     Next sleep: Disabled';
+    WriteLn('| ' + PadR(line, colWidth, ' ') + ' |');
+  end;
+
+  // Shutdown timer
+  if ShutdownTime > 0 then
+    line := '     Shutdown: ' + SRL.MsToTime(Max(0, ShutdownTime - RunTime), Time_Short)
+  else
+    line := '     Shutdown: Disabled';
+  WriteLn('| ' + PadR(line, colWidth, ' ') + ' |');
+
+  // =========================================================================
+  // Footer
+  // =========================================================================
+  WriteLn(borderLine);
+  title := 'Orka Scripts';
+  title := '|' + PadR(PadL(title, (bannerWidth - 2 + Length(title)) div 2, ' '), bannerWidth - 2, ' ') + '|';
+  WriteLn(title);
+  WriteLn(borderLine);
+  WriteLn('');
+end;
+
+(**
+  @description Builds per-skill XP lines for Discord embeds based on the active combat style.
+  @param totalXP  Total XP gained this session
+  @param runTime  Total runtime in milliseconds
+  @return Formatted string with style and per-skill XP breakdown
+*)
+function BuildDiscordSkillLines(totalXP: Int32; runTime: Int64): String;
+var
+  entries: array of TSkillXPEntry;
+  i: Int32;
+begin
+  Result := 'Style: ' + GetCombatStyleName() + LineEnding;
+
+  entries := GetSkillXPEntries(totalXP, runTime);
+  for i := 0 to High(entries) do
+    Result += entries[i].Name + ' XP: ' + ToString(entries[i].XP) +
+              ' (' + ToString(entries[i].XPPerHour) + '/hr)' + LineEnding;
+end;
+
+(**
+  @description Sends a Discord report embed with current session statistics.
+  @param reportTitle The title for the embed (e.g., 'Hourly Report', 'Level Up!')
+  @param embedColor The color of the embed sidebar (e.g., $0000FF for blue)
+*)
+procedure SendDiscordReport(reportTitle: String; embedColor: Int32);
+var
+  RunTime: Int64;
+  XPPerHour, EmbedIdx: Int32;
+begin
+  if not UseDiscord then Exit;
+
+  GainedXP := XPBar.Read() - StartXP;
+  RunTime := GetTimeRunning();
+  if RunTime > 0 then
+    XPPerHour := Round(GainedXP / (RunTime / ONE_HOUR));
+
+  try
+    EmbedIdx := Discord.Webhook.AddEmbed();
+    with Discord.Webhook.Embeds[EmbedIdx] do
+    begin
+      Title := reportTitle;
+      Description :=
+        'Runtime: ' + SRL.MsToTime(RunTime, Time_Short) + LineEnding +
+        BuildDiscordSkillLines(GainedXP, RunTime) +
+        'XP Gained: ' + ToString(GainedXP) + LineEnding +
+        'XP/Hr: ' + ToString(XPPerHour);
+      Color := embedColor;
+      Footer := SCRIPT_NAME;
+    end;
+
+    Discord.SendScreenshot(AnonymousScreenshots);
+  except
+    WriteLog('[Discord] Error sending report: ' + GetExceptionMessage);
+  end;
+end;
+
+(**
+  @description Sends a session summary to Discord when the script terminates.
+*)
+procedure _OnTerminateDiscord();
+var
+  RunTime: Int64;
+  XPPerHour, EmbedIdx: Int32;
+begin
+  if not UseDiscord then Exit;
+
+  Config.IsSetup := False;
+  Discord.Config.IsSetup := False;
+
+  try
+    GainedXP := XPBar.Read() - StartXP;
+    RunTime := GetTimeRunning();
+    if RunTime > 0 then
+      XPPerHour := Round(GainedXP / (RunTime / ONE_HOUR));
+
+    Discord.Webhook.Content := ':white_check_mark: **Session Complete**';
+    EmbedIdx := Discord.Webhook.AddEmbed();
+    with Discord.Webhook.Embeds[EmbedIdx] do
+    begin
+      Title := 'Session Summary';
+      Description :=
+        'Runtime: ' + SRL.MsToTime(RunTime, Time_Short) + LineEnding +
+        BuildDiscordSkillLines(GainedXP, RunTime) +
+        'XP Gained: ' + ToString(GainedXP) + LineEnding +
+        'XP/Hr: ' + ToString(XPPerHour);
+      Color := $00AA00;
+      Footer := SCRIPT_NAME;
+    end;
+
+    Discord.SendScreenshot(AnonymousScreenshots);
+  except
+    WriteLog('[Discord] Error sending session summary: ' + GetExceptionMessage);
+  end;
+
+  Discord.Free();
+end;
+
+(**
+ * EatFood
+ *
+ * Clicks the configured food item in the inventory to heal.
+ *)
+procedure EatFood();
+begin
+  if Inventory.ClickItem(Food) then
+  begin
+    WriteLog('Eating food');
+    WaitEx(2750, 525);
+  end else
+    WriteLog('Failed to eat food!');
+end;
+
+(**
+ * DrinkPotion
+ *
+ * Clicks the highest available dose of the configured potion and resets the potion timer.
+ *)
+procedure DrinkPotion();
+var
+  i: Int32;
+begin
+  for i := 1 to 4 do
+    if Inventory.ClickItem(Potion + '(' + ToStr(i) + ')') then
+    begin
+      WriteLog('Drinking potion');
+      PotionTimer.Reset();
+      WaitEx(2750, 525);
+      Break;
+    end;
+end;
+
+(**
+ * TAntiban.DoLoseFocus
+ *
+ * Antiban task that briefly loses focus on the game client.
+ *)
+procedure TAntiban.DoLoseFocus();
+begin
+  Self.LoseFocus(SRL.NormalRange(450, 2750));
+end;
+
+(**
+ * OnBreakStart
+ *
+ * Callback triggered when a break begins. Pauses the activity tracker and
+ * records the break start time.
+ *
+ * @param Task  Pointer to the break task that started
+ *)
+procedure OnBreakStart(Task: PBreakTask);
+var
+  T: PBreakTask;
+begin
+  WL.Activity.Pause();
+  LastBreakStartTime := GetTimeRunning();
+  T := Task;
+end;
+
+(**
+ * OnBreakEnd
+ *
+ * Callback triggered when a break ends. Resumes the activity tracker,
+ * accumulates break duration, and re-logs the player if needed.
+ *
+ * @param Task  Pointer to the break task that ended
+ *)
+procedure OnBreakEnd(Task: PBreakTask);
+var
+  T: PBreakTask;
+  BreakDuration: Int64;
+begin
+  WL.Activity.Resume();
+  LastBreakEndTime := GetTimeRunning();
+  BreakDuration := LastBreakEndTime - LastBreakStartTime;
+  TotalBreakTime := TotalBreakTime + BreakDuration;
+  T := Task;
+
+  // Log back in if player was logged out during break
+  if not RSClient.IsLoggedIn() then
+  begin
+    WriteLog('Break finished - logging player back in');
+    Login.LoginPlayer();
+
+    if not WaitUntil(RSClient.IsLoggedIn(), 250, 12 * ONE_SECOND) then
+    begin
+      WriteLog('Failed to log back in after break');
+      TerminateScript('Failed to log back in after break');
+    end;
+
+    WriteLog('Player successfully logged back in after break');
+    Wait(1000, 2000);
+    WL.Activity.Restart();
+  end;
+end;
+
+(**
+ * OnSleepStart
+ *
+ * Callback triggered when a sleep begins. Pauses the activity tracker and
+ * records the sleep start time.
+ *
+ * @param Task  Pointer to the sleep task that started
+ *)
+procedure OnSleepStart(Task: PSleepTask);
+var
+  T: PSleepTask;
+begin
+  WL.Activity.Pause();
+  LastSleepStartTime := GetTimeRunning();
+  T := Task;
+end;
+
+(**
+ * OnSleepEnd
+ *
+ * Callback triggered when a sleep ends. Resumes the activity tracker,
+ * accumulates sleep duration, and re-logs the player if needed.
+ *
+ * @param Task  Pointer to the sleep task that ended
+ *)
+procedure OnSleepEnd(Task: PSleepTask);
+var
+  T: PSleepTask;
+begin
+  WL.Activity.Resume();
+  LastSleepEndTime := GetTimeRunning();
+  TotalSleepTime := TotalSleepTime + (LastSleepEndTime - LastSleepStartTime);
+  T := Task;
+
+  // Log back in if player was logged out during sleep
+  if not RSClient.IsLoggedIn() then
+  begin
+    WriteLog('Sleep finished - logging player back in');
+    Login.LoginPlayer();
+
+    if not WaitUntil(RSClient.IsLoggedIn(), 250, 12 * ONE_SECOND) then
+    begin
+      WriteLog('Failed to log back in after sleep');
+      TerminateScript('Failed to log back in after sleep');
+    end;
+
+    WriteLog('Player successfully logged back in after sleep');
+    Wait(1000, 2000);
+    WL.Activity.Restart();
+  end;
+end;
+
+(**
+ * WithdrawPotions
+ *
+ * Withdraws the configured number of potions from the bank.
+ * Falls back to bank search if direct withdrawal fails.
+ *
+ * @return  True if potions were successfully withdrawn
+ *)
+function WithdrawPotions(): Boolean;
+var
+  P: TRSBankItem := TRSBankItem.Setup(Potion + '(4)', PotionAmount, False);
+  attempt: Int32;
+begin
+  if not Bank.IsOpen() then
+    Exit(False);
+
+  for attempt := 1 to 2 do
+  begin
+    if Bank.WithdrawItem(P, False) then
+      if WaitUntil(Inventory.ContainsItem(Potion + '(4)'), 300, 3 * ONE_SECOND) then
+      begin
+        WriteLog('Successfully withdrew potions');
+        Exit(True);
+      end;
+
+    if attempt < 2 then
+      Wait(400, 700);
+  end;
+
+  WriteLog('Failed to withdraw potions - will continue with food only');
+end;
+
+(**
+ * DropEmptyVials
+ *
+ * Shift-drops any empty vials from the inventory.
+ *)
+procedure DropEmptyVials();
+begin
+  if Inventory.ContainsAny(['Vial']) then
+  begin
+    WriteLog('Dropping empty vials');
+    Inventory.ShiftDrop(['Vial'], Inventory.RandomPattern());
+  end;
+end;
+
+(**
+ * WalkToBank
+ *
+ * Navigates the player from anywhere (including inside the stronghold) to the
+ * Edgeville bank by climbing ladders and web-walking.
+ *
+ * @return  True if successfully arrived at the bank
+ *)
+function WalkToBank(): Boolean;
+var
+  bankTile: TPoint := EDGEVILLE_BANK_TILE;
+begin
+  WriteLog(ToStr('Walking to Edgeville bank from position: ', Map.Position()));
+
+  // If in stronghold, need to exit first
+  if IsInStronghold() then
+  begin
+    WriteLog('Exiting stronghold to bank');
+
+    // Exit combat area or between-gates area
+    if not IsInInitialRoom() and (IsInCombatArea() or IsInBetweenGates()) then
+    begin
+      if not GetOutOfSpidersArea() then
+      begin
+        WriteLog('Unable to exit spider area while heading to bank');
+        Exit(False);
+      end;
+    end;
+
+    // Climb up from 3rd floor
+    if IsOnThirdFloor() then
+    begin
+      WriteLog('=== CLIMBING UP FROM 3RD FLOOR ===');
+      if not DoTransition(SpiderObjects.ThirdFloorLadderEntrance, SECOND_FLOOR_BOX) then
+        WriteLog('WARNING: Failed to reach 2nd floor');
+    end;
+
+    // Climb up from 2nd floor
+    if IsOnSecondFloor() then
+    begin
+      WriteLog('=== CLIMBING UP FROM 2ND FLOOR ===');
+      if not DoTransition(SpiderObjects.SecondFloorLadderEntrance, FIRST_FLOOR_BOX) then
+        WriteLog('WARNING: Failed to reach 1st floor');
+    end;
+
+    // Climb up from 1st floor
+    if IsOnFirstFloor() then
+    begin
+      WriteLog('=== CLIMBING UP FROM 1ST FLOOR ===');
+      if not DoTransition(SpiderObjects.FirstFloorLadderEntrance, SURFACE_BOX) then
+        WriteLog('WARNING: Failed to reach surface');
+    end;
+  end;
+
+  // WebWalk to bank
+  WriteLog(ToStr('WebWalking to bank from: ', Map.Position()));
+  Result := Map.Walker.WebWalk(bankTile, 20, 0.2);
+
+  if Result then
+    WriteLog(ToStr('Arrived at Edgeville bank - Position: ', Map.Position()))
+  else
+    WriteLog(ToStr('Failed to walk to bank - Current position: ', Map.Position()));
+end;
+
+(**
+ * WalkToStronghold
+ *
+ * Navigates from the surface down through all 3 floors of the Stronghold of Security
+ * via ladders and portals. Each transition uses DoTransition with 3 retries.
+ *
+ * @return  True if successfully reached the 3rd floor
+ *)
+function WalkToStronghold(): Boolean;
+begin
+  WriteLog(ToStr('Walking to Stronghold from position: ', Map.Position()));
+
+  // Enter stronghold from surface
+  if IsOnSurface() then
+  begin
+    WriteLog('=== ENTERING STRONGHOLD (SURFACE -> 1ST FLOOR) ===');
+    if not DoTransition(SpiderObjects.StrongholdEntrance, FIRST_FLOOR_BOX) then
+    begin
+      WriteLog('Failed to enter stronghold');
+      Exit(False);
+    end;
+  end;
+
+  // 1st floor portal (need to cross portal before reaching the ladder down)
+  if IsOnFirstFloor() and (Map.Position().X < 3500) then
+  begin
+    WriteLog('=== 1ST FLOOR PORTAL ===');
+    if not DoTransition(SpiderObjects.FirstFloorPortal, FIRST_FLOOR_PAST_PORTAL_BOX) then
+    begin
+      WriteLog('Failed at 1st floor portal');
+      Exit(False);
+    end;
+  end;
+
+  // 1st floor ladder down to 2nd floor
+  if IsOnFirstFloor() then
+  begin
+    WriteLog('=== CLIMBING DOWN TO 2ND FLOOR ===');
+    if not DoTransition(SpiderObjects.FirstFloorLadderExit, SECOND_FLOOR_BOX) then
+    begin
+      WriteLog('Failed to reach 2nd floor');
+      Exit(False);
+    end;
+  end;
+
+  // 2nd floor portal (need to cross portal before reaching the ladder down)
+  if IsOnSecondFloor() and (Map.Position().X > 4020) then
+  begin
+    WriteLog('=== 2ND FLOOR PORTAL ===');
+    if not DoTransition(SpiderObjects.SecondFloorPortal, SECOND_FLOOR_PAST_PORTAL_BOX) then
+    begin
+      WriteLog('Failed at 2nd floor portal');
+      Exit(False);
+    end;
+  end;
+
+  // 2nd floor ladder down to 3rd floor
+  if IsOnSecondFloor() then
+  begin
+    WriteLog('=== CLIMBING DOWN TO 3RD FLOOR ===');
+    if not DoTransition(SpiderObjects.SecondFloorLadderExit, THIRD_FLOOR_BOX) then
+    begin
+      WriteLog('Failed to reach 3rd floor');
+      Exit(False);
+    end;
+  end;
+
+  WriteLog(ToStr('Arrived at 3rd floor - Position: ', Map.Position()));
+  Result := True;
+end;
+
+(**
+ * ReturnToCombat
+ *
+ * Walks to the stronghold (if needed), enters the spider area, and goes to combat tiles.
+ *
+ * @return  True if successfully returned to combat position
+ *)
+function ReturnToCombat(): Boolean;
+begin
+  WriteLog('Returning to combat area');
+
+  // Navigate to stronghold if not there
+  if not IsInStronghold() then
+  begin
+    if not WalkToStronghold() then
+    begin
+      WriteLog('Failed to walk to stronghold');
+      Exit(False);
+    end;
+  end;
+
+  // Enter combat area through gates
+  GetIntoSpidersArea();
+  Wait(1000, 2000);
+
+  // Go to combat tiles
+  GoToCombatTiles();
+
+  WriteLog('Returned to combat successfully');
+  Result := True;
+end;
+
+(**
+ * RestockSupplies
+ *
+ * Walks to the Edgeville bank, deposits all items, withdraws potions and food,
+ * then returns to the combat area.
+ *)
+procedure RestockSupplies();
+begin
+  WriteLog('Restocking supplies at Edgeville bank');
+
+  // Drop vials if in combat area before banking
+  if IsInCombatArea() then
+    DropEmptyVials();
+
+  // Walk to bank if not there already
+  if not IsInEdgeville() then
+  begin
+    WriteLog('Walking to Edgeville bank');
+    if not WalkToBank() then
+    begin
+      Inc(WalkToBankFailCount);
+      WriteLog('Failed to walk to bank (attempt ' + ToStr(WalkToBankFailCount) + '/10)');
+      if WalkToBankFailCount >= 10 then
+        TerminateScript('Failed to walk to bank after 10 consecutive attempts');
+      Wait(1000, 2000);
+      Exit;
+    end;
+    WalkToBankFailCount := 0;
+  end;
+
+  // Open bank
+  if not Banks.WalkOpen() then
+  begin
+    Antiban.RandomRotate();
+    Wait(775, 1250);
+    Exit;
+  end;
+
+  Wait(500, 1000);
+
+  // Deposit all items
+  if Inventory.CountEmptySlots() < 28 then
+  begin
+    WriteLog('Depositing all items');
+    Bank.DepositAll();
+    Wait(775, 1250);
+  end;
+
+  // Withdraw potions if needed
+  if UsePotions and (PotionAmount > 0) then
+  begin
+    WriteLog(ToStr('Withdrawing ', PotionAmount, ' potions'));
+    WithdrawPotions();
+    Wait(775, 1250);
+  end;
+
+  // Withdraw food to fill remaining slots
+  if UseFood then
+  begin
+    WriteLog('Withdrawing food to fill inventory');
+    if Bank.WithdrawItem(TRSBankItem.Setup(Food, Bank.QUANTITY_ALL, False), False) then
+      WaitUntil(Inventory.ContainsItem(Food), 300, 3 * ONE_SECOND)
+    else
+      TerminateScript('Could not find food in bank: ' + Food);
+    Wait(775, 1250);
+  end;
+
+  // Close bank
+  if Bank.IsOpen() then
+  begin
+    Bank.Close(50);
+    Wait(500, 1000);
+  end;
+
+  WriteLog('Restock complete, returning to combat');
+  Antiban.DoAntiban();
+
+  // Return to combat area
+  ReturnToCombat();
+end;
+
+(**
+ * GetTrainedSkill
+ *
+ * Detects the active combat style and returns the corresponding skills being trained.
+ * Also sets the global CombatXPType for XP distribution calculations.
+ *
+ * @return  Array of ERSSkill values being trained by the current combat style
+ *)
+function GetTrainedSkill(): array of ERSSkill;
+var
+  style: String;
+  cs: TRSCombatStyle;
+begin
+  // WaspLib's TRSCombatStyle.GetCombatType OCRs the combat tab with the
+  // default black color filter, misses the white/yellow style text, and
+  // silently returns MAGIC. Read the style string instead (color-correct
+  // in Combat.GetCombatStyle) and only fall back to GetCombatType for the
+  // two truly ambiguous cases: "Accurate" and autocast magic.
+  style := Combat.GetCombatStyle();
+  WriteLog(ToStr('Detected combat style: ', style));
+
+  if style.ContainsAny(['Aggressive', 'Slash', 'Chop', 'Pummel', 'Impale', 'Swipe', 'Smash', 'Punch', 'Kick']) then
+  begin
+    WriteLog('Training Strength skill');
+    CombatXPType := ECombatXPType.XP_STRENGTH;
+    Result := [ERSSkill.STRENGTH, ERSSkill.HITPOINTS, ERSSkill.TOTAL];
+    Exit;
+  end;
+
+  if style.ContainsAny(['Stab', 'Lunge', 'Bash', 'Pound', 'Spike', 'Jab', 'Hack']) then
+  begin
+    WriteLog('Training Attack skill');
+    CombatXPType := ECombatXPType.XP_ATTACK;
+    Result := [ERSSkill.ATTACK, ERSSkill.HITPOINTS, ERSSkill.TOTAL];
+    Exit;
+  end;
+
+  if style.ContainsAny(['Defensive', 'Block', 'Fend', 'Deflect']) then
+  begin
+    WriteLog('Training Defence skill');
+    CombatXPType := ECombatXPType.XP_DEFENCE;
+    Result := [ERSSkill.DEFENCE, ERSSkill.HITPOINTS, ERSSkill.TOTAL];
+    Exit;
+  end;
+
+  if style.ContainsAny(['Controlled', 'Lash', 'Flick', 'Focus']) then
+  begin
+    WriteLog('Training Controlled (Attack, Strength, Defence)');
+    CombatXPType := ECombatXPType.XP_CONTROLLED;
+    Result := [ERSSkill.ATTACK, ERSSkill.STRENGTH, ERSSkill.DEFENCE, ERSSkill.HITPOINTS, ERSSkill.TOTAL];
+    Exit;
+  end;
+
+  if style.ContainsAny(['Longrange']) then
+  begin
+    WriteLog('Training Ranged + Defence (Longrange)');
+    CombatXPType := ECombatXPType.XP_RANGED_DEF;
+    Result := [ERSSkill.RANGE, ERSSkill.DEFENCE, ERSSkill.HITPOINTS, ERSSkill.TOTAL];
+    Exit;
+  end;
+
+  if style.ContainsAny(['Rapid']) then
+  begin
+    WriteLog('Training Ranged skill');
+    CombatXPType := ECombatXPType.XP_RANGED;
+    Result := [ERSSkill.RANGE, ERSSkill.HITPOINTS, ERSSkill.TOTAL];
+    Exit;
+  end;
+
+  // "Accurate" means Attack XP on melee weapons (pickaxes, some scimitars)
+  // and Ranged XP on bows/crossbows — the style string alone can't tell them
+  // apart, so ask the combat panel.
+  if style.ContainsAny(['Accurate']) then
+  begin
+    cs.GetCombatType();
+    if cs.CombatType = ERSCombatType.RANGED then
+    begin
+      WriteLog('Training Ranged skill (Accurate)');
+      CombatXPType := ECombatXPType.XP_RANGED;
+      Result := [ERSSkill.RANGE, ERSSkill.HITPOINTS, ERSSkill.TOTAL];
+      Exit;
+    end;
+
+    WriteLog('Training Attack skill (Accurate, melee)');
+    CombatXPType := ECombatXPType.XP_ATTACK;
+    Result := [ERSSkill.ATTACK, ERSSkill.HITPOINTS, ERSSkill.TOTAL];
+    Exit;
+  end;
+
+  // Autocast magic usually leaves the style string empty, so fall back to
+  // the panel icon here.
+  cs.GetCombatType();
+  if cs.CombatType = ERSCombatType.MAGIC then
+  begin
+    WriteLog('Training Magic skill');
+    CombatXPType := ECombatXPType.XP_MAGIC;
+    Result := [ERSSkill.MAGIC, ERSSkill.HITPOINTS, ERSSkill.TOTAL];
+    Exit;
+  end;
+
+  WriteLog(ToStr('Could not detect combat type (style="', style, '", combatType=', cs.CombatType, '), defaulting to all combat skills'));
+  CombatXPType := ECombatXPType.XP_UNKNOWN;
+  Result := [ERSSkill.ATTACK, ERSSkill.STRENGTH, ERSSkill.DEFENCE,
+             ERSSkill.HITPOINTS, ERSSkill.RANGE, ERSSkill.MAGIC, ERSSkill.TOTAL];
+end;
+
+(**
+ * SetupAntiban
+ *
+ * Configures antiban tasks (mouse, right-click, focus, rotate, hover, tab),
+ * break schedules, and sleep schedules based on GUI settings.
+ *)
+procedure SetupAntiban();
+begin
+  Antiban.Skills := GetTrainedSkill();
+
+  Antiban.AddTask(ONE_MINUTE * 4, @Antiban.RandomMouse, 0.25);
+  Antiban.AddTask(ONE_MINUTE * 5, @Antiban.RandomRightClick, 1);
+  Antiban.AddTask(ONE_MINUTE * 5, @Antiban.DoLoseFocus, 1);
+  Antiban.AddTask(ONE_MINUTE * 5, @Antiban.RandomRotate, 1);
+
+  Antiban.AddTask(ONE_MINUTE * 15, @Antiban.HoverSkills, 0.5);
+  Antiban.AddTask(ONE_MINUTE * 12, @Antiban.RandomTab, 0.5);
+
+  if TakeBreaks then
+  begin
+    Antiban.AddBreak(BreakAfter * ONE_MINUTE, BreakFor * ONE_MINUTE, 0.3, 1);
+    Antiban.OnStartBreak := @OnBreakStart;
+    Antiban.OnFinishBreak := @OnBreakEnd;
+  end;
+
+  if TakeSleeps then
+  begin
+    Antiban.AddSleep(SleepAtTime, SleepForHours * ONE_HOUR, 0.1, 1);
+    Antiban.OnStartSleep := @OnSleepStart;
+    Antiban.OnFinishSleep := @OnSleepEnd;
+  end;
+end;
+
+(**
+ * HasCorrectSupplies
+ *
+ * Checks whether the inventory already contains the correct loadout
+ * (potions + food) so we can skip banking if supplies are intact.
+ *
+ * @return  True if inventory matches the desired supply configuration
+ *)
+function HasCorrectSupplies(): Boolean;
+var
+  potionCount, i: Int32;
+begin
+  if Inventory.CountEmptySlots() > 0 then
+    Exit(False);
+
+  if UsePotions then
+  begin
+    potionCount := 0;
+    for i := 1 to 4 do
+      potionCount += Inventory.CountItem(Potion + '(' + ToStr(i) + ')');
+
+    if potionCount <> PotionAmount then
+      Exit(False);
+  end;
+
+  if UseFood then
+    if not Inventory.ContainsItem(Food) then
+      Exit(False);
+
+  Result := True;
+end;
+
+(**
+ * InitialSetup
+ *
+ * Determines the player's starting location and navigates to the appropriate
+ * destination (combat area, bank, or restock) based on inventory and position.
+ *)
+procedure InitialSetup();
+var
+  hasFood: Boolean;
+begin
+  WriteLog('Performing initial setup based on location');
+
+  // Ensure inventory is open and loaded
+  Inventory.Open();
+  Wait(500, 750);
+
+  // Check food status (if food is being used)
+  if UseFood then
+    hasFood := Inventory.ContainsItem(Food)
+  else
+    hasFood := True; // Not using food, so consider as "has food"
+
+  // Check if in combat area
+  if IsInCombatArea() then
+  begin
+    WriteLog('Starting in combat area');
+    GoToCombatTiles(); // Make sure we're on combat tiles
+    Exit;
+  end;
+
+  // Check if between gates (after gate 1, before gate 2)
+  if IsInBetweenGates() then
+  begin
+    if hasFood then
+    begin
+      WriteLog('Between gates with food - going to combat area');
+      if PassThroughGate2Only() then
+      begin
+        Wait(1000, 2000);
+        GoToCombatTiles();
+      end;
+    end else
+    begin
+      WriteLog('Between gates without food - going to bank');
+      if PassThroughGate1Only() then
+      begin
+        Wait(1000, 2000);
+        WalkToBank();
+        Wait(1000, 2000);
+        RestockSupplies();
+      end;
+    end;
+    Exit;
+  end;
+
+  // Check if in initial room (before gates)
+  if IsInInitialRoom() then
+  begin
+    if hasFood then
+    begin
+      WriteLog('In initial room with food - going to combat area');
+      GetIntoSpidersArea();
+      Wait(1000, 2000);
+      GoToCombatTiles();
+    end else
+    begin
+      WriteLog('In initial room without food - going to bank');
+      WalkToBank();
+      Wait(1000, 2000);
+      RestockSupplies();
+    end;
+    Exit;
+  end;
+
+  // Check if in Edgeville or near bank
+  if IsInEdgeville() then
+  begin
+    if HasCorrectSupplies() then
+    begin
+      WriteLog('Starting in Edgeville - inventory ready, heading to combat');
+      ReturnToCombat();
+    end else
+    begin
+      WriteLog('Starting in Edgeville - will restock and go to combat');
+      RestockSupplies();
+    end;
+    Exit;
+  end;
+
+  // Default: assume near Edgeville/Barbarian Village
+  if HasCorrectSupplies() then
+  begin
+    WriteLog('Inventory ready, heading to combat');
+    ReturnToCombat();
+  end else
+  begin
+    WriteLog('Starting near Edgeville - will restock and go to combat');
+    RestockSupplies();
+  end;
+end;
+
+(**
+ * Init
+ *
+ * Performs one-time initialization: prints the ASCII banner, logs in, reads starting XP,
+ * sets zoom/auto-retaliate, configures mouse speed, and sets up antiban.
+ *)
+procedure Init();
+begin
+  // ===== ASCII art logo =====
+  Writeln('');
+  Writeln(' _____                                           _____ ');
+  Writeln('( ___ )                                         ( ___ )');
+  Writeln(' |   |~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~|   | ');
+  Writeln(' |   |    _______  ______    ___   _  _______    |   | ');
+  Writeln(' |   |   |       ||    _ |  |   | | ||   _   |   |   | ');
+  Writeln(' |   |   |   _   ||   | ||  |   |_| ||  |_|  |   |   | ');
+  Writeln(' |   |   |  | |  ||   |_||_ |      _||       |   |   | ');
+  Writeln(' |   |   |  |_|  ||    __  ||     |_ |       |   |   | ');
+  Writeln(' |   |   |       ||   |  | ||    _  ||   _   |   |   | ');
+  Writeln(' |   |   |_______||___|  |_||___| |_||__| |__|   |   | ');
+  Writeln(' |   |                                           |   | ');
+  Writeln(' |___|~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~|___| ');
+  Writeln('(_____)                                         (_____)');
+
+  // ===== Credits block =====
+  Writeln('');
+  Writeln('  ___                                             ___  ');
+  Writeln(' |   |****************  CREDITS  ****************|   | ');
+  Writeln(' |   |                                           |   | ');
+  Writeln(' |   |    3Garrett3  |  Torwent  |  Student      |   | ');
+  Writeln(' |   |    BigAussie  |  Flight   |  Kriptic      |   | ');
+  Writeln(' |   |    skunkworks |  Fik      |  XJ           |   | ');
+  Writeln(' |   |    Sebastiaan |  unit     |  n0ll         |   | ');
+  Writeln(' |   |    Baconadors                             |   | ');
+  Writeln(' |   |                                           |   | ');
+  Writeln(' |___|~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~|___| ');
+  Writeln('');
+
+  // ===== Script configuration block =====
+  Writeln('  ___                                             ___  ');
+  Writeln(' |   |**********  Orka Giant Spiders  **********|   | ');
+  Writeln(' |   |                                           |   | ');
+  if UseFood then
+    Writeln(' |   |    ' + PadR('Food: ' + String(Food), 39) + '|   | ')
+  else
+    Writeln(' |   |    ' + PadR('Food: Disabled', 39) + '|   | ');
+  if UsePotions then
+    Writeln(' |   |    ' + PadR('Potion: ' + String(Potion) + ' x' + ToStr(PotionAmount), 39) + '|   | ')
+  else
+    Writeln(' |   |    ' + PadR('Potion: Disabled', 39) + '|   | ');
+  if TakeBreaks then
+    Writeln(' |   |    ' + PadR('Breaks: ' + ToStr(BreakFor) + 'm every ' + ToStr(BreakAfter) + 'm', 39) + '|   | ')
+  else
+    Writeln(' |   |    ' + PadR('Breaks: Disabled', 39) + '|   | ');
+  if TakeSleeps then
+    Writeln(' |   |    ' + PadR('Sleeps: ' + SleepAtTime + ' for ' + ToStr(SleepForHours) + 'h', 39) + '|   | ')
+  else
+    Writeln(' |   |    ' + PadR('Sleeps: Disabled', 39) + '|   | ');
+  if ShutdownTime > 0 then
+    Writeln(' |   |    ' + PadR('Shutdown: ' + ToStr(Round(ShutdownTime / ONE_MINUTE)) + ' minutes', 39) + '|   | ')
+  else
+    Writeln(' |   |    ' + PadR('Shutdown: Disabled', 39) + '|   | ');
+  Writeln(' |   |                                           |   | ');
+  Writeln(' |___|~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~|___| ');
+  Writeln('');
+
+  SettingsHandler.CheckGPUPlugin();
+
+  if not RSClient.IsLoggedIn() then
+    Login.LoginPlayer();
+
+  if WaitUntil(RSClient.IsLoggedIn(), 250, 12 * ONE_SECOND) then
+    StartXP := XPBar.Read();
+
+  if StartXP < 1024 then
+    TerminateScript('Failed to read XP, make sure XPBar is set up correctly');
+
+  if not InRange(Options.GetZoomLevel(), 8, 14) then
+    Options.SetZoomLevel(Random(8, 14));
+
+  if not Combat.GetAutoRetaliate() then
+    Combat.SetAutoRetaliate(True);
+
+  Mouse.Speed := SRL.NormalRange(14, 24);
+
+  // Initialize break and sleep tracking variables
+  TotalBreakTime := 0;
+  LastBreakStartTime := 0;
+  LastBreakEndTime := 0;
+  CombatXPType := ECombatXPType.XP_UNKNOWN;
+  TotalSleepTime := 0;
+  LastSleepStartTime := 0;
+  LastSleepEndTime := 0;
+
+  SetupAntiban();
+  WL.Activity.Init(5 * ONE_MINUTE);
+
+  WriteLog(ToStr('Food: ', Food, ' | Use Food: ', UseFood));
+  if UsePotions then
+    WriteLog(ToStr('Potion: ', Potion, ' | Amount: ', PotionAmount));
+
+  WL.Activity.Restart();
+  PotionTimer.Start();
+  ReportTimer.Start();
+
+  if UseDiscord then
+  begin
+    DiscordReportTimer.Setup(ONE_HOUR);
+    DiscordReportTimer.Restart();
+    AddOnTerminate(@_OnTerminateDiscord);
+  end;
+end;
+
+(**
+ * SaveConfig
+ *
+ * Persists the current GUI settings to the JSON config file.
+ *)
+procedure SaveConfig();
+begin
+  if not Config.IsSetup then
+    Config.Setup('orka-giant-spiders');
+
+  Config.Put('food_index', GUI.combo_Food.GetItemIndex());
+  Config.Put('potion_index', GUI.combo_Potion.GetItemIndex());
+  Config.Put('potion_amount', PotionAmount);
+  Config.Put('break_after', BreakAfter);
+  Config.Put('break_for', BreakFor);
+  Config.Put('shutdown_after', Round(ShutdownTime / ONE_MINUTE));
+  Config.Put('take_breaks', TakeBreaks);
+  Config.Put('take_sleeps', TakeSleeps);
+  Config.Put('sleep_at_time', SleepAtTime);
+  Config.Put('sleep_for_hours', SleepForHours);
+  Config.Put('discord_enabled', GUI.DiscordEnabledCheckbox.IsChecked());
+  Config.Put('discord_anonymous', GUI.DiscordAnonymousCheckbox.IsChecked());
+  Config.Put('discord_webhook', GUI.DiscordWebhookEdit.GetText());
+  WriteLog('Config saved');
+end;
+
+(**
+ * LoadConfig
+ *
+ * Loads saved settings from the JSON config file into the GUI controls.
+ *)
+procedure LoadConfig();
+begin
+  if not Config.IsSetup then
+    Config.Setup('orka-giant-spiders');
+
+  if Config.Has('food_index') then
+    GUI.combo_Food.SetItemIndex(Config.GetInt('food_index'));
+
+  if Config.Has('potion_index') then
+    GUI.combo_Potion.SetItemIndex(Config.GetInt('potion_index'));
+
+  if Config.Has('potion_amount') then
+    GUI.edit_PotionAmount.SetText(ToStr(Config.GetInt('potion_amount')));
+
+  if Config.Has('break_after') then
+    GUI.edit_BreakAfter.SetText(ToStr(Config.GetInt('break_after')));
+
+  if Config.Has('break_for') then
+    GUI.edit_BreakFor.SetText(ToStr(Config.GetInt('break_for')));
+
+  if Config.Has('shutdown_after') then
+    GUI.edit_ShutdownAfter.SetText(ToStr(Config.GetInt('shutdown_after')));
+
+  if Config.Has('take_breaks') then
+    GUI.cb_TakeBreaks.SetChecked(Config.GetBoolean('take_breaks'));
+
+  if Config.Has('take_sleeps') then
+    GUI.cb_TakeSleeps.SetChecked(Config.GetBoolean('take_sleeps'));
+
+  if Config.Has('sleep_at_time') then
+    GUI.edit_SleepAtTime.SetText(Config.GetString('sleep_at_time'));
+
+  if Config.Has('sleep_for_hours') then
+    GUI.edit_SleepForHours.SetText(ToStr(Config.GetInt('sleep_for_hours')));
+
+  if Config.Has('discord_enabled') then
+    GUI.DiscordEnabledCheckbox.SetChecked(Config.GetBoolean('discord_enabled'));
+  if Config.Has('discord_anonymous') then
+    GUI.DiscordAnonymousCheckbox.SetChecked(Config.GetBoolean('discord_anonymous'));
+  if Config.Has('discord_webhook') then
+    GUI.DiscordWebhookEdit.SetText(Config.GetString('discord_webhook'));
+
+  WriteLog('Config loaded');
+end;
+
+(**
+  @description Opens the Discord webhook setup guide in the user's browser.
+*)
+procedure TGUI.OpenWebhookHelp(sender: TObject);
+begin
+  sender;
+  OpenWebPage('https://support.discord.com/hc/en-us/articles/228383668-Intro-to-Webhooks');
+end;
+
+(**
+  @description Tests the Discord webhook by sending a test message.
+*)
+procedure TGUI.TestDiscordWebhook(sender: TObject);
+var
+  testClient: TDiscordClient;
+begin
+  sender;
+  testClient.Setup();
+  if testClient.SetWebhook(Self.DiscordWebhookEdit.GetText()) then
+  begin
+    testClient.SetUsername(SCRIPT_NAME);
+    testClient.SetAvatar('https://raw.githubusercontent.com/orkabyte/orka-scripts/refs/heads/main/orka-giant-spiders/orga-giant-spiders-disc-notification.jpeg');
+    testClient.Webhook.Content := 'Webhook test successful!';
+    if testClient.Send() then
+      Self.DiscordTestButton.SetCaption('Success!')
+    else
+      Self.DiscordTestButton.SetCaption('Send Failed');
+  end
+  else
+    Self.DiscordTestButton.SetCaption('Invalid URL');
+  testClient.Free();
+end;
+
+(**
+ * TGUI.StartScript
+ *
+ * Reads all GUI inputs, determines potion/food usage, configures remote input,
+ * saves config, and starts the script.
+ *
+ * @param Sender  The UI element that triggered the event
+ *)
+procedure TGUI.StartScript(Sender: TObject); override;
+var
+  ShutdownMinutes: Int32;
+begin
+  Food := Self.combo_Food.GetText();
+  Potion := Self.combo_Potion.GetText();
+
+  BreakAfter := Self.edit_BreakAfter.GetText().ExtractInteger();
+  BreakFor := Self.edit_BreakFor.GetText().ExtractInteger();
+  PotionAmount := Self.edit_PotionAmount.GetText().ExtractInteger();
+  ShutdownMinutes := Self.edit_ShutdownAfter.GetText().ExtractInteger();
+
+  TakeBreaks := Self.cb_TakeBreaks.IsChecked();
+  TakeSleeps := Self.cb_TakeSleeps.IsChecked();
+  SleepAtTime := Self.edit_SleepAtTime.GetText();
+  SleepForHours := Self.edit_SleepForHours.GetText().ExtractInteger();
+
+  if ShutdownMinutes > 0 then
+    ShutdownTime := ShutdownMinutes * ONE_MINUTE
+  else
+    ShutdownTime := 0;
+
+  // Determine potion/food usage
+  UsePotions := (Potion <> 'None') and (PotionAmount > 0);
+  UseFood := (not UsePotions) or (PotionAmount < 28);
+
+  UseDiscord := Self.DiscordEnabledCheckbox.IsChecked();
+  AnonymousScreenshots := Self.DiscordAnonymousCheckbox.IsChecked();
+  if UseDiscord then
+  begin
+    Discord.Setup();
+    Discord.SetWebhook(Self.DiscordWebhookEdit.GetText());
+    Discord.SetUsername(SCRIPT_NAME);
+    Discord.SetAvatar('https://raw.githubusercontent.com/orkabyte/orka-scripts/refs/heads/main/orka-giant-spiders/orga-giant-spiders-disc-notification.jpeg');
+  end;
+
+  WLSettings.RemoteInput.BlockInput := True;
+  RSClient.RemoteInput.DisableRealInput();
+
+  SaveConfig();
+  inherited;
+end;
+
+(**
+ * TGUI.Run
+ *
+ * Builds and displays the script GUI with combat settings, automation settings,
+ * and account manager tabs.
+ *)
+(**
+ * SetChildsBoldFont
+ *
+ * Recursively applies bold black font styling to a control and all its children.
+ * Safe for Account Manager — input fields stay readable (black text on white bg).
+ *
+ * @param ctrl  The control to style
+ *)
+procedure SetChildsBoldFont(ctrl: TControl);
+var
+  i: Int32;
+  child: TControl;
+begin
+  for i := 0 to ctrl.getComponentCount() - 1 do
+  begin
+    child := ctrl.GetComponent(i);
+    SetChildsBoldFont(child);
+  end;
+
+  ctrl.GetFont().SetColor(clBlack);
+  ctrl.GetFont().SetStyle([fsBold]);
+end;
+
+procedure TGUI.Run(); override;
+var
+  Tab, AccountTab: TTabSheet;
+  AccountPanel: TPanel;
+  Font: TFont;
+  Img: TPicture;
+  BGImg: TImage;
+  col1, col2, currentTop, spacing: Int32;
+  amSelectorPanel, amUserPanel, amPassPanel, amPinPanel, amWorldsPanel: TPanel;
+  amAddBtn, amSaveBtn, amDeleteBtn: TButton;
+  amLabel: TControl;
+  discordTab: TTabSheet;
+  helpBtn: TButton;
+begin
+  Self.Setup('Orka Giant Spiders', [880, 530]);
+  Self.Start.SetOnClick(@Self.StartScript);
+
+  Font.Init();
+  Font.setName('Verdana');
+  Font.SetQuality(fqCleartype);
+  Self.Form.setFont(Font);
+  Self.PageControl.SetFont(Font);
+  Font.Free();
+
+  // Download background image if not cached
+  if not FileExists(AppPath + 'Resources\OrkaGiantSpidersBG.jpeg') then
+    DownloadToFile('https://raw.githubusercontent.com/orkabyte/orka-scripts/refs/heads/main/orka-giant-spiders/orka-giant-spiders-bg.jpeg', AppPath + 'Resources\OrkaGiantSpidersBG.jpeg');
+
+  // Setup background image on PageControl
+  if FileExists(AppPath + 'Resources\OrkaGiantSpidersBG.jpeg') then
+  begin
+    Img.Init();
+    Img.LoadFromFile(AppPath + 'Resources\OrkaGiantSpidersBG.jpeg');
+    with BGImg do
+    begin
+      Init(Self.PageControl);
+      SetParent(Self.PageControl);
+      SetPicture(Img);
+      SetAlign(alClient);
+      SetStretch(True);
+    end;
+  end;
+
+  // =========================================================================
+  // Tab 1: Script Settings
+  // =========================================================================
+  Self.AddTab('Script Settings');
+  Tab := Self.Tabs[High(Self.Tabs)];
+
+  col1 := TControl.AdjustToDPI(50);
+  spacing := TControl.AdjustToDPI(10);
+  currentTop := TControl.AdjustToDPI(30);
+
+  // --- Food ---
+  with Self.combo_Food do
+  begin
+    Create(Tab);
+    SetCaption('Food:');
+    SetLeft(col1);
+    SetTop(currentTop);
+    SetWidth(TControl.AdjustToDPI(180));
+    SetStyle(csDropDownList);
+    AddItemArray(['Swordfish', 'Lobster', 'Tuna', 'Salmon', 'Pike', 'Trout']);
+    SetItemIndex(0);
+    SetFontColor($1A2A31);
+    Caption.GetFont().SetColor(clWhite);
+    Caption.GetFont().SetStyle([fsBold]);
+  end;
+
+  currentTop := Self.combo_Food.GetTop() + Self.combo_Food.GetHeight() + spacing;
+
+  // --- Potion + Qty ---
+  with Self.combo_Potion do
+  begin
+    Create(Tab);
+    SetCaption('Potion:');
+    SetLeft(col1);
+    SetTop(currentTop);
+    SetWidth(TControl.AdjustToDPI(125));
+    SetStyle(csDropDownList);
+    AddItemArray(['None', 'Strength potion']);
+    SetItemIndex(1);
+    SetFontColor($1A2A31);
+    Caption.GetFont().SetColor(clWhite);
+    Caption.GetFont().SetStyle([fsBold]);
+  end;
+
+  with Self.edit_PotionAmount do
+  begin
+    Create(Tab);
+    SetCaption('Qty:');
+    SetLeft(col1 + TControl.AdjustToDPI(135));
+    SetTop(currentTop);
+    SetWidth(TControl.AdjustToDPI(45));
+    SetHeight(TControl.AdjustToDPI(36));
+    SetText('4');
+    SetFontColor($1A2A31);
+    Caption.GetFont().SetColor(clWhite);
+    Caption.GetFont().SetStyle([fsBold]);
+    SetHint('Number of potions to withdraw.');
+  end;
+
+  // --- Breaks & Sleeps (below food/potion) ---
+  currentTop := Self.edit_PotionAmount.GetTop() + Self.edit_PotionAmount.GetHeight() + TControl.AdjustToDPI(35);
+  col2 := TControl.AdjustToDPI(260);
+
+  // Breaks (left column)
+  with Self.cb_TakeBreaks do
+  begin
+    Create(Tab);
+    SetCaption('Take breaks');
+    SetLeft(col1);
+    SetTop(currentTop);
+    SetWidth(TControl.AdjustToDPI(200));
+    SetChecked(True);
+    SetFontColor($1A2A31);
+    Caption.GetFont().SetColor(clWhite);
+    Caption.GetFont().SetStyle([fsBold]);
+  end;
+
+  currentTop := Self.cb_TakeBreaks.GetTop() + Self.cb_TakeBreaks.GetHeight() + spacing;
+
+  with Self.edit_BreakAfter do
+  begin
+    Create(Tab);
+    SetCaption('Break after (min):');
+    SetLeft(col1);
+    SetTop(currentTop);
+    SetWidth(TControl.AdjustToDPI(180));
+    SetHeight(TControl.AdjustToDPI(36));
+    SetText('60');
+    SetFontColor($1A2A31);
+    Caption.GetFont().SetColor(clWhite);
+    Caption.GetFont().SetStyle([fsBold]);
+  end;
+
+  currentTop := Self.edit_BreakAfter.GetTop() + Self.edit_BreakAfter.GetHeight() + spacing;
+
+  with Self.edit_BreakFor do
+  begin
+    Create(Tab);
+    SetCaption('Break for (min):');
+    SetLeft(col1);
+    SetTop(currentTop);
+    SetWidth(TControl.AdjustToDPI(180));
+    SetHeight(TControl.AdjustToDPI(36));
+    SetText('20');
+    SetFontColor($1A2A31);
+    Caption.GetFont().SetColor(clWhite);
+    Caption.GetFont().SetStyle([fsBold]);
+  end;
+
+  // Sleeps (right column, aligned with breaks)
+  currentTop := Self.cb_TakeBreaks.GetTop();
+
+  with Self.cb_TakeSleeps do
+  begin
+    Create(Tab);
+    SetCaption('Take sleeps');
+    SetLeft(col2);
+    SetTop(currentTop);
+    SetWidth(TControl.AdjustToDPI(200));
+    SetChecked(False);
+    SetFontColor($1A2A31);
+    Caption.GetFont().SetColor(clWhite);
+    Caption.GetFont().SetStyle([fsBold]);
+  end;
+
+  currentTop := Self.cb_TakeSleeps.GetTop() + Self.cb_TakeSleeps.GetHeight() + spacing;
+
+  with Self.edit_SleepAtTime do
+  begin
+    Create(Tab);
+    SetCaption('Sleep at (HH:MM:SS):');
+    SetLeft(col2);
+    SetTop(currentTop);
+    SetWidth(TControl.AdjustToDPI(180));
+    SetHeight(TControl.AdjustToDPI(36));
+    SetText('18:00:00');
+    SetFontColor($1A2A31);
+    Caption.GetFont().SetColor(clWhite);
+    Caption.GetFont().SetStyle([fsBold]);
+  end;
+
+  currentTop := Self.edit_SleepAtTime.GetTop() + Self.edit_SleepAtTime.GetHeight() + spacing;
+
+  with Self.edit_SleepForHours do
+  begin
+    Create(Tab);
+    SetCaption('Sleep for (hours):');
+    SetLeft(col2);
+    SetTop(currentTop);
+    SetWidth(TControl.AdjustToDPI(180));
+    SetHeight(TControl.AdjustToDPI(36));
+    SetText('8');
+    SetFontColor($1A2A31);
+    Caption.GetFont().SetColor(clWhite);
+    Caption.GetFont().SetStyle([fsBold]);
+  end;
+
+  currentTop := Self.edit_SleepForHours.GetTop() + Self.edit_SleepForHours.GetHeight() + spacing;
+
+  with Self.edit_ShutdownAfter do
+  begin
+    Create(Tab);
+    SetCaption('Shutdown (min):');
+    SetLeft(col2);
+    SetTop(currentTop);
+    SetWidth(TControl.AdjustToDPI(180));
+    SetHeight(TControl.AdjustToDPI(36));
+    SetText('0');
+    SetFontColor($1A2A31);
+    Caption.GetFont().SetColor(clWhite);
+    Caption.GetFont().SetStyle([fsBold]);
+    SetHint('Minutes until script shuts down. 0 = disabled');
+  end;
+
+  // --- Start button (bottom-right) ---
+  Self.Start.setVisible(False);
+  with Self.Start do
+  begin
+    SetAlign(alNone);
+    SetBounds(
+      Self.Form.GetWidth() - TControl.AdjustToDPI(220),
+      Self.Form.GetHeight() - TControl.AdjustToDPI(80),
+      TControl.AdjustToDPI(190),
+      TControl.AdjustToDPI(60)
+    );
+    SetCaption('Start');
+    GetFont().SetName('Verdana');
+    GetFont().SetSize(15);
+    setVisible(True);
+  end;
+
+  // =========================================================================
+  // Tab 2: Account Manager
+  // =========================================================================
+  Self.AddTab('Account Manager');
+  AccountTab := Self.Tabs[High(Self.Tabs)];
+  AccountPanel := Self.CreateAccountManager(AccountTab);
+
+  // Apply bold styling (bold + black = input fields stay readable)
+  SetChildsBoldFont(AccountPanel);
+  AccountPanel.SetTop(TControl.AdjustToDPI(30));
+
+  // Reposition Account Manager fields to left side
+  amSelectorPanel := Self.Form.GetChild('am_selector_panel');
+  if amSelectorPanel <> nil then
+  begin
+    amSelectorPanel.SetLeft(TControl.AdjustToDPI(50));
+    amSelectorPanel.SetWidth(TControl.AdjustToDPI(200));
+  end;
+
+  amUserPanel := Self.Form.GetChild('am_user_panel');
+  if amUserPanel <> nil then
+  begin
+    amUserPanel.SetLeft(TControl.AdjustToDPI(50));
+    amUserPanel.SetWidth(TControl.AdjustToDPI(200));
+    amUserPanel.SetHeight(TControl.AdjustToDPI(36));
+  end;
+
+  amPassPanel := Self.Form.GetChild('am_pass_panel');
+  if amPassPanel <> nil then
+  begin
+    amPassPanel.SetLeft(TControl.AdjustToDPI(50));
+    amPassPanel.SetWidth(TControl.AdjustToDPI(120));
+    amPassPanel.SetHeight(TControl.AdjustToDPI(36));
+  end;
+
+  amPinPanel := Self.Form.GetChild('am_pin_panel');
+  if amPinPanel <> nil then
+  begin
+    amPinPanel.SetLeft(TControl.AdjustToDPI(180));
+    amPinPanel.SetWidth(TControl.AdjustToDPI(70));
+    amPinPanel.SetHeight(TControl.AdjustToDPI(36));
+  end;
+
+  amWorldsPanel := Self.Form.GetChild('am_worlds_panel');
+  if amWorldsPanel <> nil then
+  begin
+    amWorldsPanel.SetLeft(TControl.AdjustToDPI(270));
+    amWorldsPanel.SetWidth(TControl.AdjustToDPI(260));
+    amWorldsPanel.SetHeight(TControl.AdjustToDPI(120));
+  end;
+
+  // Reposition buttons
+  amAddBtn := Self.Form.GetChild('am_add_button');
+  if amAddBtn <> nil then
+  begin
+    amAddBtn.SetLeft(TControl.AdjustToDPI(50));
+    amAddBtn.SetTop(TControl.AdjustToDPI(135));
+    amAddBtn.SetWidth(TControl.AdjustToDPI(100));
+  end;
+
+  amSaveBtn := Self.Form.GetChild('am_save_button');
+  if amSaveBtn <> nil then
+  begin
+    amSaveBtn.SetLeft(TControl.AdjustToDPI(160));
+    amSaveBtn.SetTop(TControl.AdjustToDPI(135));
+    amSaveBtn.SetWidth(TControl.AdjustToDPI(115));
+  end;
+
+  amDeleteBtn := Self.Form.GetChild('am_delete_button');
+  if amDeleteBtn <> nil then
+  begin
+    amDeleteBtn.SetLeft(TControl.AdjustToDPI(285));
+    amDeleteBtn.SetTop(TControl.AdjustToDPI(135));
+    amDeleteBtn.SetWidth(TControl.AdjustToDPI(105));
+  end;
+
+  // Set AM labels to white for dark background (label = child index 0)
+  if amSelectorPanel <> nil then
+  begin
+    amLabel := amSelectorPanel.GetComponent(0);
+    amLabel.GetFont().SetColor(clWhite);
+  end;
+  if amUserPanel <> nil then
+  begin
+    amLabel := amUserPanel.GetComponent(0);
+    amLabel.GetFont().SetColor(clWhite);
+  end;
+  if amPassPanel <> nil then
+  begin
+    amLabel := amPassPanel.GetComponent(0);
+    amLabel.GetFont().SetColor(clWhite);
+  end;
+  if amPinPanel <> nil then
+  begin
+    amLabel := amPinPanel.GetComponent(0);
+    amLabel.GetFont().SetColor(clWhite);
+  end;
+  if amWorldsPanel <> nil then
+  begin
+    amLabel := amWorldsPanel.GetComponent(0);
+    amLabel.GetFont().SetColor(clWhite);
+  end;
+
+  // =========================================================================
+  // Tab 3: Discord
+  // =========================================================================
+  Self.AddTab('Discord');
+  discordTab := Self.Tabs[High(Self.Tabs)];
+
+  with Self.DiscordEnabledCheckbox do
+  begin
+    Create(discordTab);
+    SetLeft(TControl.AdjustToDPI(50));
+    SetTop(TControl.AdjustToDPI(30));
+    SetName('discord_enabled');
+    SetCaption('Enable Discord Notifications');
+    SetWidth(TControl.AdjustToDPI(250));
+    SetHint('Sends hourly reports, level-ups, and session summaries to a Discord channel via webhook.' + LineEnding + 'To create one: Server Settings > Integrations > Webhooks > New Webhook > Copy URL.');
+    SetShowHint(True);
+    Caption.GetFont().SetColor(clWhite);
+    Caption.GetFont().SetStyle([fsBold]);
+  end;
+
+  with Self.DiscordAnonymousCheckbox do
+  begin
+    Create(discordTab);
+    SetLeft(Self.DiscordEnabledCheckbox.GetRight() + TControl.AdjustToDPI(10));
+    SetTop(Self.DiscordEnabledCheckbox.GetTop());
+    SetName('discord_anonymous');
+    SetCaption('Anonymous');
+    SetWidth(TControl.AdjustToDPI(120));
+    SetChecked(True);
+    SetHint('Hides your display name and XP bar in screenshots.' + LineEnding + 'Uncheck to include them. Screenshots are only sent to your webhook, never shared elsewhere.');
+    SetShowHint(True);
+    Caption.GetFont().SetColor(clWhite);
+    Caption.GetFont().SetStyle([fsBold]);
+  end;
+
+  with Self.DiscordWebhookEdit do
+  begin
+    Create(discordTab);
+    SetLeft(TControl.AdjustToDPI(50));
+    SetTop(Self.DiscordEnabledCheckbox.GetBottom() + TControl.AdjustToDPI(15));
+    SetName('discord_webhook');
+    SetCaption('Webhook URL:');
+    SetWidth(TControl.AdjustToDPI(400));
+    SetHeight(TControl.AdjustToDPI(36));
+    SetFontColor($1A2A31);
+    Caption.GetFont().SetColor(clWhite);
+    Caption.GetFont().SetStyle([fsBold]);
+  end;
+
+  with Self.DiscordTestButton do
+  begin
+    Init(discordTab);
+    SetParent(discordTab);
+    SetLeft(TControl.AdjustToDPI(50));
+    SetTop(Self.DiscordWebhookEdit.GetBottom() + TControl.AdjustToDPI(15));
+    SetWidth(TControl.AdjustToDPI(140));
+    SetHeight(TControl.AdjustToDPI(30));
+    SetCaption('Test Webhook');
+    SetOnClick(@Self.TestDiscordWebhook);
+  end;
+
+  helpBtn.Init(discordTab);
+  helpBtn.SetParent(discordTab);
+  helpBtn.SetLeft(Self.DiscordTestButton.GetRight() + TControl.AdjustToDPI(10));
+  helpBtn.SetTop(Self.DiscordTestButton.GetTop());
+  helpBtn.SetWidth(TControl.AdjustToDPI(140));
+  helpBtn.SetHeight(TControl.AdjustToDPI(30));
+  helpBtn.SetCaption('How to Set Up');
+  helpBtn.SetOnClick(@Self.OpenWebhookHelp);
+
+  // Load saved config & finalize
+  LoadConfig();
+  Self.PageControl.SetChildsFontColor($1A2A31);
+
+  inherited;
+end;
+
+(**
+ * Loop
+ *
+ * Main loop iteration: checks XP gains, prints periodic reports, handles shutdown,
+ * drops vials, and dispatches to the appropriate state handler.
+ *)
+procedure Loop();
+var
+  State: EState;
+begin
+  if WL.Activity.IsFinished() then
+  begin
+    if RSClient.IsLoggedIn() then Logout.ClickLogout();
+    TerminateScript('No activity detected');
+  end;
+
+  if HasGainedXP() then
+  begin
+    WL.Activity.Restart();
+  end;
+
+  if Chat.LeveledUp() then
+  begin
+    if UseDiscord then
+      SendDiscordReport('Level Up!', $FFA500);
+    Chat.HandleLevelUp();
+    Wait(1000, 3000);
+  end;
+
+  if ReportTimer.ElapsedTime() > REPORT_FREQUENCY then
+  begin
+    Report();
+    ReportTimer.Reset();
+  end;
+
+  if UseDiscord and DiscordReportTimer.IsFinished() then
+  begin
+    SendDiscordReport('Hourly Report', $0000FF);
+    DiscordReportTimer.Restart();
+  end;
+
+  // Check shutdown timer
+  if (ShutdownTime > 0) and (GetTimeRunning() >= ShutdownTime) then
+  begin
+    WriteLog('Shutdown timer reached - preparing to shutdown');
+
+    // If in combat area, exit to initial room first for safety
+    if IsInCombatArea() then
+    begin
+      WriteLog('Player is in combat area - exiting to initial room before shutdown');
+
+      if GetOutOfSpidersArea() then
+      begin
+        WriteLog('Successfully exited to initial room');
+        Wait(1000, 2000);
+      end else
+      begin
+        WriteLog('Warning: Failed to exit combat area, continuing with shutdown');
+      end;
+    end else
+      WriteLog('Player not in combat area, shutting down from current location');
+
+    // Log out the player before shutting down
+    if RSClient.IsLoggedIn() then
+    begin
+      WriteLog('Logging out player before shutdown');
+
+      if Logout.ClickLogout() then
+      begin
+        WriteLog('Player successfully logged out');
+        Wait(1000, 2000);
+      end else
+        WriteLog('Warning: Failed to logout player');
+    end else
+      WriteLog('Player already logged out');
+
+    TerminateScript('Shutdown timer reached');
+  end;
+
+  // Drop empty vials periodically in combat area
+  if IsInCombatArea() and SRL.Dice(5) then
+    DropEmptyVials();
+
+  State := GetState();
+
+  if State <> EState.FIGHTING then
+    WriteLog(ToStr(State));
+
+  case State of
+    CLOSE_INTERFACE: RSInterface.Close(50);
+    HANDLE_LOGIN:
+    begin
+      Login.LoginPlayer();
+      Wait(2000, 3000);
+      WL.Activity.Restart();
+    end;
+    RESTOCK: RestockSupplies();
+    NAVIGATE_TO_COMBAT: NavigateToCombat();
+    RESET_AGGRO: ResetSpiderAggression();
+    BOOST: DrinkPotion();
+    HEAL: EatFood();
+    DO_ANTIBAN: Antiban.DoAntiban(False, False);
+    FIGHTING: Wait(1000);
+  end;
+
+  WaitEx(75, 70);
+end;
+
+begin
+  // Display and process GUI
+  {$IFDEF SCRIPT_GUI}
+  GUI.Run();
+  {$ENDIF}
+
+  // Setup map, objects, and walker
+  SetupMapAndWalker();
+  SetupObjects();
+
+  // Initialize script
+  Init();
+
+  // Perform initial setup based on starting location
+  InitialSetup();
+
+  // Main loop
+  repeat
+    Loop();
+  until False;
+end.
