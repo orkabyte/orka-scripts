@@ -17,11 +17,11 @@
  *
  * ============================================================================
  *)
-{$DEFINE SCRIPT_REVISION := '2'}
+{$DEFINE SCRIPT_REVISION := '3'}
 {$DEFINE SCRIPT_GUI}
 program OrkaAmmoniteCrabs;
-{$I SRL-T/osr.simba}
-{$I WaspLib/osr.simba}
+{$I SRL-T/main.simba}
+{$I WaspLib/main.simba}
 {$I WaspLib/optional/handlers/birdhouserunner.simba}
 
 // =============================================================================
@@ -69,7 +69,7 @@ const
 // Type Definitions
 // =============================================================================
 type
-  EBankLocation = (
+  EScriptBankLocation = (
     BANK_FOSSIL_ISLAND,
     BANK_CRAFTING_GUILD
   );
@@ -101,8 +101,8 @@ type
   );
 
   TAmmoniteObjects = record
-    BankChest: TRSObjectV2;
-    CraftingGuildBank: TRSObjectV2;
+    BankChest: TGameObjectV2;
+    CraftingGuildBank: TGameObjectV2;
     ResetAreaNorth, ResetAreaSouth: TBox;
     CombatTile: TPoint;
   end;
@@ -150,8 +150,8 @@ var
   Config: TConfigJSON;
 
   // Configuration from GUI
-  BankLocation: EBankLocation;
-  Food, Potion: TRSItem;
+  BankLocation: EScriptBankLocation;
+  Food, Potion: TItem;
   PotionAmount, FoodAmount: Int32;
   UseFood, UsePotions, UseSpecs: Boolean;
   PickupFossils, PickupClues, DoBHRuns: Boolean;
@@ -271,7 +271,7 @@ procedure SetupMapAndWalker();
 begin
   WriteDebug('Setting up map and walker...');
 
-  if BankLocation = EBankLocation.BANK_CRAFTING_GUILD then
+  if BankLocation = EScriptBankLocation.BANK_CRAFTING_GUILD then
   begin
     Map.SetupChunks([
       Chunk([56,61,60,57], 0),  // Fossil Island
@@ -297,7 +297,7 @@ end;
 procedure SetupObjects();
 begin
   WriteDebug('Setting up objects...');
-  RSObjects.Setup();
+  GameObjects.Setup();
 
   // Fossil Island bank setup
   with AmmoniteObjects.BankChest do
@@ -395,7 +395,7 @@ var
   pos: TPoint;
 begin
   pos := Map.Position();
-  if BankLocation = EBankLocation.BANK_CRAFTING_GUILD then
+  if BankLocation = EScriptBankLocation.BANK_CRAFTING_GUILD then
     Result := CRAFTING_GUILD_BOX.Contains(pos) or (pos.DistanceTo([10872, 35210]) < 40)
   else
     Result := pos.DistanceTo([10872, 35210]) < 40;
@@ -524,8 +524,8 @@ function TeleportToFossilIsland(): Boolean;
 var
   attempts: Int32;
   transporter: TUniversalTransport;
-  pendantNames: TRSItemArray;
-  cachedWalker: PRSWalker;
+  pendantNames: TItemArray;
+  cachedWalker: PWalker;
 begin
   Result := False;
 
@@ -568,7 +568,7 @@ begin
           if MushTree.IsOpen() then
           begin
             WriteDebug('TeleportToFossilIsland | Using mushtree to Mushroom Meadow...');
-            MushTree.ClickButton(ERSMushTreeLocation.MUSHROOM_MEADOW);
+            MushTree.ClickButton(EMushTreeLocation.MUSHROOM_MEADOW);
             Wait(2000, 3000);  // Initial wait for teleport animation
 
             // Restore main walker (V2) to use Map.Position() for verification
@@ -747,8 +747,8 @@ end;
  *)
 procedure RestockSupplies(potionCount, foodCount: Int32);
 var
-  keepItems: TRSItemArray;
-  potionItem, foodItem: TRSBankItem;
+  keepItems: TItemArray;
+  potionItem, foodItem: TBankItem;
   emptySlots: Int32;
   transporter: TUniversalTransport;
 begin
@@ -761,7 +761,7 @@ begin
   WriteDebug('RestockSupplies | Restocking with ' + ToStr(potionCount) + ' potions, ' + ToStr(foodCount) + ' food');
 
   // Deposit everything except teleport items and BH materials based on bank location
-  if BankLocation = EBankLocation.BANK_CRAFTING_GUILD then
+  if BankLocation = EScriptBankLocation.BANK_CRAFTING_GUILD then
   begin
     keepItems := ['Crafting cape', 'Crafting cape(t)'];
     keepItems += getChargedJewelleryNames('Digsite Pendant');
@@ -784,7 +784,7 @@ begin
 
   // Ensure digsite pendant is in inventory when using Crafting Guild bank
   // Uses transport system to withdraw lowest charge pendant first (1→2→3→4→5)
-  if BankLocation = EBankLocation.BANK_CRAFTING_GUILD then
+  if BankLocation = EScriptBankLocation.BANK_CRAFTING_GUILD then
   begin
     if not Inventory.ContainsAny(getChargedJewelleryNames('Digsite Pendant')) then
     begin
@@ -799,7 +799,7 @@ begin
   // Withdraw potions first (if enabled and amount > 0)
   if UsePotions and (potionCount > 0) and (Length(String(Potion)) > 0) then
   begin
-    potionItem := TRSBankItem.Setup(Potion + '(4)', potionCount, False);
+    potionItem := TBankItem.Setup(Potion + '(4)', potionCount, False);
     if Bank.WithdrawItem(potionItem, False) then
       WriteDebug('RestockSupplies | Withdrew ' + ToStr(potionCount) + ' potions')
     else
@@ -824,7 +824,7 @@ begin
 
     if emptySlots > 0 then
     begin
-      foodItem := TRSBankItem.Setup(Food, emptySlots, False);
+      foodItem := TBankItem.Setup(Food, emptySlots, False);
       if Bank.WithdrawItem(foodItem, False) then
         WriteDebug('RestockSupplies | Withdrew ' + ToStr(emptySlots) + ' food')
       else
@@ -1065,7 +1065,7 @@ end;
  *)
 function WithdrawBHMaterials(): Boolean;
 var
-  item: TRSBankItem;
+  item: TBankItem;
   logName: String;
   logsNeeded: Int32;
 begin
@@ -1084,7 +1084,7 @@ begin
     WriteDebug('WithdrawBHMaterials | Chisel already in inventory')
   else
   begin
-    item := TRSBankItem.Setup('Chisel', 1, False);
+    item := TBankItem.Setup('Chisel', 1, False);
     if not Bank.WithdrawItem(item, False) then
     begin
       WriteDebug('WithdrawBHMaterials | Failed to withdraw chisel');
@@ -1103,7 +1103,7 @@ begin
     WriteDebug('WithdrawBHMaterials | Hammer already in inventory')
   else
   begin
-    item := TRSBankItem.Setup('Hammer', 1, False);
+    item := TBankItem.Setup('Hammer', 1, False);
     if not Bank.WithdrawItem(item, False) then
     begin
       WriteDebug('WithdrawBHMaterials | Failed to withdraw hammer');
@@ -1123,7 +1123,7 @@ begin
     WriteDebug('WithdrawBHMaterials | Already have 4+ ' + logName)
   else
   begin
-    item := TRSBankItem.Setup(logName, logsNeeded, False);
+    item := TBankItem.Setup(logName, logsNeeded, False);
     if not Bank.WithdrawItem(item, False) then
     begin
       WriteDebug('WithdrawBHMaterials | Failed to withdraw logs: ' + logName);
@@ -1142,7 +1142,7 @@ begin
     WriteDebug('WithdrawBHMaterials | Already have 40+ seeds')
   else
   begin
-    item := TRSBankItem.Setup(BirdHouseRunner.Seed, 40, False);
+    item := TBankItem.Setup(BirdHouseRunner.Seed, 40, False);
     if not Bank.WithdrawItem(item, False) then
     begin
       WriteDebug('WithdrawBHMaterials | Failed to withdraw seeds: ' + String(BirdHouseRunner.Seed));
@@ -1163,7 +1163,7 @@ begin
       WriteDebug('WithdrawBHMaterials | Clockwork already in inventory')
     else
     begin
-      item := TRSBankItem.Setup('Clockwork', 1, False);
+      item := TBankItem.Setup('Clockwork', 1, False);
       if not Bank.WithdrawItem(item, False) then
       begin
         WriteDebug('WithdrawBHMaterials | Failed to withdraw clockwork');
@@ -1363,7 +1363,7 @@ begin
     found := False;
     if Inventory.IsFull() then Break;
 
-    dots := Minimap.GetDots(ERSMinimapDot.ITEM);
+    dots := Minimap.GetDots(EMinimapDot.ITEM);
     if Length(dots) = 0 then Break;
 
     dots.Sort(Minimap.Center);
@@ -1561,7 +1561,7 @@ end;
 procedure TBirdHouseInclude.OnComplete(); override;
 var
   i: Int32;
-  item: TRSBankItem;
+  item: TBankItem;
   transporter: TUniversalTransport;
 begin
   WriteDebug('BirdHouseRunner.OnComplete | Finishing birdhouse run...');
@@ -1603,7 +1603,7 @@ begin
 
     if UsePotions and (PotionAmount > 0) and (not PotionDepleted) then
     begin
-      item := TRSBankItem.Setup(Potion + '(4)', PotionAmount, False);
+      item := TBankItem.Setup(Potion + '(4)', PotionAmount, False);
       if not Bank.WithdrawItem(item, False) then
       begin
         WriteDebug('BirdHouseRunner.OnComplete | Potion bank supply depleted');
@@ -1614,7 +1614,7 @@ begin
 
     if UseFood and (FoodAmount > 0) and (not FoodDepleted) then
     begin
-      item := TRSBankItem.Setup(Food, FoodAmount, False);
+      item := TBankItem.Setup(Food, FoodAmount, False);
       if not Bank.WithdrawItem(item, False) then
       begin
         WriteDebug('BirdHouseRunner.OnComplete | Food bank supply depleted');
@@ -1673,10 +1673,10 @@ end;
 procedure DoManualBirdHouseRun();
 var
   i, attempts, retryAttempt: Int32;
-  cachedWalker: PRSWalker;
-  item: TRSBankItem;
+  cachedWalker: PWalker;
+  item: TBankItem;
   needsBank: Boolean;
-  keepItems: TRSItemArray;
+  keepItems: TItemArray;
   logName: String;
 begin
   WriteDebug('DoManualBirdHouseRun | Starting manual birdhouse run...');
@@ -1786,7 +1786,7 @@ begin
         WriteDebug('DoManualBirdHouseRun | Clicking Verdant Valley button (attempt ' + ToStr(attempts) + ')...');
 
         // Click VERDANT_VALLEY button directly (not using GetMushButton circular route)
-        if MushTree.ClickButton(ERSMushTreeLocation.VERDANT_VALLEY) then
+        if MushTree.ClickButton(EMushTreeLocation.VERDANT_VALLEY) then
         begin
           // Wait for teleport - verify we're near Verdant Valley at [9426, 1272]
           if WaitUntil(BirdHouseRunner.RSW.GetMyPos().InRange([9426, 1272], 60), 300, 6000) then
@@ -1830,7 +1830,7 @@ begin
   while not BirdHouseRunner.HasRunFinished do
   begin
     WL.Activity.Restart();
-    if not RSClient.IsLoggedIn() then
+    if not GameClient.IsLoggedIn() then
     begin
       if not Login.LoginPlayer() then
       begin
@@ -1901,7 +1901,7 @@ begin
     // Withdraw potions
     if UsePotions and (PotionAmount > 0) and (not PotionDepleted) then
     begin
-      item := TRSBankItem.Setup(Potion + '(4)', PotionAmount, False);
+      item := TBankItem.Setup(Potion + '(4)', PotionAmount, False);
       if not Bank.WithdrawItem(item, False) then
       begin
         WriteDebug('DoManualBirdHouseRun | Potion bank supply depleted');
@@ -1913,7 +1913,7 @@ begin
     // Withdraw food
     if UseFood and (FoodAmount > 0) and (not FoodDepleted) then
     begin
-      item := TRSBankItem.Setup(Food, FoodAmount, False);
+      item := TBankItem.Setup(Food, FoodAmount, False);
       if not Bank.WithdrawItem(item, False) then
       begin
         WriteDebug('DoManualBirdHouseRun | Food bank supply depleted');
@@ -1956,27 +1956,27 @@ end;
  * Detects the player's current combat style and returns the corresponding
  * skills being trained. Used by the antiban system for skill hover tasks.
  *
- * @return  Array of ERSSkill values matching the active combat style
+ * @return  Array of ESkill values matching the active combat style
  *)
-function GetTrainedSkills(): array of ERSSkill;
+function GetTrainedSkills(): array of ESkill;
 var
   style: String;
-  combatStyle: TRSCombatStyle;
-  combatType: ERSCombatType;
+  combatStyle: TCombatStyle;
+  combatType: ECombatType;
 begin
   style := Combat.GetCombatStyle();
   combatType := combatStyle.GetCombatType();
   WriteDebug('GetTrainedSkills | Detected combat style: ' + style + ' | Combat type: ' + ToStr(combatType));
 
   case combatType of
-    ERSCombatType.MELEE:
+    ECombatType.MELEE:
     begin
       // Attack styles
       if style.ContainsAny(['Stab', 'Lunge', 'Bash', 'Pound', 'Spike', 'Jab', 'Hack', 'Accurate']) then
       begin
         WriteDebug('GetTrainedSkills | Training Attack skill');
         CombatXPType := ECombatXPType.XP_ATTACK;
-        Result := [ERSSkill.ATTACK, ERSSkill.HITPOINTS, ERSSkill.TOTAL];
+        Result := [ESkill.ATTACK, ESkill.HITPOINTS, ESkill.TOTAL];
         Exit;
       end;
 
@@ -1985,7 +1985,7 @@ begin
       begin
         WriteDebug('GetTrainedSkills | Training Strength skill');
         CombatXPType := ECombatXPType.XP_STRENGTH;
-        Result := [ERSSkill.STRENGTH, ERSSkill.HITPOINTS, ERSSkill.TOTAL];
+        Result := [ESkill.STRENGTH, ESkill.HITPOINTS, ESkill.TOTAL];
         Exit;
       end;
 
@@ -1994,7 +1994,7 @@ begin
       begin
         WriteDebug('GetTrainedSkills | Training Defence skill');
         CombatXPType := ECombatXPType.XP_DEFENCE;
-        Result := [ERSSkill.DEFENCE, ERSSkill.HITPOINTS, ERSSkill.TOTAL];
+        Result := [ESkill.DEFENCE, ESkill.HITPOINTS, ESkill.TOTAL];
         Exit;
       end;
 
@@ -2003,33 +2003,33 @@ begin
       begin
         WriteDebug('GetTrainedSkills | Training Controlled (Attack, Strength, Defence)');
         CombatXPType := ECombatXPType.XP_CONTROLLED;
-        Result := [ERSSkill.ATTACK, ERSSkill.STRENGTH, ERSSkill.DEFENCE, ERSSkill.HITPOINTS, ERSSkill.TOTAL];
+        Result := [ESkill.ATTACK, ESkill.STRENGTH, ESkill.DEFENCE, ESkill.HITPOINTS, ESkill.TOTAL];
         Exit;
       end;
     end;
 
-    ERSCombatType.RANGED:
+    ECombatType.RANGED:
     begin
       if style.ContainsAny(['Longrange']) then
       begin
         WriteDebug('GetTrainedSkills | Training Ranged + Defence (Longrange)');
         CombatXPType := ECombatXPType.XP_RANGED_DEF;
-        Result := [ERSSkill.RANGE, ERSSkill.DEFENCE, ERSSkill.HITPOINTS, ERSSkill.TOTAL];
+        Result := [ESkill.RANGE, ESkill.DEFENCE, ESkill.HITPOINTS, ESkill.TOTAL];
         Exit;
       end;
 
       // Accurate or Rapid for ranged
       WriteDebug('GetTrainedSkills | Training Ranged skill');
       CombatXPType := ECombatXPType.XP_RANGED;
-      Result := [ERSSkill.RANGE, ERSSkill.HITPOINTS, ERSSkill.TOTAL];
+      Result := [ESkill.RANGE, ESkill.HITPOINTS, ESkill.TOTAL];
       Exit;
     end;
 
-    ERSCombatType.MAGIC:
+    ECombatType.MAGIC:
     begin
       WriteDebug('GetTrainedSkills | Training Magic skill');
       CombatXPType := ECombatXPType.XP_MAGIC;
-      Result := [ERSSkill.MAGIC, ERSSkill.HITPOINTS, ERSSkill.TOTAL];
+      Result := [ESkill.MAGIC, ESkill.HITPOINTS, ESkill.TOTAL];
       Exit;
     end;
   end;
@@ -2037,8 +2037,8 @@ begin
   // Fallback: all combat skills
   WriteDebug('GetTrainedSkills | Could not detect combat type, defaulting to all combat skills');
   CombatXPType := ECombatXPType.XP_UNKNOWN;
-  Result := [ERSSkill.ATTACK, ERSSkill.STRENGTH, ERSSkill.DEFENCE,
-             ERSSkill.HITPOINTS, ERSSkill.RANGE, ERSSkill.MAGIC, ERSSkill.TOTAL];
+  Result := [ESkill.ATTACK, ESkill.STRENGTH, ESkill.DEFENCE,
+             ESkill.HITPOINTS, ESkill.RANGE, ESkill.MAGIC, ESkill.TOTAL];
 end;
 
 // =============================================================================
@@ -2090,12 +2090,12 @@ begin
   T := Task;
 
   // Log back in if player was logged out during break
-  if not RSClient.IsLoggedIn() then
+  if not GameClient.IsLoggedIn() then
   begin
     WriteDebug('OnBreakEnd | Logging player back in after break');
     Login.LoginPlayer();
 
-    if not WaitUntil(RSClient.IsLoggedIn(), 250, 12000) then
+    if not WaitUntil(GameClient.IsLoggedIn(), 250, 12000) then
       TerminateScript('Failed to log back in after break');
 
     Wait(1000, 2000);
@@ -2131,12 +2131,12 @@ begin
   T := Task;
 
   // Log back in if player was logged out during sleep
-  if not RSClient.IsLoggedIn() then
+  if not GameClient.IsLoggedIn() then
   begin
     WriteDebug('OnSleepEnd | Logging player back in after sleep');
     Login.LoginPlayer();
 
-    if not WaitUntil(RSClient.IsLoggedIn(), 250, 12000) then
+    if not WaitUntil(GameClient.IsLoggedIn(), 250, 12000) then
       TerminateScript('Failed to log back in after sleep');
 
     Wait(1000, 2000);
@@ -2292,7 +2292,7 @@ begin
 
   WriteDebug('DoShutdownIfDue | Shutdown timer reached - logging out and terminating');
 
-  if RSClient.IsLoggedIn() then
+  if GameClient.IsLoggedIn() then
   begin
     if Logout.ClickLogout() then
     begin
@@ -2321,11 +2321,11 @@ begin
   Antiban.DoAntiban(True, False);
 
   // Re-login if logged out during break
-  if not RSClient.IsLoggedIn() then
+  if not GameClient.IsLoggedIn() then
   begin
     WriteDebug('TakeBreakIfDue | Logging back in after break');
     Login.LoginPlayer();
-    if not WaitUntil(RSClient.IsLoggedIn(), 250, 12000) then
+    if not WaitUntil(GameClient.IsLoggedIn(), 250, 12000) then
       TerminateScript('Failed to log back in after break');
     Wait(2000, 3000);
   end;
@@ -2349,11 +2349,11 @@ begin
   Antiban.DoAntiban(True, False);
 
   // Re-login if logged out during sleep
-  if not RSClient.IsLoggedIn() then
+  if not GameClient.IsLoggedIn() then
   begin
     WriteDebug('TakeSleepIfDue | Logging back in after sleep');
     Login.LoginPlayer();
-    if not WaitUntil(RSClient.IsLoggedIn(), 250, 12000) then
+    if not WaitUntil(GameClient.IsLoggedIn(), 250, 12000) then
       TerminateScript('Failed to log back in after sleep');
     Wait(2000, 3000);
   end;
@@ -2374,11 +2374,11 @@ end;
 function GetState(): EState;
 begin
   // Priority 1: Login check
-  if not RSClient.IsLoggedIn() then
+  if not GameClient.IsLoggedIn() then
     Exit(HANDLE_LOGIN);
 
   // Priority 2: Close interfaces
-  if RSInterface.IsOpen() then
+  if GameInterface.IsOpen() then
     Exit(CLOSE_INTERFACE);
 
   // Priority 3: Healing
@@ -2460,20 +2460,20 @@ end;
 (**
  * GetSkillName
  *
- * Converts an ERSSkill enum value to a display-friendly string.
+ * Converts an ESkill enum value to a display-friendly string.
  *
  * @param skill  The skill enum value to convert
  * @return       Human-readable skill name (e.g., "Strength", "Hitpoints")
  *)
-function GetSkillName(skill: ERSSkill): String;
+function GetSkillName(skill: ESkill): String;
 begin
   case skill of
-    ERSSkill.ATTACK: Result := 'Attack';
-    ERSSkill.HITPOINTS: Result := 'Hitpoints';
-    ERSSkill.STRENGTH: Result := 'Strength';
-    ERSSkill.DEFENCE: Result := 'Defence';
-    ERSSkill.RANGE: Result := 'Ranged';
-    ERSSkill.MAGIC: Result := 'Magic';
+    ESkill.ATTACK: Result := 'Attack';
+    ESkill.HITPOINTS: Result := 'Hitpoints';
+    ESkill.STRENGTH: Result := 'Strength';
+    ESkill.DEFENCE: Result := 'Defence';
+    ESkill.RANGE: Result := 'Ranged';
+    ESkill.MAGIC: Result := 'Magic';
     else Result := 'Unknown';
   end;
 end;
@@ -2489,54 +2489,54 @@ end;
  * @param skill         The skill to calculate XP for
  * @return              Estimated XP for the specified skill
  *)
-function CalculateSkillXP(totalXP: Int32; xpType: ECombatXPType; skill: ERSSkill): Int32;
+function CalculateSkillXP(totalXP: Int32; xpType: ECombatXPType; skill: ESkill): Int32;
 begin
   Result := 0;
 
   case xpType of
     ECombatXPType.XP_ATTACK:
     begin
-      if skill = ERSSkill.ATTACK then Result := Round(totalXP * 0.75);
-      if skill = ERSSkill.HITPOINTS then Result := Round(totalXP * 0.25);
+      if skill = ESkill.ATTACK then Result := Round(totalXP * 0.75);
+      if skill = ESkill.HITPOINTS then Result := Round(totalXP * 0.25);
     end;
 
     ECombatXPType.XP_STRENGTH:
     begin
-      if skill = ERSSkill.STRENGTH then Result := Round(totalXP * 0.75);
-      if skill = ERSSkill.HITPOINTS then Result := Round(totalXP * 0.25);
+      if skill = ESkill.STRENGTH then Result := Round(totalXP * 0.75);
+      if skill = ESkill.HITPOINTS then Result := Round(totalXP * 0.25);
     end;
 
     ECombatXPType.XP_DEFENCE:
     begin
-      if skill = ERSSkill.DEFENCE then Result := Round(totalXP * 0.75);
-      if skill = ERSSkill.HITPOINTS then Result := Round(totalXP * 0.25);
+      if skill = ESkill.DEFENCE then Result := Round(totalXP * 0.75);
+      if skill = ESkill.HITPOINTS then Result := Round(totalXP * 0.25);
     end;
 
     ECombatXPType.XP_CONTROLLED:
     begin
-      if skill = ERSSkill.ATTACK then Result := Round(totalXP * 0.25);
-      if skill = ERSSkill.STRENGTH then Result := Round(totalXP * 0.25);
-      if skill = ERSSkill.DEFENCE then Result := Round(totalXP * 0.25);
-      if skill = ERSSkill.HITPOINTS then Result := Round(totalXP * 0.25);
+      if skill = ESkill.ATTACK then Result := Round(totalXP * 0.25);
+      if skill = ESkill.STRENGTH then Result := Round(totalXP * 0.25);
+      if skill = ESkill.DEFENCE then Result := Round(totalXP * 0.25);
+      if skill = ESkill.HITPOINTS then Result := Round(totalXP * 0.25);
     end;
 
     ECombatXPType.XP_RANGED:
     begin
-      if skill = ERSSkill.RANGE then Result := Round(totalXP * 0.75);
-      if skill = ERSSkill.HITPOINTS then Result := Round(totalXP * 0.25);
+      if skill = ESkill.RANGE then Result := Round(totalXP * 0.75);
+      if skill = ESkill.HITPOINTS then Result := Round(totalXP * 0.25);
     end;
 
     ECombatXPType.XP_RANGED_DEF:
     begin
-      if skill = ERSSkill.RANGE then Result := Round(totalXP * 0.50);
-      if skill = ERSSkill.DEFENCE then Result := Round(totalXP * 0.25);
-      if skill = ERSSkill.HITPOINTS then Result := Round(totalXP * 0.25);
+      if skill = ESkill.RANGE then Result := Round(totalXP * 0.50);
+      if skill = ESkill.DEFENCE then Result := Round(totalXP * 0.25);
+      if skill = ESkill.HITPOINTS then Result := Round(totalXP * 0.25);
     end;
 
     ECombatXPType.XP_MAGIC:
     begin
-      if skill = ERSSkill.MAGIC then Result := Round(totalXP * 0.60);
-      if skill = ERSSkill.HITPOINTS then Result := Round(totalXP * 0.40);
+      if skill = ESkill.MAGIC then Result := Round(totalXP * 0.60);
+      if skill = ESkill.HITPOINTS then Result := Round(totalXP * 0.40);
     end;
   end;
 end;
@@ -2607,89 +2607,89 @@ begin
   case CombatXPType of
     ECombatXPType.XP_ATTACK:
     begin
-      skillXP := CalculateSkillXP(GainedXP, CombatXPType, ERSSkill.ATTACK);
+      skillXP := CalculateSkillXP(GainedXP, CombatXPType, ESkill.ATTACK);
       if RunTime > 0 then skillXPPerHour := Round(skillXP / (RunTime / 3600000)) else skillXPPerHour := 0;
       WriteXPRow('Attack', skillXP, skillXPPerHour, colWidth);
 
-      skillXP := CalculateSkillXP(GainedXP, CombatXPType, ERSSkill.HITPOINTS);
+      skillXP := CalculateSkillXP(GainedXP, CombatXPType, ESkill.HITPOINTS);
       if RunTime > 0 then skillXPPerHour := Round(skillXP / (RunTime / 3600000)) else skillXPPerHour := 0;
       WriteXPRow('Hitpoints', skillXP, skillXPPerHour, colWidth);
     end;
 
     ECombatXPType.XP_STRENGTH:
     begin
-      skillXP := CalculateSkillXP(GainedXP, CombatXPType, ERSSkill.STRENGTH);
+      skillXP := CalculateSkillXP(GainedXP, CombatXPType, ESkill.STRENGTH);
       if RunTime > 0 then skillXPPerHour := Round(skillXP / (RunTime / 3600000)) else skillXPPerHour := 0;
       WriteXPRow('Strength', skillXP, skillXPPerHour, colWidth);
 
-      skillXP := CalculateSkillXP(GainedXP, CombatXPType, ERSSkill.HITPOINTS);
+      skillXP := CalculateSkillXP(GainedXP, CombatXPType, ESkill.HITPOINTS);
       if RunTime > 0 then skillXPPerHour := Round(skillXP / (RunTime / 3600000)) else skillXPPerHour := 0;
       WriteXPRow('Hitpoints', skillXP, skillXPPerHour, colWidth);
     end;
 
     ECombatXPType.XP_DEFENCE:
     begin
-      skillXP := CalculateSkillXP(GainedXP, CombatXPType, ERSSkill.DEFENCE);
+      skillXP := CalculateSkillXP(GainedXP, CombatXPType, ESkill.DEFENCE);
       if RunTime > 0 then skillXPPerHour := Round(skillXP / (RunTime / 3600000)) else skillXPPerHour := 0;
       WriteXPRow('Defence', skillXP, skillXPPerHour, colWidth);
 
-      skillXP := CalculateSkillXP(GainedXP, CombatXPType, ERSSkill.HITPOINTS);
+      skillXP := CalculateSkillXP(GainedXP, CombatXPType, ESkill.HITPOINTS);
       if RunTime > 0 then skillXPPerHour := Round(skillXP / (RunTime / 3600000)) else skillXPPerHour := 0;
       WriteXPRow('Hitpoints', skillXP, skillXPPerHour, colWidth);
     end;
 
     ECombatXPType.XP_CONTROLLED:
     begin
-      skillXP := CalculateSkillXP(GainedXP, CombatXPType, ERSSkill.ATTACK);
+      skillXP := CalculateSkillXP(GainedXP, CombatXPType, ESkill.ATTACK);
       if RunTime > 0 then skillXPPerHour := Round(skillXP / (RunTime / 3600000)) else skillXPPerHour := 0;
       WriteXPRow('Attack', skillXP, skillXPPerHour, colWidth);
 
-      skillXP := CalculateSkillXP(GainedXP, CombatXPType, ERSSkill.STRENGTH);
+      skillXP := CalculateSkillXP(GainedXP, CombatXPType, ESkill.STRENGTH);
       if RunTime > 0 then skillXPPerHour := Round(skillXP / (RunTime / 3600000)) else skillXPPerHour := 0;
       WriteXPRow('Strength', skillXP, skillXPPerHour, colWidth);
 
-      skillXP := CalculateSkillXP(GainedXP, CombatXPType, ERSSkill.DEFENCE);
+      skillXP := CalculateSkillXP(GainedXP, CombatXPType, ESkill.DEFENCE);
       if RunTime > 0 then skillXPPerHour := Round(skillXP / (RunTime / 3600000)) else skillXPPerHour := 0;
       WriteXPRow('Defence', skillXP, skillXPPerHour, colWidth);
 
-      skillXP := CalculateSkillXP(GainedXP, CombatXPType, ERSSkill.HITPOINTS);
+      skillXP := CalculateSkillXP(GainedXP, CombatXPType, ESkill.HITPOINTS);
       if RunTime > 0 then skillXPPerHour := Round(skillXP / (RunTime / 3600000)) else skillXPPerHour := 0;
       WriteXPRow('Hitpoints', skillXP, skillXPPerHour, colWidth);
     end;
 
     ECombatXPType.XP_RANGED:
     begin
-      skillXP := CalculateSkillXP(GainedXP, CombatXPType, ERSSkill.RANGE);
+      skillXP := CalculateSkillXP(GainedXP, CombatXPType, ESkill.RANGE);
       if RunTime > 0 then skillXPPerHour := Round(skillXP / (RunTime / 3600000)) else skillXPPerHour := 0;
       WriteXPRow('Ranged', skillXP, skillXPPerHour, colWidth);
 
-      skillXP := CalculateSkillXP(GainedXP, CombatXPType, ERSSkill.HITPOINTS);
+      skillXP := CalculateSkillXP(GainedXP, CombatXPType, ESkill.HITPOINTS);
       if RunTime > 0 then skillXPPerHour := Round(skillXP / (RunTime / 3600000)) else skillXPPerHour := 0;
       WriteXPRow('Hitpoints', skillXP, skillXPPerHour, colWidth);
     end;
 
     ECombatXPType.XP_RANGED_DEF:
     begin
-      skillXP := CalculateSkillXP(GainedXP, CombatXPType, ERSSkill.RANGE);
+      skillXP := CalculateSkillXP(GainedXP, CombatXPType, ESkill.RANGE);
       if RunTime > 0 then skillXPPerHour := Round(skillXP / (RunTime / 3600000)) else skillXPPerHour := 0;
       WriteXPRow('Ranged', skillXP, skillXPPerHour, colWidth);
 
-      skillXP := CalculateSkillXP(GainedXP, CombatXPType, ERSSkill.DEFENCE);
+      skillXP := CalculateSkillXP(GainedXP, CombatXPType, ESkill.DEFENCE);
       if RunTime > 0 then skillXPPerHour := Round(skillXP / (RunTime / 3600000)) else skillXPPerHour := 0;
       WriteXPRow('Defence', skillXP, skillXPPerHour, colWidth);
 
-      skillXP := CalculateSkillXP(GainedXP, CombatXPType, ERSSkill.HITPOINTS);
+      skillXP := CalculateSkillXP(GainedXP, CombatXPType, ESkill.HITPOINTS);
       if RunTime > 0 then skillXPPerHour := Round(skillXP / (RunTime / 3600000)) else skillXPPerHour := 0;
       WriteXPRow('Hitpoints', skillXP, skillXPPerHour, colWidth);
     end;
 
     ECombatXPType.XP_MAGIC:
     begin
-      skillXP := CalculateSkillXP(GainedXP, CombatXPType, ERSSkill.MAGIC);
+      skillXP := CalculateSkillXP(GainedXP, CombatXPType, ESkill.MAGIC);
       if RunTime > 0 then skillXPPerHour := Round(skillXP / (RunTime / 3600000)) else skillXPPerHour := 0;
       WriteXPRow('Magic', skillXP, skillXPPerHour, colWidth);
 
-      skillXP := CalculateSkillXP(GainedXP, CombatXPType, ERSSkill.HITPOINTS);
+      skillXP := CalculateSkillXP(GainedXP, CombatXPType, ESkill.HITPOINTS);
       if RunTime > 0 then skillXPPerHour := Round(skillXP / (RunTime / 3600000)) else skillXPPerHour := 0;
       WriteXPRow('Hitpoints', skillXP, skillXPPerHour, colWidth);
     end;
@@ -2848,7 +2848,7 @@ begin
   if WL.Activity.IsFinished() then
   begin
     WriteDebug('No activity detected - terminating');
-    if RSClient.IsLoggedIn() then
+    if GameClient.IsLoggedIn() then
       Logout.ClickLogout();
     TerminateScript('No activity detected');
   end;
@@ -2875,13 +2875,13 @@ begin
     end;
 
     CLOSE_INTERFACE:
-      RSInterface.Close(50);
+      GameInterface.Close(50);
 
     TELEPORT_TO_BANK:
     begin
       // Restart activity timer — banking round-trip can take over a minute
       WL.Activity.Restart();
-      if BankLocation = EBankLocation.BANK_CRAFTING_GUILD then
+      if BankLocation = EScriptBankLocation.BANK_CRAFTING_GUILD then
         TeleportToCraftingGuild()
       else
         AmmoniteObjects.BankChest.WalkClick();
@@ -2935,7 +2935,7 @@ begin
       if DoBHRuns and BirdHouseRunner.ScriptIntervalTimer.IsFinished() then
       begin
         WriteDebug('RESET_AGGRO | Birdhouse run due - executing before aggro reset');
-        if BankLocation = EBankLocation.BANK_CRAFTING_GUILD then
+        if BankLocation = EScriptBankLocation.BANK_CRAFTING_GUILD then
           BirdHouseRunner.DoBirdHouseRun()
         else
           DoManualBirdHouseRun();
@@ -3082,7 +3082,7 @@ end;
  *)
 function TGUI.GetMaxSupplySlots(): Int32;
 begin
-  if Self.combo_BankLocation.GetItemIndex() = Ord(EBankLocation.BANK_CRAFTING_GUILD) then
+  if Self.combo_BankLocation.GetItemIndex() = Ord(EScriptBankLocation.BANK_CRAFTING_GUILD) then
     Result := 27
   else
     Result := 28;
@@ -3279,7 +3279,7 @@ var
   combobox: TComboBox;
 begin
   combobox := Sender;
-  BirdHouseRunner.LogType := ERSLogType(comboBox.getItemIndex());
+  BirdHouseRunner.LogType := ELogType(comboBox.getItemIndex());
 end;
 
 (**
@@ -3333,7 +3333,7 @@ var
   ShutdownMinutes: Int32;
 begin
   // Bank location
-  BankLocation := EBankLocation(Self.combo_BankLocation.GetItemIndex());
+  BankLocation := EScriptBankLocation(Self.combo_BankLocation.GetItemIndex());
 
   // Potion
   Potion := Self.combo_Potion.GetText();
@@ -3378,7 +3378,7 @@ begin
 
   // Block real input by default
   WLSettings.RemoteInput.BlockInput := True;
-  RSClient.RemoteInput.DisableRealInput();
+  GameClient.RemoteInput.DisableRealInput();
 
   SaveConfig();
   inherited;
@@ -3894,7 +3894,7 @@ begin
     BHIncludeGUICraftWhileNav := True;  // Default: enabled
 
   if Config.Has('bh_logType') then
-    BHIncludeGUILogType := ERSLogType(Config.GetInt('bh_logType'));
+    BHIncludeGUILogType := ELogType(Config.GetInt('bh_logType'));
 
   if Config.Has('bh_seed') then
     BHIncludeGUISeed := Config.GetString('bh_seed');
@@ -4150,7 +4150,7 @@ begin
   Writeln('  ___                                             ___  ');
   Writeln(' |   |**********  Orka Ammonite Crabs  ***********|   | ');
   Writeln(' |   |                                           |   | ');
-  if BankLocation = EBankLocation.BANK_CRAFTING_GUILD then
+  if BankLocation = EScriptBankLocation.BANK_CRAFTING_GUILD then
     Writeln(' |   |    ' + PadR('Bank: Crafting Guild (Crafting Cape)', 39) + '|   | ')
   else
     Writeln(' |   |    ' + PadR('Bank: Fossil Island', 39) + '|   | ');
@@ -4171,13 +4171,13 @@ begin
   Writeln('');
 
   // Login if not logged in
-  if not RSClient.IsLoggedIn() then
+  if not GameClient.IsLoggedIn() then
   begin
     WriteDebug('Init | Logging in...');
     Login.LoginPlayer();
   end;
 
-  if not WaitUntil(RSClient.IsLoggedIn(), 250, 12000) then
+  if not WaitUntil(GameClient.IsLoggedIn(), 250, 12000) then
     TerminateScript('Failed to log in');
 
   // Get current position
@@ -4185,7 +4185,7 @@ begin
   WriteDebug('Init | Current position: ' + ToStr(pos));
 
   // Handle startup location based on bank configuration
-  if BankLocation = EBankLocation.BANK_CRAFTING_GUILD then
+  if BankLocation = EScriptBankLocation.BANK_CRAFTING_GUILD then
   begin
     // FIRST: Validate Crafting Cape exists (required for this bank option)
     if not (Inventory.ContainsAny(['Crafting cape', 'Crafting cape(t)']) or
@@ -4265,7 +4265,7 @@ begin
   SetupAntiban();
 
   // Cache hunter level for birdhouse log selection (avoids bank close/reopen)
-  CachedHunterLevel := Stats.GetLevel(ERSSkill.HUNTER);
+  CachedHunterLevel := Stats.GetLevel(ESkill.HUNTER);
   WriteDebug('Init | Cached hunter level: ' + ToStr(CachedHunterLevel));
 
   // Always initialize BirdHouseRunner (needed for TeleportToFossilIsland even if BH runs disabled)
@@ -4302,7 +4302,7 @@ begin
   if DoBHRuns and (BirdHouseRunner.TaskInterval = 0) then
   begin
     WriteDebug('Init | "Do a run now" selected - executing immediate birdhouse run');
-    if BankLocation = EBankLocation.BANK_CRAFTING_GUILD then
+    if BankLocation = EScriptBankLocation.BANK_CRAFTING_GUILD then
       BirdHouseRunner.DoBirdHouseRun()
     else
       DoManualBirdHouseRun();

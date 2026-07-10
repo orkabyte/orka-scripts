@@ -18,11 +18,11 @@
  * ============================================================================
  *)
 
-{$DEFINE SCRIPT_REVISION := '9'}
+{$DEFINE SCRIPT_REVISION := '10'}
 program OrkaGELogBurner;
 {$DEFINE SCRIPT_GUI}
-{$I SRL-T/osr.simba}
-{$I WaspLib/osr.simba}
+{$I SRL-T/main.simba}
+{$I WaspLib/main.simba}
 {$I WaspLib/optional/handlers/discord.simba}
 
 (** Checks the active RuneLite profile for GPU plugin and auto-disables it. *)
@@ -121,8 +121,8 @@ type
 
   TGELogBurner = record(TBaseWalkerScript)
     State: EGELogBurnerState;
-    LogType: TRSItem;
-    Tinderbox: TRSItem;
+    LogType: TItem;
+    Tinderbox: TItem;
 
     // Location & Tiles
     IsLeftSide: Boolean;
@@ -498,7 +498,7 @@ end;
  *)
 procedure TAntiban.Setup(); override;
 begin
-  Self.Skills := [ERSSkill.FIREMAKING, ERSSkill.TOTAL];
+  Self.Skills := [ESkill.FIREMAKING, ESkill.TOTAL];
   Self.MinZoom := 10;
   Self.MaxZoom := 60;
 
@@ -663,7 +663,7 @@ end;
 function TGELogBurner.HandleBanking(): Boolean;
 var
   NeedTinderbox: Boolean;
-  TinderboxItem, LogItem: TRSBankItem;
+  TinderboxItem, LogItem: TBankItem;
   WithdrawAttempts: Int32;
 begin
   if not Bank.IsOpen() then
@@ -699,7 +699,7 @@ begin
 
     if Bank.ContainsItem(Self.Tinderbox) then
     begin
-      TinderboxItem := TRSBankItem.Setup(Self.Tinderbox, 1, False);
+      TinderboxItem := TBankItem.Setup(Self.Tinderbox, 1, False);
       if not Bank.WithdrawItem(TinderboxItem, False) then
       begin
         WriteDebug('HandleBanking | Failed to withdraw tinderbox');
@@ -720,7 +720,7 @@ begin
     Exit(True);
   end;
 
-  LogItem := TRSBankItem.Setup(Self.LogType, Bank.QUANTITY_ALL, False);
+  LogItem := TBankItem.Setup(Self.LogType, Bank.QUANTITY_ALL, False);
 
   for WithdrawAttempts := 1 to 3 do
   begin
@@ -781,7 +781,7 @@ end;
 function TGELogBurner.ScanForFire(): Boolean;
 var
   SearchArea: TPointArray;
-  Campfire: TRSObjectV2;
+  Campfire: TGameObjectV2;
   ATPA: T2DPointArray;
   i, k: Int32;
   CheckAreas: array of TPointArray;
@@ -951,7 +951,7 @@ end;
  *)
 function TGELogBurner.InteractWithFire(): Boolean;
 var
-  Campfire: TRSObjectV2;
+  Campfire: TGameObjectV2;
   ATPA: T2DPointArray;
 begin
   if Chat.LeveledUp() then
@@ -967,10 +967,10 @@ begin
     Exit(False);
   end;
 
-  if RSInterface.IsOpen() then
+  if GameInterface.IsOpen() then
   begin
     WriteDebug('InteractWithFire | Closing interface');
-    RSInterface.Close();
+    GameInterface.Close();
     Wait(500, 800);
   end;
 
@@ -1099,7 +1099,7 @@ end;
  *)
 function TGELogBurner.GetState(): EGELogBurnerState;
 begin
-  if not RSClient.IsLoggedIn() then
+  if not GameClient.IsLoggedIn() then
     Exit(EGELogBurnerState.HANDLE_LOGIN);
 
   if WL.Activity.IsFinished() then
@@ -1252,9 +1252,9 @@ begin
       EGELogBurnerState.LEVEL_UP:
       begin
         WriteLn('LEVEL_UP | Firemaking level up!');
-        if RSInterface.IsOpen() then
+        if GameInterface.IsOpen() then
         begin
-          RSInterface.Close();
+          GameInterface.Close();
           Wait(500, 800);
         end;
         if Self.UseDiscord then

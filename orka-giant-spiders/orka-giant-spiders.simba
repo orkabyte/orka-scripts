@@ -17,11 +17,11 @@
  *
  * ============================================================================
  *)
-{$DEFINE SCRIPT_REVISION := '1'}
+{$DEFINE SCRIPT_REVISION := '2'}
 {$DEFINE SCRIPT_GUI}
 program OrkaGiantSpiders;
-{$I SRL-T/osr.simba}
-{$I WaspLib/osr.simba}
+{$I SRL-T/main.simba}
+{$I WaspLib/main.simba}
 {$I WaspLib/optional/handlers/discord.simba}
 
 const
@@ -91,16 +91,16 @@ type
   end;
 
   TSpiderObjects = record
-    StrongholdEntrance: TRSObjectV2;
-    FirstFloorLadderEntrance: TRSObjectV2;
-    FirstFloorPortal: TRSObjectV2;
-    FirstFloorLadderExit: TRSObjectV2;
-    SecondFloorLadderEntrance: TRSObjectV2;
-    SecondFloorPortal: TRSObjectV2;
-    SecondFloorLadderExit: TRSObjectV2;
-    ThirdFloorLadderEntrance: TRSObjectV2;
-    ThirdFloorGate1: TRSObjectV2;
-    ThirdFloorGate2: TRSObjectV2;
+    StrongholdEntrance: TGameObjectV2;
+    FirstFloorLadderEntrance: TGameObjectV2;
+    FirstFloorPortal: TGameObjectV2;
+    FirstFloorLadderExit: TGameObjectV2;
+    SecondFloorLadderEntrance: TGameObjectV2;
+    SecondFloorPortal: TGameObjectV2;
+    SecondFloorLadderExit: TGameObjectV2;
+    ThirdFloorLadderEntrance: TGameObjectV2;
+    ThirdFloorGate1: TGameObjectV2;
+    ThirdFloorGate2: TGameObjectV2;
   end;
 
   EState = (HANDLE_LOGIN, CLOSE_INTERFACE, RESTOCK, NAVIGATE_TO_COMBAT,
@@ -123,7 +123,7 @@ var
   ShutdownTime: Int64;
   UsePotions, UseFood: Boolean;
   PotionTimer, ReportTimer: TStopwatch;
-  Potion, Food: TRSItem;
+  Potion, Food: TItem;
   GUI: TGUI;
   Config: TConfigJSON;
   TakeBreaks, TakeSleeps: Boolean;
@@ -446,7 +446,7 @@ end;
  * @param maxAttempts  Number of retry attempts (default 3)
  * @return             True if successfully transitioned to destBox
  *)
-function DoTransition(var obj: TRSObjectV2; destBox: TBox; maxAttempts: Int32 = 3): Boolean;
+function DoTransition(var obj: TGameObjectV2; destBox: TBox; maxAttempts: Int32 = 3): Boolean;
 var
   attempt: Int32;
 begin
@@ -533,7 +533,7 @@ end;
 function HandleSecurityQuestion(): Boolean;
 var
   chatText, answer, title: String;
-  options: TRSChatboxOptionArray;
+  options: TChatboxOptionArray;
   wrongIdx, i: Int32;
 begin
   title := Chat.GetChatTitle();
@@ -641,7 +641,7 @@ end;
  * @param maxAttempts  Number of retry attempts (default 5)
  * @return             True if successfully transitioned to destBox
  *)
-function DoGateTransition(var obj: TRSObjectV2; destBox: TBox; maxAttempts: Int32 = 5): Boolean;
+function DoGateTransition(var obj: TGameObjectV2; destBox: TBox; maxAttempts: Int32 = 5): Boolean;
 var
   attempt, effectiveMaxAttempts: Int32;
   shouldAnswer: Boolean;
@@ -984,12 +984,12 @@ begin
   WriteLog('Break timer reached - taking scheduled break in initial room');
   Antiban.DoAntiban(True, False);
 
-  if not RSClient.IsLoggedIn() then
+  if not GameClient.IsLoggedIn() then
   begin
     WriteLog('Player logged out during break, logging back in');
     Login.LoginPlayer();
 
-    if not WaitUntil(RSClient.IsLoggedIn(), 250, 12 * ONE_SECOND) then
+    if not WaitUntil(GameClient.IsLoggedIn(), 250, 12 * ONE_SECOND) then
       TerminateScript('Failed to log back in after scheduled break');
   end;
 
@@ -1034,12 +1034,12 @@ begin
   WriteLog('Sleep timer reached - taking scheduled sleep in initial room');
   Antiban.DoAntiban(True, False);
 
-  if not RSClient.IsLoggedIn() then
+  if not GameClient.IsLoggedIn() then
   begin
     WriteLog('Player logged out during sleep, logging back in');
     Login.LoginPlayer();
 
-    if not WaitUntil(RSClient.IsLoggedIn(), 250, 12 * ONE_SECOND) then
+    if not WaitUntil(GameClient.IsLoggedIn(), 250, 12 * ONE_SECOND) then
       TerminateScript('Failed to log back in after scheduled sleep');
   end;
 
@@ -1175,10 +1175,10 @@ end;
  *)
 function GetState(): EState;
 begin
-  if not RSClient.IsLoggedIn() then
+  if not GameClient.IsLoggedIn() then
     Exit(HANDLE_LOGIN);
 
-  if RSInterface.IsOpen() then
+  if GameInterface.IsOpen() then
     Exit(CLOSE_INTERFACE);
 
   if UseFood then
@@ -1318,54 +1318,54 @@ end;
  * @param skill         The skill to calculate XP for
  * @return              Estimated XP for the specified skill
  *)
-function CalculateSkillXP(totalXP: Int32; xpType: ECombatXPType; skill: ERSSkill): Int32;
+function CalculateSkillXP(totalXP: Int32; xpType: ECombatXPType; skill: ESkill): Int32;
 begin
   Result := 0;
 
   case xpType of
     ECombatXPType.XP_ATTACK:
     begin
-      if skill = ERSSkill.ATTACK then Result := Round(totalXP * 0.75);
-      if skill = ERSSkill.HITPOINTS then Result := Round(totalXP * 0.25);
+      if skill = ESkill.ATTACK then Result := Round(totalXP * 0.75);
+      if skill = ESkill.HITPOINTS then Result := Round(totalXP * 0.25);
     end;
 
     ECombatXPType.XP_STRENGTH:
     begin
-      if skill = ERSSkill.STRENGTH then Result := Round(totalXP * 0.75);
-      if skill = ERSSkill.HITPOINTS then Result := Round(totalXP * 0.25);
+      if skill = ESkill.STRENGTH then Result := Round(totalXP * 0.75);
+      if skill = ESkill.HITPOINTS then Result := Round(totalXP * 0.25);
     end;
 
     ECombatXPType.XP_DEFENCE:
     begin
-      if skill = ERSSkill.DEFENCE then Result := Round(totalXP * 0.75);
-      if skill = ERSSkill.HITPOINTS then Result := Round(totalXP * 0.25);
+      if skill = ESkill.DEFENCE then Result := Round(totalXP * 0.75);
+      if skill = ESkill.HITPOINTS then Result := Round(totalXP * 0.25);
     end;
 
     ECombatXPType.XP_CONTROLLED:
     begin
-      if skill = ERSSkill.ATTACK then Result := Round(totalXP * 0.25);
-      if skill = ERSSkill.STRENGTH then Result := Round(totalXP * 0.25);
-      if skill = ERSSkill.DEFENCE then Result := Round(totalXP * 0.25);
-      if skill = ERSSkill.HITPOINTS then Result := Round(totalXP * 0.25);
+      if skill = ESkill.ATTACK then Result := Round(totalXP * 0.25);
+      if skill = ESkill.STRENGTH then Result := Round(totalXP * 0.25);
+      if skill = ESkill.DEFENCE then Result := Round(totalXP * 0.25);
+      if skill = ESkill.HITPOINTS then Result := Round(totalXP * 0.25);
     end;
 
     ECombatXPType.XP_RANGED:
     begin
-      if skill = ERSSkill.RANGE then Result := Round(totalXP * 0.75);
-      if skill = ERSSkill.HITPOINTS then Result := Round(totalXP * 0.25);
+      if skill = ESkill.RANGE then Result := Round(totalXP * 0.75);
+      if skill = ESkill.HITPOINTS then Result := Round(totalXP * 0.25);
     end;
 
     ECombatXPType.XP_RANGED_DEF:
     begin
-      if skill = ERSSkill.RANGE then Result := Round(totalXP * 0.50);
-      if skill = ERSSkill.DEFENCE then Result := Round(totalXP * 0.25);
-      if skill = ERSSkill.HITPOINTS then Result := Round(totalXP * 0.25);
+      if skill = ESkill.RANGE then Result := Round(totalXP * 0.50);
+      if skill = ESkill.DEFENCE then Result := Round(totalXP * 0.25);
+      if skill = ESkill.HITPOINTS then Result := Round(totalXP * 0.25);
     end;
 
     ECombatXPType.XP_MAGIC:
     begin
-      if skill = ERSSkill.MAGIC then Result := Round(totalXP * 0.60);
-      if skill = ERSSkill.HITPOINTS then Result := Round(totalXP * 0.40);
+      if skill = ESkill.MAGIC then Result := Round(totalXP * 0.60);
+      if skill = ESkill.HITPOINTS then Result := Round(totalXP * 0.40);
     end;
   end;
 end;
@@ -1389,18 +1389,18 @@ type
 function GetSkillXPEntries(totalXP: Int32; timeMs: Int64): array of TSkillXPEntry;
 var
   entry: TSkillXPEntry;
-  skills: array of ERSSkill;
+  skills: array of ESkill;
   names: TStringArray;
   i: Int32;
 begin
   case CombatXPType of
-    ECombatXPType.XP_ATTACK:     begin skills := [ERSSkill.ATTACK, ERSSkill.HITPOINTS]; names := ['Attack', 'Hitpoints']; end;
-    ECombatXPType.XP_STRENGTH:   begin skills := [ERSSkill.STRENGTH, ERSSkill.HITPOINTS]; names := ['Strength', 'Hitpoints']; end;
-    ECombatXPType.XP_DEFENCE:    begin skills := [ERSSkill.DEFENCE, ERSSkill.HITPOINTS]; names := ['Defence', 'Hitpoints']; end;
-    ECombatXPType.XP_CONTROLLED: begin skills := [ERSSkill.ATTACK, ERSSkill.STRENGTH, ERSSkill.DEFENCE, ERSSkill.HITPOINTS]; names := ['Attack', 'Strength', 'Defence', 'Hitpoints']; end;
-    ECombatXPType.XP_RANGED:     begin skills := [ERSSkill.RANGE, ERSSkill.HITPOINTS]; names := ['Ranged', 'Hitpoints']; end;
-    ECombatXPType.XP_RANGED_DEF: begin skills := [ERSSkill.RANGE, ERSSkill.DEFENCE, ERSSkill.HITPOINTS]; names := ['Ranged', 'Defence', 'Hitpoints']; end;
-    ECombatXPType.XP_MAGIC:      begin skills := [ERSSkill.MAGIC, ERSSkill.HITPOINTS]; names := ['Magic', 'Hitpoints']; end;
+    ECombatXPType.XP_ATTACK:     begin skills := [ESkill.ATTACK, ESkill.HITPOINTS]; names := ['Attack', 'Hitpoints']; end;
+    ECombatXPType.XP_STRENGTH:   begin skills := [ESkill.STRENGTH, ESkill.HITPOINTS]; names := ['Strength', 'Hitpoints']; end;
+    ECombatXPType.XP_DEFENCE:    begin skills := [ESkill.DEFENCE, ESkill.HITPOINTS]; names := ['Defence', 'Hitpoints']; end;
+    ECombatXPType.XP_CONTROLLED: begin skills := [ESkill.ATTACK, ESkill.STRENGTH, ESkill.DEFENCE, ESkill.HITPOINTS]; names := ['Attack', 'Strength', 'Defence', 'Hitpoints']; end;
+    ECombatXPType.XP_RANGED:     begin skills := [ESkill.RANGE, ESkill.HITPOINTS]; names := ['Ranged', 'Hitpoints']; end;
+    ECombatXPType.XP_RANGED_DEF: begin skills := [ESkill.RANGE, ESkill.DEFENCE, ESkill.HITPOINTS]; names := ['Ranged', 'Defence', 'Hitpoints']; end;
+    ECombatXPType.XP_MAGIC:      begin skills := [ESkill.MAGIC, ESkill.HITPOINTS]; names := ['Magic', 'Hitpoints']; end;
   end;
 
   for i := 0 to High(skills) do
@@ -1761,12 +1761,12 @@ begin
   T := Task;
 
   // Log back in if player was logged out during break
-  if not RSClient.IsLoggedIn() then
+  if not GameClient.IsLoggedIn() then
   begin
     WriteLog('Break finished - logging player back in');
     Login.LoginPlayer();
 
-    if not WaitUntil(RSClient.IsLoggedIn(), 250, 12 * ONE_SECOND) then
+    if not WaitUntil(GameClient.IsLoggedIn(), 250, 12 * ONE_SECOND) then
     begin
       WriteLog('Failed to log back in after break');
       TerminateScript('Failed to log back in after break');
@@ -1813,12 +1813,12 @@ begin
   T := Task;
 
   // Log back in if player was logged out during sleep
-  if not RSClient.IsLoggedIn() then
+  if not GameClient.IsLoggedIn() then
   begin
     WriteLog('Sleep finished - logging player back in');
     Login.LoginPlayer();
 
-    if not WaitUntil(RSClient.IsLoggedIn(), 250, 12 * ONE_SECOND) then
+    if not WaitUntil(GameClient.IsLoggedIn(), 250, 12 * ONE_SECOND) then
     begin
       WriteLog('Failed to log back in after sleep');
       TerminateScript('Failed to log back in after sleep');
@@ -1840,7 +1840,7 @@ end;
  *)
 function WithdrawPotions(): Boolean;
 var
-  P: TRSBankItem := TRSBankItem.Setup(Potion + '(4)', PotionAmount, False);
+  P: TBankItem := TBankItem.Setup(Potion + '(4)', PotionAmount, False);
   attempt: Int32;
 begin
   if not Bank.IsOpen() then
@@ -2103,7 +2103,7 @@ begin
   if UseFood then
   begin
     WriteLog('Withdrawing food to fill inventory');
-    if Bank.WithdrawItem(TRSBankItem.Setup(Food, Bank.QUANTITY_ALL, False), False) then
+    if Bank.WithdrawItem(TBankItem.Setup(Food, Bank.QUANTITY_ALL, False), False) then
       WaitUntil(Inventory.ContainsItem(Food), 300, 3 * ONE_SECOND)
     else
       TerminateScript('Could not find food in bank: ' + Food);
@@ -2130,14 +2130,14 @@ end;
  * Detects the active combat style and returns the corresponding skills being trained.
  * Also sets the global CombatXPType for XP distribution calculations.
  *
- * @return  Array of ERSSkill values being trained by the current combat style
+ * @return  Array of ESkill values being trained by the current combat style
  *)
-function GetTrainedSkill(): array of ERSSkill;
+function GetTrainedSkill(): array of ESkill;
 var
   style: String;
-  cs: TRSCombatStyle;
+  cs: TCombatStyle;
 begin
-  // WaspLib's TRSCombatStyle.GetCombatType OCRs the combat tab with the
+  // WaspLib's TCombatStyle.GetCombatType OCRs the combat tab with the
   // default black color filter, misses the white/yellow style text, and
   // silently returns MAGIC. Read the style string instead (color-correct
   // in Combat.GetCombatStyle) and only fall back to GetCombatType for the
@@ -2149,7 +2149,7 @@ begin
   begin
     WriteLog('Training Strength skill');
     CombatXPType := ECombatXPType.XP_STRENGTH;
-    Result := [ERSSkill.STRENGTH, ERSSkill.HITPOINTS, ERSSkill.TOTAL];
+    Result := [ESkill.STRENGTH, ESkill.HITPOINTS, ESkill.TOTAL];
     Exit;
   end;
 
@@ -2157,7 +2157,7 @@ begin
   begin
     WriteLog('Training Attack skill');
     CombatXPType := ECombatXPType.XP_ATTACK;
-    Result := [ERSSkill.ATTACK, ERSSkill.HITPOINTS, ERSSkill.TOTAL];
+    Result := [ESkill.ATTACK, ESkill.HITPOINTS, ESkill.TOTAL];
     Exit;
   end;
 
@@ -2165,7 +2165,7 @@ begin
   begin
     WriteLog('Training Defence skill');
     CombatXPType := ECombatXPType.XP_DEFENCE;
-    Result := [ERSSkill.DEFENCE, ERSSkill.HITPOINTS, ERSSkill.TOTAL];
+    Result := [ESkill.DEFENCE, ESkill.HITPOINTS, ESkill.TOTAL];
     Exit;
   end;
 
@@ -2173,7 +2173,7 @@ begin
   begin
     WriteLog('Training Controlled (Attack, Strength, Defence)');
     CombatXPType := ECombatXPType.XP_CONTROLLED;
-    Result := [ERSSkill.ATTACK, ERSSkill.STRENGTH, ERSSkill.DEFENCE, ERSSkill.HITPOINTS, ERSSkill.TOTAL];
+    Result := [ESkill.ATTACK, ESkill.STRENGTH, ESkill.DEFENCE, ESkill.HITPOINTS, ESkill.TOTAL];
     Exit;
   end;
 
@@ -2181,7 +2181,7 @@ begin
   begin
     WriteLog('Training Ranged + Defence (Longrange)');
     CombatXPType := ECombatXPType.XP_RANGED_DEF;
-    Result := [ERSSkill.RANGE, ERSSkill.DEFENCE, ERSSkill.HITPOINTS, ERSSkill.TOTAL];
+    Result := [ESkill.RANGE, ESkill.DEFENCE, ESkill.HITPOINTS, ESkill.TOTAL];
     Exit;
   end;
 
@@ -2189,7 +2189,7 @@ begin
   begin
     WriteLog('Training Ranged skill');
     CombatXPType := ECombatXPType.XP_RANGED;
-    Result := [ERSSkill.RANGE, ERSSkill.HITPOINTS, ERSSkill.TOTAL];
+    Result := [ESkill.RANGE, ESkill.HITPOINTS, ESkill.TOTAL];
     Exit;
   end;
 
@@ -2199,35 +2199,35 @@ begin
   if style.ContainsAny(['Accurate']) then
   begin
     cs.GetCombatType();
-    if cs.CombatType = ERSCombatType.RANGED then
+    if cs.CombatType = ECombatType.RANGED then
     begin
       WriteLog('Training Ranged skill (Accurate)');
       CombatXPType := ECombatXPType.XP_RANGED;
-      Result := [ERSSkill.RANGE, ERSSkill.HITPOINTS, ERSSkill.TOTAL];
+      Result := [ESkill.RANGE, ESkill.HITPOINTS, ESkill.TOTAL];
       Exit;
     end;
 
     WriteLog('Training Attack skill (Accurate, melee)');
     CombatXPType := ECombatXPType.XP_ATTACK;
-    Result := [ERSSkill.ATTACK, ERSSkill.HITPOINTS, ERSSkill.TOTAL];
+    Result := [ESkill.ATTACK, ESkill.HITPOINTS, ESkill.TOTAL];
     Exit;
   end;
 
   // Autocast magic usually leaves the style string empty, so fall back to
   // the panel icon here.
   cs.GetCombatType();
-  if cs.CombatType = ERSCombatType.MAGIC then
+  if cs.CombatType = ECombatType.MAGIC then
   begin
     WriteLog('Training Magic skill');
     CombatXPType := ECombatXPType.XP_MAGIC;
-    Result := [ERSSkill.MAGIC, ERSSkill.HITPOINTS, ERSSkill.TOTAL];
+    Result := [ESkill.MAGIC, ESkill.HITPOINTS, ESkill.TOTAL];
     Exit;
   end;
 
   WriteLog(ToStr('Could not detect combat type (style="', style, '", combatType=', cs.CombatType, '), defaulting to all combat skills'));
   CombatXPType := ECombatXPType.XP_UNKNOWN;
-  Result := [ERSSkill.ATTACK, ERSSkill.STRENGTH, ERSSkill.DEFENCE,
-             ERSSkill.HITPOINTS, ERSSkill.RANGE, ERSSkill.MAGIC, ERSSkill.TOTAL];
+  Result := [ESkill.ATTACK, ESkill.STRENGTH, ESkill.DEFENCE,
+             ESkill.HITPOINTS, ESkill.RANGE, ESkill.MAGIC, ESkill.TOTAL];
 end;
 
 (**
@@ -2464,10 +2464,10 @@ begin
 
   SettingsHandler.CheckGPUPlugin();
 
-  if not RSClient.IsLoggedIn() then
+  if not GameClient.IsLoggedIn() then
     Login.LoginPlayer();
 
-  if WaitUntil(RSClient.IsLoggedIn(), 250, 12 * ONE_SECOND) then
+  if WaitUntil(GameClient.IsLoggedIn(), 250, 12 * ONE_SECOND) then
     StartXP := XPBar.Read();
 
   if StartXP < 1024 then
@@ -2663,7 +2663,7 @@ begin
   end;
 
   WLSettings.RemoteInput.BlockInput := True;
-  RSClient.RemoteInput.DisableRealInput();
+  GameClient.RemoteInput.DisableRealInput();
 
   SaveConfig();
   inherited;
@@ -3124,7 +3124,7 @@ var
 begin
   if WL.Activity.IsFinished() then
   begin
-    if RSClient.IsLoggedIn() then Logout.ClickLogout();
+    if GameClient.IsLoggedIn() then Logout.ClickLogout();
     TerminateScript('No activity detected');
   end;
 
@@ -3175,7 +3175,7 @@ begin
       WriteLog('Player not in combat area, shutting down from current location');
 
     // Log out the player before shutting down
-    if RSClient.IsLoggedIn() then
+    if GameClient.IsLoggedIn() then
     begin
       WriteLog('Logging out player before shutdown');
 
@@ -3201,7 +3201,7 @@ begin
     WriteLog(ToStr(State));
 
   case State of
-    CLOSE_INTERFACE: RSInterface.Close(50);
+    CLOSE_INTERFACE: GameInterface.Close(50);
     HANDLE_LOGIN:
     begin
       Login.LoginPlayer();

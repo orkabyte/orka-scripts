@@ -1,8 +1,8 @@
-{$DEFINE SCRIPT_REVISION := '1'}
+{$DEFINE SCRIPT_REVISION := '2'}
 {$DEFINE SCRIPT_GUI}
 program OrkaLeadMiner;
-{$I SRL-T/osr.simba}
-{$I WaspLib/osr.simba}
+{$I SRL-T/main.simba}
+{$I WaspLib/main.simba}
 
 const
   VERBOSE_LOGGING = True;
@@ -17,10 +17,10 @@ type
   end;
 
   TPandemoniumObjects = record
-    LeadRock1, LeadRock2, LeadRock3, LeadRock4: TRSObjectV2;
-    DungeonExit: TRSObjectV2;
-    DungeonEntrance: TRSObjectV2;
-    Bank: TRSObjectV2;
+    LeadRock1, LeadRock2, LeadRock3, LeadRock4: TGameObjectV2;
+    DungeonExit: TGameObjectV2;
+    DungeonEntrance: TGameObjectV2;
+    Bank: TGameObjectV2;
   end;
 
   EState = (HANDLE_LOGIN, CLOSE_INTERFACE, BANKING, ENTER_CAVE,
@@ -369,7 +369,7 @@ end;
 
 procedure SetupAntiban();
 begin
-  Antiban.Skills := [ERSSkill.MINING, ERSSkill.TOTAL];
+  Antiban.Skills := [ESkill.MINING, ESkill.TOTAL];
   Antiban.MinZoom := 12;
   Antiban.MaxZoom := 38;
 
@@ -476,11 +476,11 @@ begin
   if Self.cb_BlockInput.IsChecked() then
   begin
     WLSettings.RemoteInput.BlockInput := True;
-    RSClient.RemoteInput.DisableRealInput();
+    GameClient.RemoteInput.DisableRealInput();
   end else
   begin
     WLSettings.RemoteInput.BlockInput := False;
-    RSClient.RemoteInput.EnableRealInput();
+    GameClient.RemoteInput.EnableRealInput();
   end;
 
   SaveConfig();
@@ -625,10 +625,10 @@ end;
 
 procedure EnsureLoggedIn();
 begin
-  if not RSClient.IsLoggedIn() then
+  if not GameClient.IsLoggedIn() then
     Login.LoginPlayer();
 
-  if not WaitUntil(RSClient.IsLoggedIn(), 250, 12000) then
+  if not WaitUntil(GameClient.IsLoggedIn(), 250, 12000) then
     TerminateScript('Failed to log in');
 end;
 
@@ -777,7 +777,7 @@ begin
   end;
 end;
 
-function IsRockDepleted(rock: TRSObjectV2): Boolean;
+function IsRockDepleted(rock: TGameObjectV2): Boolean;
 var
   rockATPA: T2DPointArray;
   rockTPA: TPointArray;
@@ -817,7 +817,7 @@ begin
   if SpecLevel >= 100 then
   begin
     WriteDebug('Using Dragon Pickaxe special attack');
-    Mouse.Click(Minimap.Orbs[ERSMinimapOrb.SPECIAL_ATTACK], MOUSE_LEFT);
+    Mouse.Click(Minimap.Orbs[EMinimapOrb.SPECIAL_ATTACK], MOUSE_LEFT);
 
     // Wait for spec to drop to confirm usage
     T := GetTickCount() + 2000;
@@ -830,7 +830,7 @@ begin
   end;
 end;
 
-function MineRock(rock: TRSObjectV2): Boolean;
+function MineRock(rock: TGameObjectV2): Boolean;
 var
   timeout: UInt64;
   invBefore: Int32;
@@ -879,7 +879,7 @@ end;
 procedure MineUntilFull();
 var
   rockIndex, failCount: Int32;
-  currentRock: TRSObjectV2;
+  currentRock: TGameObjectV2;
 begin
   WriteDebug('Mining until inventory is full');
   rockIndex := 0;
@@ -887,7 +887,7 @@ begin
 
   while not Inventory.IsFull() do
   begin
-    if not RSClient.IsLoggedIn() then
+    if not GameClient.IsLoggedIn() then
     begin
       WriteDebug('Player logged out, exiting mining loop');
       Break;
@@ -991,10 +991,10 @@ end;
 
 function GetState(): EState;
 begin
-  if not RSClient.IsLoggedIn() then
+  if not GameClient.IsLoggedIn() then
     Exit(HANDLE_LOGIN);
 
-  if RSInterface.IsOpen() then
+  if GameInterface.IsOpen() then
     Exit(CLOSE_INTERFACE);
 
   if Inventory.IsFull() then
@@ -1042,7 +1042,7 @@ begin
 
   case State of
     HANDLE_LOGIN: Login.LoginPlayer();
-    CLOSE_INTERFACE: RSInterface.Close(50);
+    CLOSE_INTERFACE: GameInterface.Close(50);
     BANKING:
       begin
         if BankInventory() and IsOnIsland() then

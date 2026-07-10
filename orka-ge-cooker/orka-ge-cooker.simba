@@ -18,11 +18,11 @@
  * ============================================================================
  *)
 
-{$DEFINE SCRIPT_REVISION := '7'}
+{$DEFINE SCRIPT_REVISION := '8'}
 program OrkaGECooker;
 {$DEFINE SCRIPT_GUI}
-{$I SRL-T/osr.simba}
-{$I WaspLib/osr.simba}
+{$I SRL-T/main.simba}
+{$I WaspLib/main.simba}
 {$I WaspLib/optional/handlers/discord.simba}
 
 (** Checks the active RuneLite profile for GPU plugin and auto-disables it. *)
@@ -133,8 +133,8 @@ type
     CookingMode: ECookingMode;
     FireTileIndex: Int32;
     NextCampfireScan: Int64;
-    RawFood: TRSItem;
-    Tinderbox: TRSItem;
+    RawFood: TItem;
+    Tinderbox: TItem;
     LogPriorities: TStringArray;
     SelectedFood: String;
 
@@ -142,7 +142,7 @@ type
     BankTile: TPoint;
     PreferredFireTile: TPoint;
     CurrentFireTile: TPoint;
-    FireObject: TRSObjectV2;
+    FireObject: TGameObjectV2;
 
     StartXP, GainedXP: Int32;
     FoodCooked: Int32;
@@ -478,7 +478,7 @@ end;
  *)
 procedure TAntiban.Setup(); override;
 begin
-  Self.Skills := [ERSSkill.COOKING];
+  Self.Skills := [ESkill.COOKING];
   Self.MinZoom := 10;
   Self.MaxZoom := 60;
   Self.OnStartBreak := @OnBreakStart;
@@ -731,7 +731,7 @@ function TGECooker.SmartWithdraw(loadout: array of TLoadoutItem): Boolean;
 var
   i, attempts: Int32;
   loadoutItem: TLoadoutItem;
-  itemToWithdraw: TRSBankItem;
+  itemToWithdraw: TBankItem;
   projectedEmptySlots, requiredSlots: Int32;
   cachedStackability: array of Boolean;
   cachedInventoryCounts: array of Int32;
@@ -802,7 +802,7 @@ begin
     end;
 
     WriteDebug('Attempting to withdraw: ' + loadoutItem.Name);
-    itemToWithdraw := TRSBankItem.Setup(loadoutItem.Name, loadoutItem.Quantity, False);
+    itemToWithdraw := TBankItem.Setup(loadoutItem.Name, loadoutItem.Quantity, False);
 
     for attempts := 1 to 2 do
     begin
@@ -1103,7 +1103,7 @@ end;
 function TGECooker.CreateFire(): Boolean;
 var
   Tile, startPos: TPoint;
-  MyLog: TRSItem;
+  MyLog: TItem;
   i: Int32;
   Tiles: TPointArray;
   ATPA: T2DPointArray;
@@ -1351,9 +1351,9 @@ begin
     Exit(False);
   end;
 
-  if RSInterface.IsOpen() then
+  if GameInterface.IsOpen() then
   begin
-    RSInterface.Close();
+    GameInterface.Close();
     Wait(500, 800);
   end;
 
@@ -1570,7 +1570,7 @@ end;
  *)
 function TGECooker.GetState(): EGECookerState;
 begin
-  if not RSClient.IsLoggedIn() then
+  if not GameClient.IsLoggedIn() then
     Exit(EGECookerState.HANDLE_LOGIN);
 
   if WL.Activity.IsFinished() then
@@ -1722,9 +1722,9 @@ begin
 
       EGECookerState.LEVEL_UP:
       begin
-        if RSInterface.IsOpen() then
+        if GameInterface.IsOpen() then
         begin
-          RSInterface.Close();
+          GameInterface.Close();
           Wait(500, 800);
         end;
         if Self.UseDiscord then

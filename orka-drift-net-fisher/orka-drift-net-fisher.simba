@@ -17,11 +17,11 @@
  *
  * ============================================================================
  *)
-{$DEFINE SCRIPT_REVISION := '1'}
+{$DEFINE SCRIPT_REVISION := '2'}
 {$DEFINE SCRIPT_GUI}
 program OrkaDriftNetFisher;
-{$I SRL-T/osr.simba}
-{$I WaspLib/osr.simba}
+{$I SRL-T/main.simba}
+{$I WaspLib/main.simba}
 {$I WaspLib/optional/interfaces/mainscreen/driftnet.simba}
 {$I WaspLib/optional/interfaces/mainscreen/annettesnets.simba}
 {$I WaspLib/optional/handlers/discord.simba}
@@ -147,20 +147,20 @@ type
   end;
 
   TDriftNetFishingObjects = record
-    SurfaceBankChest: TRSObjectV2;
-    SurfaceRowboat: TRSObjectV2;
-    UnderwaterTunnel: TRSObjectV2;
-    UnderwaterAnchorRope: TRSObjectV2;
-    UnderwaterPlantDoor: TRSObjectV2;
-    Annette: TRSObjectV2;
-    Underwater_DriftNet_North_Anchor: TRSObjectV2;
-    Underwater_DriftNet_South_Anchor: TRSObjectV2;
-    Underwater_DriftNet_North_Full: TRSObjectV2;
-    Underwater_DriftNet_South_Full: TRSObjectV2;
-    Underwater_DriftNet_North_NotFull: TRSObjectV2;
-    Underwater_DriftNet_South_NotFull: TRSObjectV2;
-    Underwater_FishShoal_North: TRSObjectV2;
-    Underwater_FishShoal_South: TRSObjectV2;
+    SurfaceBankChest: TGameObjectV2;
+    SurfaceRowboat: TGameObjectV2;
+    UnderwaterTunnel: TGameObjectV2;
+    UnderwaterAnchorRope: TGameObjectV2;
+    UnderwaterPlantDoor: TGameObjectV2;
+    Annette: TGameObjectV2;
+    Underwater_DriftNet_North_Anchor: TGameObjectV2;
+    Underwater_DriftNet_South_Anchor: TGameObjectV2;
+    Underwater_DriftNet_North_Full: TGameObjectV2;
+    Underwater_DriftNet_South_Full: TGameObjectV2;
+    Underwater_DriftNet_North_NotFull: TGameObjectV2;
+    Underwater_DriftNet_South_NotFull: TGameObjectV2;
+    Underwater_FishShoal_North: TGameObjectV2;
+    Underwater_FishShoal_South: TGameObjectV2;
   end;
 
   TGUI = record(TScriptForm)
@@ -393,7 +393,7 @@ end;
 (**
  * SetupObjects
  *
- * Configures all TRSObjectV2 instances with positions, colors, and UpText.
+ * Configures all TGameObjectV2 instances with positions, colors, and UpText.
  *)
 procedure SetupObjects();
 begin
@@ -752,7 +752,7 @@ end;
 (**
  * DetectShoals
  *
- * Detects fish shoals using TRSObjectV2 finders for both areas.
+ * Detects fish shoals using TGameObjectV2 finders for both areas.
  * After matching, merges grace-period survivors into PreviousShoals
  * so that briefly-invisible shoals retain their IDs on reappearance.
  *
@@ -1002,8 +1002,8 @@ var
   boxColor: Int32;
   bounds: TBox;
 begin
-  RSClient.Image.SetFontSize(16);
-  RSClient.Image.SetFontAntialiasing(True);
+  GameClient.Image.SetFontSize(16);
+  GameClient.Image.SetFontAntialiasing(True);
 
   for i := 0 to High(shoals) do
   begin
@@ -1015,8 +1015,8 @@ begin
       boxColor := COLOR_YELLOW;
 
     bounds := shoals[i].Bounds;
-    RSClient.Image.DrawBox(bounds, boxColor);
-    RSClient.Image.DrawText(
+    GameClient.Image.DrawBox(bounds, boxColor);
+    GameClient.Image.DrawText(
       ToStr(shoals[i].ID),
       [bounds.X1 + (bounds.Width() div 2) - 5, bounds.Y1 + (bounds.Height() div 2) - 8],
       boxColor
@@ -1066,7 +1066,7 @@ function DepositNotedNetsToAnnette(): Boolean; forward;
 function DetectNetStatus(area: EArea): ENetStatus;
 var
   atpa: T2DPointArray;
-  fullNet, notFullNet: TRSObjectV2;
+  fullNet, notFullNet: TGameObjectV2;
 begin
   if area = AREA_NORTH then
   begin
@@ -1521,7 +1521,7 @@ var
   center: TPoint;
   attempt: Int32;
 begin
-  RSClient.Image.Clear();
+  GameClient.Image.Clear();
   found := DetectShoals(shoals);
 
   if found and DEBUG_SHOALS then
@@ -1816,7 +1816,7 @@ end;
 function HandleFullNet(): Boolean;
 var
   atpa: T2DPointArray;
-  fullNet, anchor, notFullNet: TRSObjectV2;
+  fullNet, anchor, notFullNet: TGameObjectV2;
   pos, center: TPoint;
   attempt: Int32;
 begin
@@ -1928,7 +1928,7 @@ end;
 function SetNetOnAnchor(area: EArea): Boolean;
 var
   center: TPoint;
-  anchor, notFullNet: TRSObjectV2;
+  anchor, notFullNet: TGameObjectV2;
   atpa: T2DPointArray;
 begin
   Result := False;
@@ -2083,7 +2083,7 @@ end;
  *
  * Clicks an object and waits for arrival in destination box with retries.
  *)
-function DoTransition(var obj: TRSObjectV2; destBox: TBox; maxAttempts: Int32 = 3): Boolean;
+function DoTransition(var obj: TGameObjectV2; destBox: TBox; maxAttempts: Int32 = 3): Boolean;
 var
   attempt: Int32;
 begin
@@ -2230,7 +2230,7 @@ end;
  *)
 function RestockDriftNetsFromBank(): Boolean;
 var
-  bankItem: TRSBankItem;
+  bankItem: TBankItem;
   exitAttempt: Int32;
   startStep: Int32;
 begin
@@ -2363,7 +2363,7 @@ begin
     Exit;
   end;
 
-  bankItem := TRSBankItem.Setup('Drift net', 2000, True);
+  bankItem := TBankItem.Setup('Drift net', 2000, True);
   Bank.WithdrawItem(bankItem, False);
   Wait(775, 1250);
   Bank.Close(True);
@@ -2453,7 +2453,7 @@ end;
  *)
 function RestockNumulitesFromBank(): Boolean;
 var
-  bankItem: TRSBankItem;
+  bankItem: TBankItem;
   exitAttempt: Int32;
   startStep: Int32;
 begin
@@ -2585,7 +2585,7 @@ begin
     Exit;
   end;
 
-  bankItem := TRSBankItem.Setup('Numulite', -1, False);
+  bankItem := TBankItem.Setup('Numulite', -1, False);
   Bank.WithdrawItem(bankItem, False);
   Wait(775, 1250);
   Bank.Close(True);
@@ -2813,7 +2813,7 @@ end;
  * @param skill - The skill to read.
  * @return The confirmed skill level, or -1 if no agreement.
  *)
-function ReadSkillLevelConfirmed(skill: ERSSkill): Int32;
+function ReadSkillLevelConfirmed(skill: ESkill): Int32;
 var
   r1, r2, r3: Int32;
 begin
@@ -2843,9 +2843,9 @@ var
 begin
   if LevelsCached then Exit;
 
-  newFishLvl := ReadSkillLevelConfirmed(ERSSkill.FISHING);
+  newFishLvl := ReadSkillLevelConfirmed(ESkill.FISHING);
   Wait(SRL.TruncatedGauss(500, 2000));
-  newHunterLvl := ReadSkillLevelConfirmed(ERSSkill.HUNTER);
+  newHunterLvl := ReadSkillLevelConfirmed(ESkill.HUNTER);
   Wait(SRL.TruncatedGauss(500, 2000));
 
   if (newFishLvl < 1) or (newHunterLvl < 1) then
@@ -2885,10 +2885,10 @@ begin
   TotalBreakTime += LastBreakEndTime - LastBreakStartTime;
   WriteLog('Break | Break ended (duration: ' + SRL.MsToTime(LastBreakEndTime - LastBreakStartTime, Time_Short) + ')');
 
-  if not RSClient.IsLoggedIn() then
+  if not GameClient.IsLoggedIn() then
   begin
     Login.LoginPlayer();
-    WaitUntil(RSClient.IsLoggedIn(), 250, 12000);
+    WaitUntil(GameClient.IsLoggedIn(), 250, 12000);
     Wait(1000, 2000);
   end;
 
@@ -2909,10 +2909,10 @@ begin
   TotalSleepTime += LastSleepEndTime - LastSleepStartTime;
   WriteLog('Sleep | Sleep ended (duration: ' + SRL.MsToTime(LastSleepEndTime - LastSleepStartTime, Time_Short) + ')');
 
-  if not RSClient.IsLoggedIn() then
+  if not GameClient.IsLoggedIn() then
   begin
     Login.LoginPlayer();
-    WaitUntil(RSClient.IsLoggedIn(), 250, 12000);
+    WaitUntil(GameClient.IsLoggedIn(), 250, 12000);
     Wait(1000, 2000);
   end;
 
@@ -2921,7 +2921,7 @@ end;
 
 procedure SetupAntiban();
 begin
-  Antiban.Skills := [ERSSkill.FISHING, ERSSkill.HUNTER, ERSSkill.TOTAL];
+  Antiban.Skills := [ESkill.FISHING, ESkill.HUNTER, ESkill.TOTAL];
   Antiban.MinZoom := ZOOM_MIN;
   Antiban.MaxZoom := ZOOM_MAX;
 
@@ -2959,7 +2959,7 @@ end;
  *)
 function GetState(): EState;
 begin
-  if not RSClient.IsLoggedIn() then
+  if not GameClient.IsLoggedIn() then
     Exit(HANDLE_LOGIN);
 
   if HANDLE_LEVEL_UP_CHAT and Chat.LeveledUp() then
@@ -2968,7 +2968,7 @@ begin
   if DriftNet.IsOpen() then
     Exit(HANDLE_DRIFT_NET_CATCH);
 
-  if RSInterface.IsOpen() then
+  if GameInterface.IsOpen() then
     Exit(CLOSE_INTERFACE);
 
   if not IsInFishingArea() then
@@ -3284,7 +3284,7 @@ begin
   // Inactivity termination
   if WL.Activity.IsFinished() then
   begin
-    if RSClient.IsLoggedIn() then Logout.ClickLogout();
+    if GameClient.IsLoggedIn() then Logout.ClickLogout();
     TerminateScript('No activity detected for 5 minutes');
   end;
 
@@ -3292,7 +3292,7 @@ begin
   if (ShutdownTime > 0) and (GetTimeRunning() >= ShutdownTime) then
   begin
     Report();
-    if RSClient.IsLoggedIn() then Logout.ClickLogout();
+    if GameClient.IsLoggedIn() then Logout.ClickLogout();
     TerminateScript('Shutdown timer reached');
   end;
 
@@ -3314,13 +3314,13 @@ begin
   // to match object-mapper frame rate. Full check every 10s as safety net.
   if (LastLoopState = CHASING) and (GetTickCount() - LastFullStateCheck < 10000) then
   begin
-    if not RSClient.IsLoggedIn() then
+    if not GameClient.IsLoggedIn() then
       state := HANDLE_LOGIN
     else if HANDLE_LEVEL_UP_CHAT and Chat.LeveledUp() then
       state := HANDLE_LEVEL_UP
     else if DriftNet.IsOpen() then
       state := HANDLE_DRIFT_NET_CATCH
-    else if RSInterface.IsOpen() then
+    else if GameInterface.IsOpen() then
       state := CLOSE_INTERFACE
     else if NeedsNetCheck then
       state := CHECK_AREA_NET
@@ -3337,7 +3337,7 @@ begin
 
   if state <> CHASING then
   begin
-    RSClient.Image.Clear();
+    GameClient.Image.Clear();
     WriteDebug('State: ' + ToStr(state));
   end;
 
@@ -3383,7 +3383,7 @@ begin
     CLOSE_INTERFACE:
     begin
       WriteDebug('Interface | Closing open interface');
-      RSInterface.Close(True);
+      GameInterface.Close(True);
       Wait(300, 500);
     end;
 
@@ -3461,9 +3461,9 @@ begin
           end;
 
           // Still no nets - full bank restock
-          if RSInterface.IsOpen() then
+          if GameInterface.IsOpen() then
           begin
-            RSInterface.Close(True);
+            GameInterface.Close(True);
             Wait(300, 500);
           end;
           UnequipWeapon();
@@ -3610,7 +3610,7 @@ begin
 
   // Block real input
   WLSettings.RemoteInput.BlockInput := True;
-  RSClient.RemoteInput.DisableRealInput();
+  GameClient.RemoteInput.DisableRealInput();
 
   SaveConfig();
   inherited;
@@ -4190,8 +4190,8 @@ var
   missing: TStringArray;
   weaponFound, numulitesFound, needBank: Boolean;
   fallbackWeapons: TStringArray;
-  bankItem: TRSBankItem;
-  allowedItems: TRSItemArray;
+  bankItem: TBankItem;
+  allowedItems: TItemArray;
   i: Int32;
 begin
   // --- Check required diving gear ---
@@ -4273,7 +4273,7 @@ begin
   if not weaponFound then
   begin
     // Try preferred weapon
-    bankItem := TRSBankItem.Setup(DetectedWeaponName, 1, False);
+    bankItem := TBankItem.Setup(DetectedWeaponName, 1, False);
     if Bank.WithdrawItem(bankItem, False) then
     begin
       Wait(300, 500);
@@ -4290,7 +4290,7 @@ begin
         if fallbackWeapons[i] = DetectedWeaponName then
           Continue;
 
-        bankItem := TRSBankItem.Setup(fallbackWeapons[i], 1, False);
+        bankItem := TBankItem.Setup(fallbackWeapons[i], 1, False);
         if Bank.WithdrawItem(bankItem, False) then
         begin
           Wait(300, 500);
@@ -4322,7 +4322,7 @@ begin
   // --- Numulites withdrawal ---
   if not numulitesFound then
   begin
-    bankItem := TRSBankItem.Setup('Numulite', -1, False);
+    bankItem := TBankItem.Setup('Numulite', -1, False);
     if not Bank.WithdrawItem(bankItem, False) then
     begin
       if BankFish then
@@ -4410,9 +4410,9 @@ begin
 
   // Login
   WriteLog('Init | Logging in');
-  if not RSClient.IsLoggedIn() then
+  if not GameClient.IsLoggedIn() then
     Login.LoginPlayer();
-  if not WaitUntil(RSClient.IsLoggedIn(), 250, 12000) then
+  if not WaitUntil(GameClient.IsLoggedIn(), 250, 12000) then
     TerminateScript('Failed to log in');
   WriteLog('Init | Login successful');
 
@@ -4426,9 +4426,9 @@ begin
   WriteLog('Init | Starting XP: ' + FormatNumber(StartXP));
 
   // Per-skill XP estimation via ratios
-  FishingLevel := ReadSkillLevelConfirmed(ERSSkill.FISHING);
+  FishingLevel := ReadSkillLevelConfirmed(ESkill.FISHING);
   Wait(300, 500);
-  HunterLevel := ReadSkillLevelConfirmed(ERSSkill.HUNTER);
+  HunterLevel := ReadSkillLevelConfirmed(ESkill.HUNTER);
   if (FishingLevel < 1) or (HunterLevel < 1) then
     TerminateScript('Failed to get a confirmed skill level reading from the Stats tab.');
   WriteLog('Init | Fishing level: ' + ToStr(FishingLevel) + ', Hunter level: ' + ToStr(HunterLevel));

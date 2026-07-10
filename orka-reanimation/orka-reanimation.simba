@@ -17,12 +17,12 @@
  *
  * ============================================================================
  *)
-{$DEFINE SCRIPT_REVISION := '7'}
+{$DEFINE SCRIPT_REVISION := '8'}
 {$IFNDEF SCRIPT_CHAIN}
   {$DEFINE SCRIPT_GUI}
   program OrkaReanimation;
-  {$I SRL-T/osr.simba}
-  {$I WaspLib/osr.simba}
+  {$I SRL-T/main.simba}
+  {$I WaspLib/main.simba}
   {$I WaspLib/optional/handlers/teleports/transport.simba}
   {$I WaspLib/optional/handlers/birdhouserunner.simba}
 {$ENDIF}
@@ -113,7 +113,7 @@ type
     POTION_RANGING
   );
 
-  EBankLocation = (
+  EScriptBankLocation = (
     BANK_CRAFTING_GUILD,
     BANK_FEROX_ENCLAVE
   );
@@ -123,14 +123,14 @@ type
 
     // Configuration
     HeadType: EHeadType;
-    HeadItem: TRSItem;
-    ReanimationSpell: ERSSpell;
+    HeadItem: TItem;
+    ReanimationSpell: ESpell;
     DoBHRuns: Boolean;
     UseSpecs: Boolean;
     UseQuickPrayers: Boolean;
     UseBankPotion: Boolean;
     BankPotion: EPotionType;
-    BankLocation: EBankLocation;
+    BankLocation: EScriptBankLocation;
 
     // Position tracking
     CurrentTile: TPoint;
@@ -231,23 +231,23 @@ end;
  * @param headType  The head to reanimate
  * @return          The required spell enum
  *)
-function GetReanimationSpell(headType: EHeadType): ERSSpell;
+function GetReanimationSpell(headType: EHeadType): ESpell;
 begin
   case headType of
     HEAD_BEAR, HEAD_GOBLIN, HEAD_IMP, HEAD_MINOTAUR,
     HEAD_MONKEY, HEAD_SCORPION, HEAD_UNICORN:
-      Result := ERSSpell.BASIC_REANIMATION;
+      Result := ESpell.BASIC_REANIMATION;
 
     HEAD_CHAOS_DRUID, HEAD_DOG, HEAD_ELF, HEAD_GIANT,
     HEAD_HORROR, HEAD_OGRE, HEAD_TROLL:
-      Result := ERSSpell.ADEPT_REANIMATION;
+      Result := ESpell.ADEPT_REANIMATION;
 
     HEAD_BLOODVELD, HEAD_DAGANNOTH, HEAD_DEMON,
     HEAD_HELLHOUND, HEAD_KALPHITE, HEAD_TZHAAR:
-      Result := ERSSpell.EXPERT_REANIMATION;
+      Result := ESpell.EXPERT_REANIMATION;
 
     HEAD_ABYSSAL, HEAD_AVIANSIE, HEAD_DRAGON:
-      Result := ERSSpell.MASTER_REANIMATION;
+      Result := ESpell.MASTER_REANIMATION;
   end;
 end;
 
@@ -469,7 +469,7 @@ end;
  * @param expectedUpText  Array of strings to verify correct spell target
  * @return                True if cast was successful
  *)
-function TReanimationBot.SafeCastSpell(spell: ERSSpell; expectedUpText: TStringArray): Boolean;
+function TReanimationBot.SafeCastSpell(spell: ESpell; expectedUpText: TStringArray): Boolean;
 var
   box: TBox;
   selectedSlot: Int32;
@@ -754,7 +754,7 @@ end;
  *)
 procedure TAntiban.Setup(); override;
 begin
-  Self.Skills := [ERSSkill.PRAYER, ERSSkill.MAGIC, ERSSkill.TOTAL];
+  Self.Skills := [ESkill.PRAYER, ESkill.MAGIC, ESkill.TOTAL];
   Self.MinZoom := 15;
   Self.MaxZoom := 50;
 
@@ -785,7 +785,7 @@ end;
 function TBirdHouseInclude.OnStart(): Boolean; override;
 var
   i: Int32;
-  ring: TRSBankItem;
+  ring: TBankItem;
 begin
   WriteDebug('BirdHouseRunner.OnStart | Starting birdhouse run preparation...');
 
@@ -796,7 +796,7 @@ begin
   // Update log type if using best log
   if Self.AlwaysUseBestLog then
   begin
-    Self.SuggestedLogType := BirdHouseRunner.GetLogForHunterLevel(Stats.GetLevel(ERSSkill.HUNTER));
+    Self.SuggestedLogType := BirdHouseRunner.GetLogForHunterLevel(Stats.GetLevel(ESkill.HUNTER));
     if Self.LogType <> Self.SuggestedLogType then
       Self.LogType := Self.SuggestedLogType;
   end;
@@ -810,7 +810,7 @@ begin
   end;
 
   // Check ring status before opening bank (to avoid closing it later)
-  if (Bot.BankLocation = EBankLocation.BANK_FEROX_ENCLAVE) and (not HasRingOfDuelingEquipped()) then
+  if (Bot.BankLocation = EScriptBankLocation.BANK_FEROX_ENCLAVE) and (not HasRingOfDuelingEquipped()) then
   begin
       WriteDebug('BirdHouseRunner.OnStart | Ring of Dueling missing, will withdraw new one...');
       Bot.NeedsNewRing := True;
@@ -850,12 +850,12 @@ begin
   end;
 
   // Ensure Ring of Dueling if using Ferox Enclave
-  if Bot.BankLocation = EBankLocation.BANK_FEROX_ENCLAVE then
+  if Bot.BankLocation = EScriptBankLocation.BANK_FEROX_ENCLAVE then
   begin
     if Bot.NeedsNewRing then
     begin
       WriteDebug('BirdHouseRunner.OnStart | Withdrawing new Ring of Dueling...');
-      ring := TRSBankItem.Setup('Ring of dueling(8)', 1);
+      ring := TBankItem.Setup('Ring of dueling(8)', 1);
       if Bank.WithdrawItem(ring, False) then
       begin
         Wait(600, 900);
@@ -1069,7 +1069,7 @@ begin
   SpellFinder.SimTolerance := 0.96;
 
   // Check Arceuus Library Teleport
-  if not Magic.CanActivate(ERSSpell.ARCEUUS_LIBRARY_TELEPORT) then
+  if not Magic.CanActivate(ESpell.ARCEUUS_LIBRARY_TELEPORT) then
   begin
     WriteDebug('CheckRequiredSpells | Arceuus Library Teleport cannot be activated (missing runes/level?)');
     Exit(False);
@@ -1102,7 +1102,7 @@ begin
 
   for attempts := 1 to 5 do
   begin
-    if Self.SafeCastSpell(ERSSpell.ARCEUUS_LIBRARY_TELEPORT, ['Arceuus Library', 'Library Teleport']) then
+    if Self.SafeCastSpell(ESpell.ARCEUUS_LIBRARY_TELEPORT, ['Arceuus Library', 'Library Teleport']) then
     begin
       if WaitUntil(IsAtArceuusLibrary(), 200, 8000) then
       begin
@@ -1158,7 +1158,7 @@ begin
     end;
 
     // Try to teleport via equipment ring of dueling
-    if Equipment.ClickSlot(ERSEquipmentSlot.RING, 'Ferox Enclave') then
+    if Equipment.ClickSlot(EEquipmentSlot.RING, 'Ferox Enclave') then
     begin
       if WaitUntil(IsInFeroxEnclave(), 200, 8000) then
       begin
@@ -1195,7 +1195,7 @@ end;
  *)
 function TReanimationBot.TeleportToBank(): Boolean;
 begin
-  if Self.BankLocation = EBankLocation.BANK_FEROX_ENCLAVE then
+  if Self.BankLocation = EScriptBankLocation.BANK_FEROX_ENCLAVE then
   begin
     WriteDebug('TeleportToBank | Teleporting to Ferox Enclave...');
     Result := Self.TeleportToFeroxEnclave();
@@ -1216,7 +1216,7 @@ end;
  *)
 function TReanimationBot.DrinkFromPool(): Boolean;
 var
-  PoolObj: TRSObjectV2;
+  PoolObj: TGameObjectV2;
 begin
   WriteDebug('DrinkFromPool | Looking for Pool of Refreshment...');
 
@@ -1268,7 +1268,7 @@ end;
  *)
 function TReanimationBot.OpenFeroxBank(): Boolean;
 var
-  BankObj: TRSObjectV2;
+  BankObj: TGameObjectV2;
 begin
   if Bank.IsOpen() then
   begin
@@ -1313,10 +1313,10 @@ end;
  *)
 function TReanimationBot.OpenBank(): Boolean;
 var
-  BankObj: TRSObjectV2;
+  BankObj: TGameObjectV2;
 begin
   // Handle based on bank location
-  if Self.BankLocation = EBankLocation.BANK_FEROX_ENCLAVE then
+  if Self.BankLocation = EScriptBankLocation.BANK_FEROX_ENCLAVE then
   begin
     // Check ring before opening bank if at Ferox, BUT NOT if bank is already open
     if (not Bank.IsOpen()) and (not HasRingOfDuelingEquipped()) then
@@ -1361,8 +1361,8 @@ end;
  *)
 procedure TReanimationBot.ManageInventory();
 var
-  keepItems: TRSItemArray;
-  item: TRSBankItem;
+  keepItems: TItemArray;
+  item: TBankItem;
 begin
   if not Bank.IsOpen() then Exit;
 
@@ -1371,7 +1371,7 @@ begin
   // Items we want to keep - varies by bank location
   keepItems := ['Rune pouch', 'Divine rune pouch', 'Law rune', 'Earth rune', 'Body rune', 'Nature rune', 'Soul rune', 'Blood rune'];
 
-  if Self.BankLocation = EBankLocation.BANK_FEROX_ENCLAVE then
+  if Self.BankLocation = EScriptBankLocation.BANK_FEROX_ENCLAVE then
   begin
     // Ferox specific items to keep
   end
@@ -1386,14 +1386,14 @@ begin
   Self.HeadCount := 0;
 
   // Handle bank location specific essentials
-  if Self.BankLocation = EBankLocation.BANK_FEROX_ENCLAVE then
+  if Self.BankLocation = EScriptBankLocation.BANK_FEROX_ENCLAVE then
   begin
     // For Ferox Enclave, handle Ring of Dueling only when it crumbled
     // Note: Don't check HasRingOfDuelingEquipped() here - bank interface blocks equipment view
     if Self.NeedsNewRing then
     begin
       WriteDebug('ManageInventory | Ring crumbled, withdrawing and equipping new one...');
-      item := TRSBankItem.Setup('Ring of dueling(8)', 1);
+      item := TBankItem.Setup('Ring of dueling(8)', 1);
       if Bank.WithdrawItem(item, False) then
       begin
         Wait(600, 900);
@@ -1427,9 +1427,9 @@ begin
     begin
       WriteDebug('ManageInventory | Withdrawing Crafting cape...');
       if Bank.ContainsItem('Crafting cape(t)') then
-        item := TRSBankItem.Setup('Crafting cape(t)', 1)
+        item := TBankItem.Setup('Crafting cape(t)', 1)
       else
-        item := TRSBankItem.Setup('Crafting cape', 1);
+        item := TBankItem.Setup('Crafting cape', 1);
 
       Bank.WithdrawItem(item, False);
       Wait(600, 900);
@@ -1461,9 +1461,9 @@ end;
  *)
 function TReanimationBot.WithdrawOneDosePotion(potionName: String): Boolean;
 var
-  item: TRSBankItem;
+  item: TBankItem;
 begin
-  item := TRSBankItem.Setup(potionName, 1);
+  item := TBankItem.Setup(potionName, 1);
   if Bank.WithdrawItem(item, False) then
   begin
     Wait(400, 600);
@@ -1497,7 +1497,7 @@ end;
  *)
 function TReanimationBot.WithdrawAntifirePotion(): String;
 var
-  extItem, regItem: TRSBankItem;
+  extItem, regItem: TBankItem;
 begin
   if Self.AntifirePotionUnavailable then Exit('');
   if not Bank.IsOpen() then Exit('');
@@ -1525,7 +1525,7 @@ begin
   Wait(800, 1200);
 
   // Prefer extended antifire
-  extItem := TRSBankItem.Setup('Extended antifire(1)', 1);
+  extItem := TBankItem.Setup('Extended antifire(1)', 1);
   if Bank.WithdrawItem(extItem, False) then
   begin
     Wait(400, 600);
@@ -1539,7 +1539,7 @@ begin
   end;
 
   // Fallback to regular antifire
-  regItem := TRSBankItem.Setup('Antifire potion(1)', 1);
+  regItem := TBankItem.Setup('Antifire potion(1)', 1);
   if Bank.WithdrawItem(regItem, False) then
   begin
     Wait(400, 600);
@@ -1758,7 +1758,7 @@ begin
 
   if Enable then
   begin
-    if Minimap.GetLevel(ERSMinimapOrb.PRAYER) <= 0 then
+    if Minimap.GetLevel(EMinimapOrb.PRAYER) <= 0 then
     begin
       WriteDebug('HandleQuickPrayers | Prayer points depleted, skipping activation');
       Exit;
@@ -2050,7 +2050,7 @@ begin
   MMPoint := Map.Map2MM(Self.SpawnTile);
   // Using 20x20 box as requested, enough for large monsters
   MMBox := Box(MMPoint, 20, 20);
-  StartDotCount := Length(Minimap.GetDots(ERSMinimapDot.NPC, MMBox));
+  StartDotCount := Length(Minimap.GetDots(EMinimapDot.NPC, MMBox));
 
   // Reduced timeout since we already waited 4s
   Timeout.Init(8000);
@@ -2059,7 +2059,7 @@ begin
     MMPoint := Map.Map2MM(Self.SpawnTile);
     MMBox := Box(MMPoint, 20, 20);
 
-    if Length(Minimap.GetDots(ERSMinimapDot.NPC, MMBox)) > StartDotCount then
+    if Length(Minimap.GetDots(EMinimapDot.NPC, MMBox)) > StartDotCount then
     begin
       WriteDebug('WaitForMonsterSpawn | Monster detected!');
       Self.MonsterSpawned := True;
@@ -2140,7 +2140,7 @@ begin
 
   // 2. NPC DOTS LOGIC
   MMSpawn := Map.Map2MM(Self.SpawnTile);
-  Dots := Minimap.GetDots(ERSMinimapDot.NPC);
+  Dots := Minimap.GetDots(EMinimapDot.NPC);
 
   // Filter dots within 20 pixels radius of spawn point on minimap
   FilteredDots := Dots.FilterDist(0, 20, MMSpawn.X, MMSpawn.Y);
@@ -2468,12 +2468,12 @@ function TReanimationBot.GetState(): EReanimationState;
 var
   pos: TPoint;
 begin
-  if not RSClient.IsLoggedIn() then
+  if not GameClient.IsLoggedIn() then
     Exit(EReanimationState.HANDLE_LOGIN);
 
   if Minimap.GetHPPercent() < MIN_HEALTH_PERCENT then
   begin
-    if Self.BankLocation = EBankLocation.BANK_FEROX_ENCLAVE then
+    if Self.BankLocation = EScriptBankLocation.BANK_FEROX_ENCLAVE then
     begin
       WriteDebug('Health Check | HP is below ' + ToStr(MIN_HEALTH_PERCENT) + '% (' + ToStr(Minimap.GetHPPercent()) + '%). Emergency healing at Ferox.');
       Self.NeedsEmergencyHeal := True;
@@ -2570,7 +2570,7 @@ begin
     Self.IsInCombat := False;
 
     // Handle based on bank location
-    if Self.BankLocation = EBankLocation.BANK_FEROX_ENCLAVE then
+    if Self.BankLocation = EScriptBankLocation.BANK_FEROX_ENCLAVE then
     begin
       // Ferox Enclave banking flow
       if IsInFeroxEnclave() then
@@ -2618,7 +2618,7 @@ begin
   // Disable native WaspLib reports in favor of Orka custom report
   WLSettings.Put('reports', False);
 
-  if Self.BankLocation = EBankLocation.BANK_FEROX_ENCLAVE then
+  if Self.BankLocation = EScriptBankLocation.BANK_FEROX_ENCLAVE then
   begin
     Map.SetupChunks([
       Chunk([24, 61, 27, 59], 0),  // Arceuus Library / Altar
@@ -2659,7 +2659,7 @@ begin
 
   // Ferox Enclave state
   Self.HasUsedPool := False;
-  if Self.BankLocation = EBankLocation.BANK_FEROX_ENCLAVE then
+  if Self.BankLocation = EScriptBankLocation.BANK_FEROX_ENCLAVE then
     Self.NeedsNewRing := not HasRingOfDuelingEquipped()
   else
     Self.NeedsNewRing := False;
@@ -2703,20 +2703,20 @@ begin
 
   // Check and set NPC attack option
   WriteDebug('Init | Checking NPC attack option...');
-  if Options.GetNPCAttackOption() <> ERSAttackOption.ALWAYS_LEFT_CLICK then
+  if Options.GetNPCAttackOption() <> EAttackOption.ALWAYS_LEFT_CLICK then
   begin
     WriteDebug('Init | NPC attack option not set correctly, setting to left-click...');
-    Options.SetNPCAttackOption(ERSAttackOption.ALWAYS_LEFT_CLICK);
+    Options.SetNPCAttackOption(EAttackOption.ALWAYS_LEFT_CLICK);
     Wait(300, 500);
   end
   else
     WriteDebug('Init | NPC attack option already set to left-click');
 
   // Ensure chat is on 'All' tab to detect messages
-  if not (ChatButtons.GetActive() in [ERSChatButton.ALL_CHAT, ERSChatButton.GAME_CHAT]) then
+  if not (ChatButtons.GetActive() in [EChatButton.ALL_CHAT, EChatButton.GAME_CHAT]) then
   begin
     WriteDebug('Init | Switching to All Chat tab...');
-    ChatButtons.Open(ERSChatButton.ALL_CHAT);
+    ChatButtons.Open(EChatButton.ALL_CHAT);
     Wait(300, 500);
   end;
 
@@ -2754,7 +2754,7 @@ begin
   Writeln(' |   |                                           |   | ');
   Writeln(' |   |    ' + PadR('Head Type: ' + GetHeadDisplayName(Self.HeadType), 39) + '|   | ');
   Writeln(' |   |    ' + PadR('Spell: ' + ToStr(Self.ReanimationSpell), 39) + '|   | ');
-  if Self.BankLocation = EBankLocation.BANK_FEROX_ENCLAVE then
+  if Self.BankLocation = EScriptBankLocation.BANK_FEROX_ENCLAVE then
     Writeln(' |   |    ' + PadR('Bank: Ferox Enclave (Ring of Dueling)', 39) + '|   | ')
   else
     Writeln(' |   |    ' + PadR('Bank: Crafting Guild (Crafting Cape)', 39) + '|   | ');
@@ -2794,7 +2794,7 @@ begin
     end;
 
     // Check for birdhouse run when safe (not in combat, logged in)
-    if Self.DoBHRuns and (not Self.IsInCombat) and (not Self.MonsterSpawned) and RSClient.IsLoggedIn() then
+    if Self.DoBHRuns and (not Self.IsInCombat) and (not Self.MonsterSpawned) and GameClient.IsLoggedIn() then
     begin
       if BirdHouseRunner.ScriptIntervalTimer.IsFinished() then
       begin
@@ -2806,7 +2806,7 @@ begin
     end;
 
     // First run spell check
-    if (not Self.VerifiedSpells) and RSClient.IsLoggedIn() then
+    if (not Self.VerifiedSpells) and GameClient.IsLoggedIn() then
     begin
       if not Self.CheckRequiredSpells() then
         TerminateScript('Missing required runes/spells or spellbook!');
@@ -3162,7 +3162,7 @@ begin
   // Load birdhouse settings and update GUI defaults
   if Config.Has('bhLogType') then
   begin
-    BirdHouseRunner.LogType := ERSLogType(Config.GetInt('bhLogType'));
+    BirdHouseRunner.LogType := ELogType(Config.GetInt('bhLogType'));
     BHIncludeGUILogType := BirdHouseRunner.LogType;
   end;
 
@@ -3221,8 +3221,8 @@ begin
   Bot.BankPotion := EPotionType(potionIndex);
 
   // Set bank location to Ferox Enclave (only GUI option for now)
-  Bot.BankLocation := EBankLocation.BANK_FEROX_ENCLAVE;
-  // Bot.BankLocation := EBankLocation.BANK_CRAFTING_GUILD; // Reactivate if needed
+  Bot.BankLocation := EScriptBankLocation.BANK_FEROX_ENCLAVE;
+  // Bot.BankLocation := EScriptBankLocation.BANK_CRAFTING_GUILD; // Reactivate if needed
 
   SaveConfig();
   inherited;
@@ -3260,7 +3260,7 @@ function TReanimationConfig.CreateBirdhouseRunSettings(): TTabSheet; override;
     combobox: TComboBox;
   begin
     combobox := sender;
-    BirdHouseRunner.LogType := ERSLogType(comboBox.getItemIndex());
+    BirdHouseRunner.LogType := ELogType(comboBox.getItemIndex());
   end;
 
   (**
