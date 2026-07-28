@@ -35,8 +35,10 @@ The cheapest prayer training method with great xp/h rates (up to 200k+ xp/h with
 - 🏰 **Ferox Enclave Banking:** Restores stats at the Pool of Refreshment every trip.
 - ⚔️ **Weapon Specs:** Uses special attacks to speed up kills.
 - 🛡️ **Quick Prayers:** Intelligent usage of your pre-configured quick prayers.
-- 🧪 **1-Dose Potions:** Supports sipping 1-dose Combat/Antifire potions at the bank. *(Tip: Use Bob Barter at GE to decant potions to 1-dose.)*
+- 🧪 **1-Dose Potions:** Supports sipping 1-dose Combat/Antifire potions at the bank. _(Tip: Use Bob Barter at GE to decant potions to 1-dose.)_
 - 🐦 **Birdhouse Runs:** Fully integrated Birdhouse run support.
+- 📢 **Discord Notifications**: Hourly progress reports, level-up alerts, and a session summary sent to your own Discord webhook — with optional anonymized screenshots (hides display name & XP bar). Includes a "Test Webhook" button and setup guide in the script GUI.
+- 🌍 **Player Detection & World Hopping**: Hops worlds when another player sets up at your reanimation spot. Passers-by are ignored — only players who linger trigger a hop. Also checks whether the spot is already camped right after arriving, before wasting a cast.
 
 ---
 
@@ -46,6 +48,15 @@ The cheapest prayer training method with great xp/h rates (up to 200k+ xp/h with
 - **Inventory:** Start with Runes + Ring of Dueling equipped.
 - **Bank Setup:** Place Heads, Rings, and Potions in the Main Tab for speed.
 - **Dragons (optional):** If doing Dragon heads, have Antifire(1) or Extended Antifire(1) in bank.
+
+### 📢 Discord Notifications (Optional)
+
+- Create a webhook in your Discord server: **Server Settings > Integrations > Webhooks > New Webhook > Copy URL**.
+- Paste the URL in the script GUI and use the **Test Webhook** button to verify it works.
+
+### 🌍 World Hopping (Optional)
+
+- Add at least **5 worlds** to your world list in Simba's **Account Manager** (player-hopping stays disabled with fewer).
 
 ### 🐦 Birdhouse Requirements (If Enabled)
 
