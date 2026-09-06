@@ -2,13 +2,15 @@
 
 A collection of OSRS scripts for [Simba 1.4](https://github.com/Villavu/Simba).
 
-Last verified running on [SRL-T](https://github.com/Torwent/SRL-T) **v7.21.47** and [WaspLib](https://github.com/Torwent/WaspLib) **v20.4.23**.
+Last verified running on [SRL-T](https://github.com/Torwent/SRL-T) **v7.21.48** and [WaspLib](https://github.com/Torwent/WaspLib) **v20.4.42**.
 
 ## How to Use
 
-1. Download and install [Simba 1.4](https://waspscripts.com/setup).
-2. Copy the contents of the `.simba` file you want to use.
-3. Paste it into Simba and hit Run.
+1. Download the Orka launcher from [orkascripts.com](https://orkascripts.com).
+2. Sign in with Discord.
+3. Pick the script in the launcher's Orka tab and press Run.
+
+Every script is GPL-3 and can still be pasted into Simba 1.4 by hand.
 
 ## Scripts
 
@@ -24,4 +26,4 @@ Last verified running on [SRL-T](https://github.com/Torwent/SRL-T) **v7.21.47** 
 
 ## Community
 
-Join the [Wasp Scripts Discord](https://discord.com/channels/795071177475227709/) for help, updates, and to share feedback.
+Join the [Orka Discord](https://discord.gg/dZssByKRbD) for help, updates and feedback.

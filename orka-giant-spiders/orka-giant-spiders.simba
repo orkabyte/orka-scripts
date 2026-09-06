@@ -1,3 +1,9 @@
+{$DEFINE SCRIPT_NAME := 'Orka Giant Spiders'}
+{$DEFINE SCRIPT_DESCRIPTION := 'AFK combat training on Giant Spiders at the Stronghold of Security'}
+{$DEFINE SCRIPT_REVISION := '1'}
+{$DEFINE SCRIPT_SKILLS := 'attack strength defence ranged hitpoints'}
+{$DEFINE ORKA_LIBS := 'srl-t@7.21.48 wasplib@20.4.42'}
+
 (**
  * ============================================================================
  * Orka Giant Spiders - Credits & Appreciation
@@ -17,7 +23,6 @@
  *
  * ============================================================================
  *)
-{$DEFINE SCRIPT_REVISION := '1'}
 {$DEFINE SCRIPT_GUI}
 program OrkaGiantSpiders;
 {$I SRL-T/osr.simba}

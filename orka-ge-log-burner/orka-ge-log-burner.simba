@@ -1,3 +1,9 @@
+{$DEFINE SCRIPT_NAME := 'Orka GE Log Burner'}
+{$DEFINE SCRIPT_DESCRIPTION := 'Train Firemaking 1-99 at the Grand Exchange'}
+{$DEFINE SCRIPT_REVISION := '9'}
+{$DEFINE SCRIPT_SKILLS := 'firemaking'}
+{$DEFINE ORKA_LIBS := 'srl-t@7.21.48 wasplib@20.4.42'}
+
 (**
  * ============================================================================
  * Orka GE Log Burner - Credits & Appreciation
@@ -18,7 +24,6 @@
  * ============================================================================
  *)
 
-{$DEFINE SCRIPT_REVISION := '9'}
 program OrkaGELogBurner;
 {$DEFINE SCRIPT_GUI}
 {$I SRL-T/osr.simba}

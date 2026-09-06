@@ -1,3 +1,9 @@
+{$DEFINE SCRIPT_NAME := 'Orka Drift Net Fisher'}
+{$DEFINE SCRIPT_DESCRIPTION := 'Drift net fishing at Fossil Island'}
+{$DEFINE SCRIPT_REVISION := '1'}
+{$DEFINE SCRIPT_SKILLS := 'fishing hunter'}
+{$DEFINE ORKA_LIBS := 'srl-t@7.21.48 wasplib@20.4.42'}
+
 (**
  * ============================================================================
  * Orka Drift Net Fisher - Credits & Appreciation
@@ -17,7 +23,6 @@
  *
  * ============================================================================
  *)
-{$DEFINE SCRIPT_REVISION := '1'}
 {$DEFINE SCRIPT_GUI}
 program OrkaDriftNetFisher;
 {$I SRL-T/osr.simba}

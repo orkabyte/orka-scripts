@@ -1,4 +1,9 @@
+{$DEFINE SCRIPT_NAME := 'Orka Lead Miner'}
+{$DEFINE SCRIPT_DESCRIPTION := 'Mine lead ore on Pandemonium Island'}
 {$DEFINE SCRIPT_REVISION := '1'}
+{$DEFINE SCRIPT_SKILLS := 'mining'}
+{$DEFINE ORKA_LIBS := 'srl-t@7.21.48 wasplib@20.4.42'}
+
 {$DEFINE SCRIPT_GUI}
 program OrkaLeadMiner;
 {$I SRL-T/osr.simba}

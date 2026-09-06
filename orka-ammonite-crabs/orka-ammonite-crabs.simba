@@ -1,3 +1,9 @@
+{$DEFINE SCRIPT_NAME := 'Orka Ammonite Crabs'}
+{$DEFINE SCRIPT_DESCRIPTION := 'Combat training at Ammonite Crabs with optional Birdhouse Runs'}
+{$DEFINE SCRIPT_REVISION := '2'}
+{$DEFINE SCRIPT_SKILLS := 'attack strength defence ranged hitpoints'}
+{$DEFINE ORKA_LIBS := 'srl-t@7.21.48 wasplib@20.4.42'}
+
 (**
  * ============================================================================
  * Orka Ammonite Crabs - Credits & Appreciation
@@ -17,7 +23,6 @@
  *
  * ============================================================================
  *)
-{$DEFINE SCRIPT_REVISION := '2'}
 {$DEFINE SCRIPT_GUI}
 program OrkaAmmoniteCrabs;
 {$I SRL-T/osr.simba}

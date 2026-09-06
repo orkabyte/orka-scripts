@@ -17,7 +17,12 @@
  *
  * ============================================================================
  *)
+{$DEFINE SCRIPT_NAME := 'Orka Reanimation'}
+{$DEFINE SCRIPT_DESCRIPTION := 'Reanimate ensouled heads at the Dark Altar for Prayer XP'}
 {$DEFINE SCRIPT_REVISION := '8'}
+{$DEFINE SCRIPT_SKILLS := 'prayer magic'}
+{$DEFINE ORKA_LIBS := 'srl-t@7.21.48 wasplib@20.4.42'}
+
 {$IFNDEF SCRIPT_CHAIN}
   {$DEFINE SCRIPT_GUI}
   program OrkaReanimation;

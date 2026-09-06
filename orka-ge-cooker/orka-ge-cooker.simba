@@ -1,3 +1,9 @@
+{$DEFINE SCRIPT_NAME := 'Orka GE Cooker'}
+{$DEFINE SCRIPT_DESCRIPTION := 'Train Cooking 1-99 at the Grand Exchange'}
+{$DEFINE SCRIPT_REVISION := '7'}
+{$DEFINE SCRIPT_SKILLS := 'cooking'}
+{$DEFINE ORKA_LIBS := 'srl-t@7.21.48 wasplib@20.4.42'}
+
 (**
  * ============================================================================
  * Orka GE Cooker - Credits & Appreciation
@@ -18,7 +24,6 @@
  * ============================================================================
  *)
 
-{$DEFINE SCRIPT_REVISION := '7'}
 program OrkaGECooker;
 {$DEFINE SCRIPT_GUI}
 {$I SRL-T/osr.simba}
